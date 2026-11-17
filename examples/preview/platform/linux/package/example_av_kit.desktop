@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AVKit Preview
+Exec=example_av_kit
+Icon=example_av_kit
+Categories=Utility;
+Terminal=false
