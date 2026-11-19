@@ -254,6 +254,8 @@ std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> CreateTimelineNcnnPr
   if (pack.Child("yunet.ncnn.param").Exists()) models.face = model("yunet");
   if (pack.Child("mp_persondet.ncnn.param").Exists())
     models.body_hand = NcnnBodyHandModels{model("mp_persondet"), model("mp_pose"), model("mp_palmdet"), model("mp_handpose")};
+  if (pack.Child("selfie.ncnn.param").Exists()) models.portrait = model("selfie");
+  if (pack.Child("pp_humansegv2_lite.ncnn.param").Exists()) models.portrait_wide = model("pp_humansegv2_lite");
   auto provider = CreateNcnnAnalysisProvider(models);
   if (!provider.Succeeded()) throw std::runtime_error(provider.Error());
   return std::move(provider).Value();

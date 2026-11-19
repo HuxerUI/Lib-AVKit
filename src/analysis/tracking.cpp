@@ -1,12 +1,11 @@
 #include "tracking.h"
 
+#include "analysis_job.h"
+
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <map>
-#include <mutex>
 #include <stdexcept>
 
 #include "support/cancellation.h"
@@ -17,13 +16,13 @@ namespace {
 
 using namespace analysis;
 using media::VideoFrame;
-std::atomic<std::uint64_t> next_generation{1};
 
 const char* Name(AnalysisCapability capability) {
   switch (capability) {
     case AnalysisCapability::BodyLandmarks: return "body landmarks";
     case AnalysisCapability::FaceLandmarks: return "face landmarks";
     case AnalysisCapability::HandLandmarks: return "hand landmarks";
+    case AnalysisCapability::PortraitMask: return "portrait mask";
   }
   throw std::invalid_argument("Unknown analysis capability");
 }
@@ -54,35 +53,11 @@ void ValidateWindow(const Model& model) {
   }
 }
 
-struct Mailbox {
-  std::mutex mutex;
-  std::condition_variable changed;
-  std::optional<AnalysisCompletion> completion;
-};
-
 std::vector<TrackingDetection> Run(Model& model, AnalysisJob job, std::stop_token stop) {
-  CheckCancelled(stop);
-  const auto box = std::make_shared<Mailbox>();
-  const std::stop_callback wake_on_stop(stop, [box] {
-    const std::lock_guard lock(box->mutex);
-    box->changed.notify_one();
+  auto completion = WaitForAnalysis<AnalysisCompletion>(std::move(job), stop, [&](auto request, auto token, auto done) {
+    model.session->Submit(std::move(request), token, std::move(done));
   });
-  const auto target = job.target;
-  const auto id = job.id;
-  // A provider can finish after cancellation releases this job's mailbox.
-  model.session->Submit(std::move(job), stop, [mailbox = std::weak_ptr(box), target, id](AnalysisCompletion result) {
-    if (result.job_id != id || result.target != target) return;
-    if (const auto queued = mailbox.lock()) {
-      const std::lock_guard lock(queued->mutex);
-      if (queued->completion) return;
-      queued->completion.emplace(std::move(result));
-      queued->changed.notify_one();
-    }
-  });
-  std::unique_lock lock(box->mutex);
-  box->changed.wait(lock, [&] { return box->completion || stop.stop_requested(); });
-  CheckCancelled(stop);
-  auto result = std::move(box->completion->result);
+  auto result = std::move(completion->result);
   if (!result.Succeeded())
     throw std::runtime_error(std::string("Analysis failed for ") + Name(model.config.capability) + ": " + result.Error());
   return std::move(result).Value().value_or(std::vector<TrackingDetection>{});
@@ -189,7 +164,7 @@ struct SourceTracking::Impl {
       : provider(std::move(provider)), source(source) {}
 
   std::shared_ptr<AnalysisProvider> provider;
-  std::uint64_t source, generation{next_generation.fetch_add(1, std::memory_order_relaxed)}, next_job{1};
+  std::uint64_t source, generation{NextAnalysisGeneration()}, next_job{1};
   std::vector<TrackedPart> parts;
   std::vector<Model> models;
   std::optional<FrameKey> last;
@@ -218,7 +193,7 @@ struct SourceTracking::Impl {
     end_of_input = false;
     ordered_frames.clear();
     hand_reference.reset();
-    generation = next_generation.fetch_add(1, std::memory_order_relaxed);
+    generation = NextAnalysisGeneration();
   }
 
   void Prepare(const VideoFrame& image) {

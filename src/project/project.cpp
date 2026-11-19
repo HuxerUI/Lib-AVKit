@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "support/media_time.h"
+#include "support/geometry.h"
 
 namespace huxerui::avkit {
 namespace {
@@ -155,6 +156,13 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
             "This timeline supports source playback at 1x");
       ValidateRect(clip.destination);
       Check(track.kind == TrackKind::Video || clip.stickers.empty(), "Stickers require a visual clip");
+      if (clip.background) {
+        const auto& effect = *clip.background;
+        Check(track.kind == TrackKind::Video && detail::IsUnitRect(effect.source_crop),
+              "Background replacement requires a visual clip and a normalized source crop");
+        for (const auto channel : {effect.color.red, effect.color.green, effect.color.blue, effect.color.alpha})
+          Check(channel >= 0 && channel <= 1, "Background color channels must be in [0, 1]");
+      }
       for (const auto& sticker : clip.stickers) {
         unique_id(sticker.id);
         const auto& resource = sticker.spec.resource;
@@ -228,6 +236,10 @@ ClipInfo& ProjectEdit::Clip(ClipId clip) {
 
 void ProjectEdit::SetClip(ClipId clip, ClipPlacement placement) { Clip(clip).placement = placement; }
 void ProjectEdit::SetLayout(ClipId clip, Rect destination) { Clip(clip).destination = destination; }
+
+void ProjectEdit::SetBackground(ClipId clip, std::optional<BackgroundReplacement> background) {
+  Clip(clip).background = std::move(background);
+}
 
 InstanceId ProjectEdit::AddSticker(ClipId clip, StickerSpec spec) {
   auto& instances = Clip(clip).stickers;

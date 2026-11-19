@@ -1020,6 +1020,12 @@ The first release stores foreground mask coverage in `R8Unorm`. For classificati
 
 Live effects wait for the corresponding frame result and bridge preparation within their budget. On timeout, apply the effect's declared fallback, such as restoring the original image for background replacement or hiding a virtual layer whose occlusion is unknown. Preview and recording share that choice with the composited frame. Offline processing waits for required frame results and GPU dependencies. A skipped or failed required result produces an analysis error.
 
+The timeline background replacement milestone enables an optional solid background on an individual clip. Its crop is normalized in the oriented, pre-mirror source, and the selected rectangle fills the clip destination. The render plan maps the visible rectangle into the fitted color input and the local mask independently. bgfx interpolates numeric R8 coverage between texels, clamps the samples within the valid mask region, and uses zero outside it. The two surfaces may have different stored row origins. CPU providers can return a retained `ImageSurface` from `RetainImagePixels`, and the renderer uploads its rows on its own sequence. [Render API](../include/huxerui/avkit/render.h)
+
+An `ImportVideoFrame` callback returns an `ImportedVideoFrame` with a color surface and `source_to_texture_uv`. The transform maps normalized, oriented visible source coordinates before clip mirroring to logical texture UVs. Use the identity for a texture that contains the full oriented source, and describe the source placement explicitly for a texture with padding or cropping. The renderer handles each surface's stored row origin. When the callback is omitted, the compositor fits each decoded input to the project canvas using `ImageFit::Contain`. [Timeline API](../include/huxerui/avkit/timeline.h)
+
+The portrait mask capability currently accepts stateless single-frame providers. Each clip owns its analysis session. It passes `BackgroundReplacement::model_id` to the provider when opening the session. An empty selection uses the provider default. Installing a new project revision retires the previous selection and its results. An explicit skipped completion keeps the cropped and mirrored source for this optional effect in preview and export. A valid all-zero texture displays the replacement color. The timeline submits every visible clip's mask request before collecting results. Clocked preview starts a 12 ms deadline at each submission and restores the original for the affected clip on timeout. A completion received within its deadline stays available until collection. Export waits for each current result and reports provider errors. A completion must match the job ID, clip, generation, and source PTS.
+
 ### Shader programs and resource packs
 
 `ProgramKey` consists of a namespaced name, parameter contract version, and implementation variant. For `avkit.color.lut`, the effect declares strength, color domain, and a LUT resource. The compiler selects the implementation variant and generates bindings. `ProgramSpec` declares logical parameter names and types, and the packaged backend manifest maps them to the actual uniform, sampler, and storage slots for each stage. Parameter shapes use column-major matrices and explicit `Float4` component conventions. A scalar can occupy one component. The first release uses clamp addressing for all samplers.
@@ -1394,6 +1400,8 @@ Use `--verify` to check external registration, reparenting, parent deletion, equ
 
 Each timeline cursor opens only its selected video or audio decoder directly at the mapped source time. Sampling retires stale cursors before opening replacements. Audio sampling releases a clip's decoder when it reaches the trim end, including when one PCM block spans a cut.
 
+The macOS timeline preview fills the available capacity of its 250 ms PCM queue before deciding whether to sample another picture. It primes each new playback epoch from the start or seek position before requesting playback. The preview submits and seals the final PCM block together. For audio-clocked video, it checks the current PCM position again after composition and discards pictures that are at least 100 ms late. Once audio drains, the last in-range picture can still be published.
+
 Build the macOS example as in the file milestone. The verification takes a blue and a red 2.5-second fixture with audio and writes three project documents and their MP4 exports. It uses copies when simulating a missing file. Use a fresh result directory for each run.
 
 ```sh
@@ -1442,6 +1450,8 @@ The verification gives the clips a shared rectangle covering the middle 60% of t
 ## macOS thumbnail and waveform milestone
 
 `TrackSource::reverse` reverses a 1× clip. `MapClipToSource` and `MapClipToProject` return ascending time ranges in either direction. Reverse video uses the frame immediately to the left of the mapped time. Reverse audio reads a short source window in increasing presentation time and outputs its sample frames in reverse order with channels intact. Project documents with reverse clips or relink revisions use `.avkit` version 3. [Project API](../include/huxerui/avkit/project.h)
+
+For reverse video, the clip cursor caches CPU pictures already decoded from the seek anchor, including mapped preroll that overlaps the clip trim. A cache miss opens a new window. Each cursor keeps up to 64 CPU pictures within 64 MiB, or one picture if it exceeds the byte budget. Cached CPU planes own their bytes independently of the decoder. Platform pictures retain the existing eight-frame lease limit. `TimelineSession::Seek` starts a new audio and analysis epoch and retains a reverse clip's CPU window if it covers the requested source picture. A full reset or a project revision change releases the window. [Timeline API](../include/huxerui/avkit/timeline.h)
 
 `AssetSampler` opens video-only and audio-only cursors on its owning worker sequence. Thumbnail requests report actual decoded PTS. The example selects an interior source time for each thumbnail cell and uses Lib-Media to fit and orient the frame before encoding it as a PNG `ImageAsset`. Waveform buckets align to the audio track start and contain each channel's minimum and maximum decoded PCM value. The example maps whole buckets back to the visible clip and draws them in playback order. The cache keys include the asset path, file metadata, relink revision, track, and sampling resolution. Coarse buckets can merge two cached half-size buckets while preserving their extrema. [Sampling API](../include/huxerui/avkit/asset_sampling.h)
 
@@ -1537,3 +1547,59 @@ open -n "$app" --args --timeline-ncnn-preview "$work/body-hand.avkit" "$pack"
 ```
 
 The verifier checks both directions for each clip against the same source PTS and verifies that direct and clocked seeks reuse the ordered results. It also compares pre-encode pixels and reimported MP4 timing.
+
+### Portrait mask verification
+
+Use the macOS file preview build and a fresh directory. The fixture uses two independently analyzed clips of the same file, with different crops, a mirrored picture-in-picture layer, and opposite playback directions. It also checks a 320×180 source on a 320×240 canvas with fitted, full-source, and padded imports. The verifier compares the GPU output against a source-space pixel calculation, then checks both seek directions, reversed playback, clocked preview, export before encoding, and reimported PTS and PCM. The reimport pixel check uses an unspecified output transfer so it measures the encoded SDR samples. The verifier also submits a late mask from a timed-out job during a new job for the same source PTS.
+
+```sh
+app="$PWD/build/preview/example_av_kit.app"
+preview="$app/Contents/MacOS/example_av_kit"
+work="$PWD/build/portrait-mask-check"
+"$preview" --timeline-verify-masks "$work"
+open -n "$app" --args --timeline-mask-preview "$work/portrait-mask.avkit"
+```
+
+### ncnn portrait segmentation
+
+Set `NcnnAnalysisModels::portrait` to the MediaPipe Selfie Segmentation pack for default analysis. Set `NcnnAnalysisModels::portrait_wide` to the optional general PP-HumanSegV2-Lite pack for wide, full-body footage. Both use one unrotated SDR I420 CPU picture per job. The provider resizes the visible source to the pack's 256×256 planar RGB input and quantizes foreground probabilities into an `R8Unorm` image with top-left rows. The UV map is the identity because the grid covers the whole visible source. Use a software video decoder with this provider. [MediaPipe pack](../models/mediapipe/selfie-segmentation) · [PP-HumanSegV2-Lite pack](../models/paddle/pp-humansegv2-lite) · [Provider API](../include/huxerui/avkit/ncnn.h)
+
+During editing, set `BackgroundReplacement::model_id` to `analysis::kPPHumanSegV2LiteModelId` or `analysis::kMediaPipeSelfieModelId` and apply the setting with `ProjectEdit::SetBackground`. Projects with an explicit selection store the ID in document version 6. Older background settings load with the default selection. The same provider can open both models for different clips of the same asset. An unavailable explicit model produces a diagnostic that names the requested ID.
+
+On threaded builds, sessions of the same model share its inference worker. A timed-out preview job can retire while its ncnn extraction finishes, and a different model has its own worker. Cancelled jobs release their frame leases when retired. On Web builds without pthreads, inference runs inline and deadline checks can discard the result after inference completes. MediaPipe is tuned for close-range people. PP-HumanSegV2-Lite helps preserve people in wider shots. Both output single-frame foreground probabilities.
+
+Use the macOS ncnn file preview build and a fresh directory. The verifier takes a 640×480, 24 fps SDR recording with an audio track and at least 49 frames. It builds two differently trimmed clips with overlapping source PTS and a mirrored, reversed inset. It checks GPU edge pixels against the inferred coverage, compares both seek directions and reverse playback, and measures submission-to-completion latency. Export checks the composed pixels before encoding, then reimports the MP4 to verify PTS, audio sample continuity, and compression tolerance. The deadline test holds one real completion at a time and confirms the other clip can submit and keep its mask. The verifier then sends the late result after a seek to the same PTS and to the other clip at that PTS. A separate explicit skip verifies the original picture fallback.
+
+Prepare each pack with its own Python environment and output directory using PNNX 20261020. Verify both packs before collecting their four runtime files. Each generated pack keeps its own `LICENSE` and `SHA256SUMS` in its output directory.
+
+```sh
+pnnx="/path/to/pnnx"
+models="$PWD/build/portrait-models"
+python3 -m venv "$models/selfie-venv"
+python3.11 -m venv "$models/wide-venv"
+"$models/selfie-venv/bin/python" -m pip install onnx==1.22.0
+"$models/wide-venv/bin/python" -m pip install paddle2onnx==1.3.1 onnx==1.19.1
+
+"$models/selfie-venv/bin/python" models/mediapipe/selfie-segmentation/prepare.py "$pnnx" "$models/selfie"
+"$models/wide-venv/bin/python" models/paddle/pp-humansegv2-lite/prepare.py "$pnnx" "$models/wide"
+(cd "$models/selfie" && shasum -a 256 -c SHA256SUMS)
+(cd "$models/wide" && shasum -a 256 -c SHA256SUMS)
+
+pack="$models/runtime"
+mkdir -p "$pack"
+cp "$models/selfie/selfie.ncnn.param" "$models/selfie/selfie.ncnn.bin" "$pack/"
+cp "$models/wide/pp_humansegv2_lite.ncnn.param" "$models/wide/pp_humansegv2_lite.ncnn.bin" "$pack/"
+```
+
+Use `--mixed-models` with the prepared runtime directory to select the wide model on the main clip and MediaPipe on the inset. The verifier opens the saved project, compares the selected masks at shared source PTS, and changes one clip's model in a new revision. It checks that the other clip keeps its selected coverage. For an inset that fits in one GOP, it checks for one video decoder per clip during sequential sampling and verifies that seeks within the warmed window reuse the reverse decoder. Both playback directions resume after each seek, reach the last frame, and verify zero PCM underruns and less than 100 ms of video publication lag relative to the PCM clock. The playback report includes missed frame positions between seeks and pictures discarded after rendering. Omit the option to verify the default MediaPipe path.
+
+```sh
+app="$PWD/build/preview/example_av_kit.app"
+preview="$app/Contents/MacOS/example_av_kit"
+source="/path/to/recording.mp4"
+pack="$PWD/build/portrait-models/runtime"
+work="$PWD/build/ncnn-portrait-check"
+"$preview" --timeline-verify-ncnn-mask "$source" "$pack" "$work" --mixed-models
+open -n "$app" --args --timeline-ncnn-preview "$work/ncnn-portrait.avkit" "$pack"
+"$preview" --timeline-ncnn-export "$work/ncnn-portrait.avkit" "$pack" "$work/export.mp4"
+```

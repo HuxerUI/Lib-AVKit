@@ -6,6 +6,7 @@
 /// Link AVKit::Media. The session works in project time and retains the decoded pictures and render
 /// plan needed by a compositor. Rendering and resource resolution belong to the caller.
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,7 +27,7 @@ using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::Color
 
 /// @brief Prepares a decoded input on the compositor sequence.
 /// Throw PlatformVideoImportError when a platform video texture cannot be shared with the compositor.
-using ImportVideoFrame = std::function<render::ColorSurface(const media::VideoFrame&)>;
+using ImportVideoFrame = std::function<render::ImportedVideoFrame(const media::VideoFrame&)>;
 
 /// @brief Mask resource sampled at a transition-local time.
 struct TransitionMaskSample {
@@ -45,6 +46,8 @@ struct TimelineFrame {
   std::shared_ptr<const render::RenderPlan> plan;
   std::vector<TimelineInput> inputs; ///< External color slots referenced by the render plan.
   std::vector<TransitionMaskSample> masks; ///< Data slots resolved by the compositor.
+  /// Analysis masks occupy the first data slots, followed by the transition masks.
+  std::vector<render::ImageSurface> analysis_masks;
 };
 
 /// @brief Samples one immutable revision on a worker sequence.
@@ -52,7 +55,7 @@ struct TimelineFrame {
 class TimelineSession {
 public:
   /// @brief Prepares project metadata and retains the selected providers.
-  /// @param analysis Required for active clips with tracking anchors.
+  /// @param analysis Required for active clips with tracking anchors or portrait background replacement.
   TimelineSession(std::shared_ptr<const ProjectSnapshot> project, MovieCodecProviders providers,
                   CodecPolicy policy = CodecPolicy::Auto, OnCodecFallback on_fallback = {},
                   std::shared_ptr<analysis::AnalysisProvider> analysis = {});
@@ -67,17 +70,24 @@ public:
   /// @param output Requested color format for the render target.
   /// @param stop Cancels pending decode and analysis waits. Cancellation retires sampling state.
   /// @param import Optionally prepares each visible video input. A rejected platform frame is retried from its
-  /// exact source PTS on the software provider for that clip.
+  /// exact source PTS on the software provider for that clip. When omitted, the compositor must fit decoded
+  /// inputs to the project canvas with ImageFit::Contain. The plan uses the corresponding UV mapping.
+  /// @param mask_wait Per-job preview budget measured from submission. All visible mask jobs are submitted
+  /// before waiting. A timeout uses that clip's original image. Omit for offline sampling.
   /// @return Immutable plan and retained inputs. Required analysis is sampled at its exact source PTS.
   TimelineFrame SampleVideo(media::MediaTimestamp at, render::PixelFormat output = render::PixelFormat::Bgra8Unorm,
-                            std::stop_token stop = {}, const ImportVideoFrame& import = {});
+                            std::stop_token stop = {}, const ImportVideoFrame& import = {},
+                            std::optional<std::chrono::milliseconds> mask_wait = {});
   /// @brief Returns the PCM format shared by the timeline's selected audio clips.
   media::AudioFormat PcmFormat() const;
   /// @brief Mixes an interval on the project PCM sample grid, filling gaps with silence.
   /// @param start Interval start aligned to the sample rate.
   /// @param samples Positive number of sample frames.
   media::AudioFrame SampleAudio(media::MediaTimestamp start, std::uint32_t samples);
-  /// @brief Retires all sampling cursors and analysis state before a discontinuous seek.
+  /// @brief Starts a new sampling epoch at an in-range project time.
+  /// Retires audio and analysis state. A reverse clip can reuse its own cached CPU pictures at the target.
+  void Seek(media::MediaTimestamp at);
+  /// @brief Retires all sampling cursors and analysis state.
   void Reset();
 
 private:
@@ -92,7 +102,7 @@ using ComposeTimelineFrame = std::function<media::VideoFrame(const TimelineFrame
 /// @brief Samples the project on the export video and PCM grids and publishes a finalized MP4.
 /// @param destination New local path separate from project sources.
 /// @param compose Compositor callback. A recoverable platform encoder failure can replay it from the start.
-/// @param analysis Provider for tracked stickers when required by the project.
+/// @param analysis Provider for tracked stickers and portrait background replacement required by the project.
 /// @param import Optionally prepares video inputs with the same per-clip software retry as preview.
 void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
                     const MovieCodecProviders& providers, const FileExportSettings& settings,

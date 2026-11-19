@@ -14,6 +14,7 @@
 #if defined(AVKIT_FILE_MEDIA)
 #include "file_preview.h"
 #include "timeline_preview.h"
+#include "timeline_mask_verify.h"
 #include "timeline_strip.h"
 #include "timeline_tracking_verify.h"
 #endif
@@ -87,7 +88,27 @@ int main(int argc, const char** argv) {
         avkit_preview::VerifyTimelineTracking(argv[2]);
         return 0;
       }
+      if (command == "--timeline-verify-masks" && argc == 3) {
+        avkit_preview::VerifyTimelineMasks(argv[2]);
+        return 0;
+      }
+      if (command == "--timeline-mask-preview" && (argc == 3 || argc == 4)) {
+        avkit_preview::ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
+                                                avkit_preview::CreateMockMaskProvider(), true);
+        const int result = huxerui::RunApplication();
+        avkit_preview::StopTimelinePreview();
+        return result;
+      }
 #if defined(AVKIT_NCNN_PREVIEW)
+      if (command == "--timeline-verify-ncnn-mask" &&
+          (argc == 5 || (argc == 6 && std::string_view(argv[5]) == "--mixed-models"))) {
+        avkit_preview::VerifyTimelineNcnnMasks(argv[2], argv[3], argv[4], argc == 6);
+        return 0;
+      }
+      if (command == "--timeline-ncnn-export" && argc == 5) {
+        avkit_preview::ExportTimelinePreview(argv[2], argv[4], true, avkit_preview::CreateTimelineNcnnProvider(argv[3]));
+        return 0;
+      }
       if (command == "--timeline-ncnn-preview" && (argc == 4 || argc == 5)) {
         avkit_preview::ConfigureTimelinePreview(argv[2], argc == 5 ? argv[4] : "0",
                                                 avkit_preview::CreateTimelineNcnnProvider(argv[3]), true);
@@ -104,7 +125,9 @@ int main(int argc, const char** argv) {
         return 0;
       }
       std::cerr << "Usage: --timeline-ncnn-preview PROJECT MODEL_DIRECTORY [SECONDS]\n"
+                   "       --timeline-ncnn-export PROJECT MODEL_DIRECTORY OUTPUT\n"
                    "       --timeline-verify-ncnn SOURCE MODEL_DIRECTORY DIRECTORY\n"
+                   "       --timeline-verify-ncnn-mask SOURCE MODEL_DIRECTORY DIRECTORY [--mixed-models]\n"
                    "       --timeline-verify-ncnn-body SOURCE MODEL_DIRECTORY LANDMARKS DIRECTORY\n";
 #endif
       std::cerr << "Usage: --timeline-preview PROJECT [SECONDS]\n"
@@ -115,6 +138,8 @@ int main(int argc, const char** argv) {
                    "       --timeline-assets PROJECT REPLACEMENT\n"
                    "       --timeline-verify-assets FIRST REPLACEMENT DIRECTORY\n"
                    "       --timeline-verify-tracking DIRECTORY\n"
+                   "       --timeline-verify-masks DIRECTORY\n"
+                   "       --timeline-mask-preview PROJECT [SECONDS]\n"
                    "       --timeline-tracking-preview PROJECT [SECONDS]\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << '\n';

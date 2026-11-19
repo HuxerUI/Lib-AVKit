@@ -43,6 +43,7 @@ AnalysisWindow Window(AnalysisCapability capability, bool ordered) {
     case BodyLandmarks: return {2, 1, Tick(1), false, true};
     case FaceLandmarks: return {};
     case HandLandmarks: return {1, 2, Tick(1), false, false};
+    case PortraitMask: break;
   }
   throw std::invalid_argument("Unknown mock model");
 }
@@ -172,6 +173,7 @@ public:
 
   Result<AnalysisWindow, std::string> Probe(const AnalysisConfig& config) const override {
     using ProbeResult = Result<AnalysisWindow, std::string>;
+    if (config.capability == PortraitMask) return ProbeResult::Failure("Mock tracking has no mask capability");
     if (!state_->hands && config.capability == HandLandmarks) return ProbeResult::Failure("Mock hands are disabled");
     if ((config.capability == BodyLandmarks && config.uses_roi) ||
         (config.capability == HandLandmarks && !config.uses_roi) || !config.format.Validate())

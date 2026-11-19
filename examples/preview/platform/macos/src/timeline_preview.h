@@ -24,7 +24,8 @@ std::shared_ptr<huxerui::ExternalTexture> CreateTimelinePreview();
 void SeekTimelinePreview(bool midpoint);
 void ReplaceTimelinePreviewProject(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project);
 void StopTimelinePreview();
-void ExportTimelinePreview(std::string_view project, std::string_view destination, bool software_only);
+void ExportTimelinePreview(std::string_view project, std::string_view destination, bool software_only,
+                           std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {});
 void VerifyTimelinePreview(std::string_view first, std::string_view second, std::string_view directory);
 void VerifyTimelineCodecs(std::string_view project, std::string_view directory);
 void VerifyTimelineTransition(std::string_view first, std::string_view second, std::string_view directory);
@@ -36,6 +37,7 @@ using TimelineSeek = std::function<std::optional<huxerui::media::MediaTimestamp>
 
 struct TimelinePlaybackStats {
   std::size_t clocked_frames{};
+  std::size_t late_video_frames{};
   double maximum_video_lag_ms{};
   std::uint64_t audio_underruns{};
 };
@@ -50,7 +52,8 @@ TimelinePlaybackStats PlayTimeline(huxerui::avkit::TimelineSession& session, hux
                                    std::stop_token stop);
 void ExportComposedTimeline(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, const huxerui::File& file,
                             const huxerui::avkit::MovieCodecProviders& providers, MovieRenderer& renderer,
-                            huxerui::avkit::CodecPolicy policy, huxerui::avkit::OnCodecFallback on_fallback = {});
+                            huxerui::avkit::CodecPolicy policy, huxerui::avkit::OnCodecFallback on_fallback = {},
+                            std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {});
 #endif
 
 } // namespace avkit_preview

@@ -133,12 +133,24 @@ struct TransitionInfo {
   bool operator==(const TransitionInfo&) const = default;
 };
 
+/// @brief Portrait coverage over a solid background.
+struct BackgroundReplacement {
+  Color color;
+  /// The rectangle fills the clip destination. Coordinates refer to the oriented, pre-mirror source.
+  Rect source_crop{0, 0, 1, 1};
+  bool mirrored{};
+  /// Stable portrait model ID. An empty value selects the provider's default.
+  std::string model_id;
+  bool operator==(const BackgroundReplacement&) const = default;
+};
+
 /// @brief Clip placement, normalized canvas bounds, and clip-local stickers.
 struct ClipInfo {
   ClipId id;
   ClipPlacement placement;
   Rect destination{0, 0, 1, 1};
   std::vector<StickerInstance> stickers;
+  std::optional<BackgroundReplacement> background;
   bool operator==(const ClipInfo&) const = default;
 };
 
@@ -181,6 +193,8 @@ public:
   void SetClip(ClipId clip, ClipPlacement placement);
   /// @brief Sets normalized canvas bounds for a clip.
   void SetLayout(ClipId clip, Rect destination);
+  /// @brief Sets or removes a visual clip's background replacement and model selection.
+  void SetBackground(ClipId clip, std::optional<BackgroundReplacement> background);
   /// @brief Attaches an independently editable sticker to a visual clip.
   InstanceId AddSticker(ClipId clip, StickerSpec spec);
   /// @brief Sets an instance's bounds in its clip or anchor coordinates.

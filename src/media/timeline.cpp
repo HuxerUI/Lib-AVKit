@@ -10,10 +10,13 @@
 #include <stdexcept>
 #include <system_error>
 
+#include "analysis/source_mask.h"
 #include "analysis/tracking.h"
 #include "project/project_internal.h"
 #include "support/cancellation.h"
+#include "support/geometry.h"
 #include "support/media_time.h"
+#include "support/video_geometry.h"
 
 namespace huxerui::avkit {
 namespace {
@@ -36,12 +39,70 @@ MediaTimestamp SourceTime(const ClipPlacement& clip, MediaTimestamp time) {
   return clip.source.reverse ? Difference(clip.source.range.end, offset) : Add(clip.source.range.start, offset);
 }
 
+struct ReverseVideoCache {
+  struct Entry {
+    VideoFrame picture;
+    std::size_t bytes;
+  };
+
+  bool Append(VideoFrame picture) {
+    constexpr std::size_t kCpuByteLimit = 64 * 1024 * 1024;
+    constexpr std::size_t kCpuFrameLimit = 64, kPlatformFrameLimit = 8;
+    const auto storage = picture.Storage();
+    const bool cpu = storage == VideoStorage::Cpu;
+    const auto limit = cpu ? kCpuFrameLimit : kPlatformFrameLimit;
+    std::size_t bytes = 0;
+    for (const auto& plane : picture.planes) {
+      const auto size = plane.data.AsBytes().size();
+      if (size > kCpuByteLimit - bytes) {
+        bytes = kCpuByteLimit + 1;
+        break;
+      }
+      bytes += size;
+    }
+    const auto previous_size = entries.size();
+    while (!entries.empty() && (entries.back().picture.Storage() != storage || entries.size() >= limit ||
+                                retained_bytes > kCpuByteLimit || bytes > kCpuByteLimit - retained_bytes)) {
+      retained_bytes -= entries.front().bytes;
+      entries.pop_front();
+    }
+    const bool evicted = previous_size != entries.size();
+    // Own cached CPU planes so reverse playback cannot exhaust a decoder's output pool.
+    // A picture larger than the byte budget is kept alone without copying it.
+    if (cpu && bytes <= kCpuByteLimit) {
+      for (auto& plane : picture.planes) {
+        const auto data = plane.data.AsBytes();
+        const auto owned = std::make_shared<Bytes>(data.begin(), data.end());
+        plane.data = BufferReference(*owned, owned);
+      }
+    }
+    entries.push_back({std::move(picture), bytes});
+    retained_bytes += bytes;
+    return evicted;
+  }
+
+  std::deque<Entry> entries;
+  std::size_t retained_bytes{};
+};
+
 struct VideoCursor {
+  bool CoversReverse(MediaTimestamp source) const {
+    return reverse_window && Before(reverse_window->start, source) && !Before(reverse_window->end, source);
+  }
+
+  VideoFrame* CachedReverse(MediaTimestamp source) {
+    const auto entry = std::ranges::find_if(reverse.entries, [&](const ReverseVideoCache::Entry& entry) {
+      const auto& picture = entry.picture;
+      return Before(picture.pts, source) && !Before(Add(picture.pts, *picture.duration), source);
+    });
+    return entry == reverse.entries.end() ? nullptr : &entry->picture;
+  }
+
   std::unique_ptr<MovieReader> reader;
   std::optional<VideoFrame> frame;
   std::optional<MediaTimestamp> last;
   std::optional<TimeRange> reverse_window;
-  std::deque<VideoFrame> reverse_frames;
+  ReverseVideoCache reverse;
 };
 
 struct AudioCursor {
@@ -69,6 +130,7 @@ struct VideoClip {
   std::optional<std::uint32_t> subcomposition;
   std::unique_ptr<detail::SourceTracking> tracking;
   bool software_video{};
+  std::unique_ptr<detail::SourceMask> mask;
 };
 
 struct TransitionLayer {
@@ -107,32 +169,35 @@ float FeatherAt(const TransitionSpec& spec, MediaTimestamp offset) {
   return std::lerp(lower.value, upper->value, static_cast<float>(fraction));
 }
 
-Rect VideoContent(const VideoFormat& format, PixelSize canvas) {
-  // Match the integer placement of Lib-Media's Contain texture fit used by the timeline compositor.
-  double width = double(format.visible.width) * format.aspect_width / format.aspect_height;
-  double height = format.visible.height;
-  if (format.rotation == VideoRotation::Clockwise90 || format.rotation == VideoRotation::Clockwise270)
-    std::swap(width, height);
-  const auto fit = std::min(canvas.width / width, canvas.height / height);
-  const auto w = std::clamp(std::lround(width * fit), 1L, long(canvas.width));
-  const auto h = std::clamp(std::lround(height * fit), 1L, long(canvas.height));
-  return {float((canvas.width - w) / 2) / canvas.width, float((canvas.height - h) / 2) / canvas.height,
-          float(w) / canvas.width, float(h) / canvas.height};
+Transform2D UvRect(Rect rect) {
+  return {rect.width, 0, 0, rect.height, rect.x, rect.y};
+}
+
+Transform2D DrawToSource(const BackgroundReplacement& effect) {
+  auto transform = UvRect(effect.source_crop);
+  if (effect.mirrored) {
+    transform.translate_x += transform.m11;
+    transform.m11 = -transform.m11;
+  }
+  return transform;
 }
 
 std::optional<Transform2D> AnchorTransform(const analysis::TrackingAnchor& anchor, const analysis::PersonSample& person,
-                                           Rect content, PixelSize canvas) {
+                                           const Transform2D& source_to_clip, PixelSize canvas) {
   const auto& part = anchor.part == analysis::TrackedPart::Face ? person.face
                      : anchor.part == analysis::TrackedPart::LeftHand ? person.left_hand : person.right_hand;
   if (!part || part->observed != person.target) return std::nullopt;
   const auto origin = detail::FindLandmark(*part, anchor.point);
   if (!origin) return std::nullopt;
-  const Point position{content.x + origin->x * content.width, content.y + origin->y * content.height};
-  if (!anchor.axis_point) return Transform2D{content.width, 0, 0, content.height, position.x, position.y};
+  const auto position = source_to_clip.Apply(*origin);
+  if (!anchor.axis_point)
+    return Transform2D{std::hypot(source_to_clip.m11, source_to_clip.m12), 0, 0,
+                       std::hypot(source_to_clip.m21, source_to_clip.m22), position.x, position.y};
   const auto axis = detail::FindLandmark(*part, *anchor.axis_point);
   if (!axis || *axis == *origin) return std::nullopt;
-  const auto x = (axis->x - origin->x) * content.width;
-  const auto y = (axis->y - origin->y) * content.height;
+  const auto dx = axis->x - origin->x, dy = axis->y - origin->y;
+  const auto x = dx * source_to_clip.m11 + dy * source_to_clip.m21;
+  const auto y = dx * source_to_clip.m12 + dy * source_to_clip.m22;
   return Transform2D{x, y, -y * canvas.height / canvas.width, x * canvas.width / canvas.height, position.x, position.y};
 }
 
@@ -206,6 +271,8 @@ struct TimelineSession::Impl {
 
   void AddVideo(const ClipInfo& clip, const MovieAsset& movie) {
     auto& node = pictures.emplace_back(VideoClip{&clip, &movie, AddLayer(clip.destination, render::Blend::Replace)});
+    if (clip.background)
+      node.mask = std::make_unique<detail::SourceMask>(analysis_provider, clip.id.value, clip.background->model_id);
     std::vector<analysis::TrackedPart> parts;
     for (const auto& instance : clip.stickers) {
       auto entity = AddLayer(instance.spec.destination, render::Blend::PremultipliedOver);
@@ -272,34 +339,30 @@ struct TimelineSession::Impl {
 
   VideoFrame* ReversePicture(VideoClip& clip, MediaTimestamp source, std::stop_token stop) {
     auto& cursor = clip.cursor;
-    if (!cursor.reverse_window || !Before(cursor.reverse_window->start, source) || Before(cursor.reverse_window->end, source)) {
-      cursor.reverse_window.reset();
-      cursor.reverse_frames.clear();
-      cursor.reader.reset();
+    if (!cursor.CoversReverse(source)) {
+      cursor = {};
       const auto trim = clip.clip->placement.source.range.start;
       const auto earliest = Difference(source, {1, 4});
       auto begin = Before(earliest, trim) ? trim : earliest;
       cursor.reader = Open(*clip.movie, TrackKind::Video, begin, clip.software_video);
-      while (auto picture = cursor.reader->ReadVideo(stop)) {
+      bool evicted = false;
+      while (auto picture = cursor.reader->ReadVideoInternal(stop, trim)) {
         if (!Before(picture->pts, source)) break;
         const auto end = Add(picture->pts, *picture->duration);
-        if (cursor.reverse_frames.size() == 8) {
-          cursor.reverse_frames.pop_front();
-          if (Before(begin, cursor.reverse_frames.front().pts)) begin = cursor.reverse_frames.front().pts;
-        }
-        cursor.reverse_frames.push_back(std::move(*picture));
+        if (cursor.reverse.Append(std::move(*picture))) evicted = true;
         if (!Before(end, source)) break;
+      }
+      if (!cursor.reverse.entries.empty()) {
+        const auto first = cursor.reverse.entries.front().picture.pts;
+        begin = std::max(trim, evicted ? first : std::min(begin, first, Before), Before);
       }
       cursor.reverse_window = TimeRange{begin, source};
     }
-    const auto picture = std::ranges::find_if(cursor.reverse_frames, [&](const VideoFrame& frame) {
-      return Before(frame.pts, source) && !Before(Add(frame.pts, *frame.duration), source);
-    });
-    return picture == cursor.reverse_frames.end() ? nullptr : &*picture;
+    return cursor.CachedReverse(source);
   }
 
-  render::ColorSurface PreparePicture(VideoClip& clip, VideoFrame*& picture, const ImportVideoFrame& import,
-                                      std::stop_token stop) {
+  render::ImportedVideoFrame PreparePicture(VideoClip& clip, VideoFrame*& picture, const ImportVideoFrame& import,
+                                             std::stop_token stop) {
     try {
       return import(*picture);
     } catch (const PlatformVideoImportError& error) {
@@ -307,10 +370,10 @@ struct TimelineSession::Impl {
       clip.software_video = true;
       if (clip.clip->placement.source.reverse) {
         auto& cursor = clip.cursor;
-        cursor.reverse_frames.clear();
+        cursor.reverse = {};
         cursor.reverse_window = TimeRange{replacement.pts, Add(replacement.pts, *replacement.duration)};
-        cursor.reverse_frames.push_back(std::move(replacement));
-        picture = &cursor.reverse_frames.front();
+        cursor.reverse.Append(std::move(replacement));
+        picture = &cursor.reverse.entries.front().picture;
       } else {
         *picture = std::move(replacement);
       }
@@ -347,7 +410,7 @@ struct TimelineSession::Impl {
   }
 
   TimelineFrame SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
-                            const ImportVideoFrame& import) {
+                            const ImportVideoFrame& import, std::optional<std::chrono::milliseconds> mask_wait) {
     CheckCancelled(stop);
     if (!Contains(range, at)) throw std::out_of_range("Sample time is outside the project interval");
     TimelineFrame frame{at, {}, {}};
@@ -355,6 +418,7 @@ struct TimelineSession::Impl {
       if ((clip.cursor.reader || clip.cursor.reverse_window) && !NeedsPicture(clip, at)) {
         clip.cursor = {};
         if (clip.tracking) clip.tracking->Reset();
+        if (clip.mask) clip.mask->Reset();
       }
       clip.subcomposition.reset();
     }
@@ -370,6 +434,14 @@ struct TimelineSession::Impl {
         node.to->subcomposition = subcomposition_count++;
       }
     }
+    struct MaskSample {
+      VideoClip& clip;
+      const VideoFrame& image;
+      Transform2D draw_to_source;
+      render::SourceSampling sampling;
+      std::unique_ptr<detail::SourceMask::Request> request;
+    };
+    std::vector<MaskSample> masks;
     for (auto& clip : pictures) {
       if (clip.subcomposition) clip.subcomposition_root.set<SubcompositionRoot>({*clip.subcomposition});
       else if (clip.subcomposition_root && clip.subcomposition_root.has<SubcompositionRoot>())
@@ -385,10 +457,29 @@ struct TimelineSession::Impl {
       }
       if (!image) continue;
       clip.layer.get_mut<CompositeLayer>().input_slot = static_cast<std::uint32_t>(frame.inputs.size());
-      if (import) frame.inputs.emplace_back(PreparePicture(clip, image, import, stop));
-      else frame.inputs.emplace_back(*image);
+      Transform2D content;
+      if (import) {
+        auto prepared = PreparePicture(clip, image, import, stop);
+        content = prepared.source_to_texture_uv;
+        if (!detail::IsFinite(content)) throw std::invalid_argument("Invalid imported video texture UV mapping");
+        frame.inputs.emplace_back(std::move(prepared.surface));
+      } else {
+        frame.inputs.emplace_back(*image);
+        if (clip.mask || clip.tracking) {
+          const VideoTextureOptions options{project->canvas.width, project->canvas.height, ImageFit::Contain};
+          content = detail::FitVideoTexture(image->format, options).SourceToTextureUv(options);
+        }
+      }
       const analysis::PersonSample* primary = nullptr;
-      Rect content;
+      auto source_to_clip = content;
+      if (clip.mask) {
+        const auto& effect = *clip.clip->background;
+        const auto draw_to_source = DrawToSource(effect);
+        source_to_clip = {1 / draw_to_source.m11, 0, 0, 1 / draw_to_source.m22,
+                          -draw_to_source.translate_x / draw_to_source.m11,
+                          -draw_to_source.translate_y / draw_to_source.m22};
+        masks.push_back({clip, *image, draw_to_source, {detail::Compose(content, draw_to_source)}, {}});
+      }
       if (clip.tracking) {
         const auto& tracking = clip.tracking->Sample(*image, [&](const auto& target, const auto& window) {
           return AnalysisImages(clip, target, window, stop);
@@ -410,13 +501,12 @@ struct TimelineSession::Impl {
           const auto person = std::ranges::find(tracking.people, *tracking.primary, &analysis::PersonSample::person);
           if (person != tracking.people.end()) {
             primary = &*person;
-            content = VideoContent(image->format, project->canvas);
           }
         }
       }
       for (const auto& sticker : clip.stickers) {
         if (sticker.anchor) {
-          const auto transform = primary ? AnchorTransform(*sticker.spec->anchor, *primary, content, project->canvas)
+          const auto transform = primary ? AnchorTransform(*sticker.spec->anchor, *primary, source_to_clip, project->canvas)
                                          : std::nullopt;
           if (!transform) {
             sticker.entity.disable();
@@ -433,12 +523,22 @@ struct TimelineSession::Impl {
         if (found == frame.inputs.end()) frame.inputs.emplace_back(sticker.spec->resource);
       }
     }
+    for (auto& item : masks) item.request = item.clip.mask->Submit(item.image, stop, mask_wait);
+    for (auto& item : masks) {
+      if (auto mask = item.clip.mask->Collect(std::move(item.request))) {
+        item.sampling.background = render::BackgroundMask{static_cast<std::uint32_t>(frame.analysis_masks.size()),
+            detail::Compose(mask->source_to_texture_uv, item.draw_to_source), mask->valid_uv,
+            item.clip.clip->background->color};
+        frame.analysis_masks.push_back(std::move(mask->surface));
+      }
+      item.clip.layer.set<render::SourceSampling>(std::move(item.sampling));
+    }
     for (auto& node : transitions) {
       const auto& spec = node.transition->spec;
       if (!node.visible) continue;
       if (!node.from->visible || !node.to->visible) throw std::runtime_error("Transition requires both source pictures");
       const auto offset = Difference(at, spec.range.start);
-      const auto mask_slot = static_cast<std::uint32_t>(frame.masks.size());
+      const auto mask_slot = static_cast<std::uint32_t>(frame.analysis_masks.size() + frame.masks.size());
       frame.masks.push_back({spec.mask, offset, Difference(spec.range.end, spec.range.start)});
       const auto first = static_cast<std::uint32_t>(frame.inputs.size());
       node.layer.get_mut<CompositeLayer>().input_slot = first + *node.from->subcomposition;
@@ -546,6 +646,23 @@ struct TimelineSession::Impl {
     return {pcm, {start, pcm.sample_rate}, count, {BufferReference(std::as_bytes(std::span(*samples)), samples)}};
   }
 
+  void Reset(std::optional<MediaTimestamp> seek) {
+    for (auto& clip : pictures) {
+      const VideoFrame* cached = nullptr;
+      if (seek && clip.clip->placement.source.reverse && NeedsPicture(clip, *seek)) {
+        const auto source = SourceTime(clip.clip->placement, *seek);
+        if (clip.cursor.CoversReverse(source)) cached = clip.cursor.CachedReverse(source);
+      }
+      if (!cached || cached->Storage() != VideoStorage::Cpu) clip.cursor = {};
+      if (clip.tracking) clip.tracking->Reset();
+      if (clip.mask) clip.mask->Reset();
+    }
+    for (auto& clip : sounds) {
+      clip.cursor = {};
+      clip.reverse_pcm = std::vector<std::int16_t>{};
+    }
+  }
+
   std::shared_ptr<const ProjectSnapshot> project;
   MovieCodecProviders providers;
   CodecPolicy policy;
@@ -574,9 +691,10 @@ void TimelineSession::ApplyProject(std::shared_ptr<const ProjectSnapshot> projec
 }
 
 TimelineFrame TimelineSession::SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
-                                           const ImportVideoFrame& import) {
+                                           const ImportVideoFrame& import,
+                                           std::optional<std::chrono::milliseconds> mask_wait) {
   try {
-    return impl_->SampleVideo(at, output, stop, import);
+    return impl_->SampleVideo(at, output, stop, import, mask_wait);
   } catch (const std::system_error& error) {
     if (error.code() == std::errc::operation_canceled) Reset();
     throw;
@@ -589,15 +707,11 @@ AudioFrame TimelineSession::SampleAudio(MediaTimestamp start, std::uint32_t samp
   return impl_->SampleAudio(start, samples);
 }
 
-void TimelineSession::Reset() {
-  for (auto& clip : impl_->pictures) {
-    clip.cursor = {};
-    if (clip.tracking) clip.tracking->Reset();
-  }
-  for (auto& clip : impl_->sounds) {
-    clip.cursor = {};
-    clip.reverse_pcm = std::vector<std::int16_t>{};
-  }
+void TimelineSession::Seek(MediaTimestamp at) {
+  if (!Contains(impl_->range, at)) throw std::out_of_range("Seek time is outside the project interval");
+  impl_->Reset(at);
 }
+
+void TimelineSession::Reset() { impl_->Reset(std::nullopt); }
 
 } // namespace huxerui::avkit

@@ -150,10 +150,10 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
           picture = reader.ReadVideo(stop);
           if (picture) {
             try {
-              pending_surface = renderer.ImportFrame(*picture);
+              pending_surface = renderer.ImportFrame(*picture).surface;
             } catch (const PlatformVideoImportError& error) {
               picture = reader.RetryVideoFrame(*picture, error, stop);
-              pending_surface = renderer.ImportFrame(*picture);
+              pending_surface = renderer.ImportFrame(*picture).surface;
             }
           }
         }

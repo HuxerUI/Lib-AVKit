@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "support/geometry.h"
+
 namespace huxerui::avkit {
 namespace {
 
@@ -29,12 +31,7 @@ struct ResolvedLayer {
   std::optional<Transform2D> transform;
 };
 
-Transform2D Compose(const Transform2D& outer, const Transform2D& inner) {
-  const auto origin = outer.Apply({inner.translate_x, inner.translate_y});
-  return {outer.m11 * inner.m11 + outer.m21 * inner.m12, outer.m12 * inner.m11 + outer.m22 * inner.m12,
-          outer.m11 * inner.m21 + outer.m21 * inner.m22, outer.m12 * inner.m21 + outer.m22 * inner.m22,
-          origin.x, origin.y};
-}
+using detail::Compose;
 
 } // namespace
 
@@ -46,6 +43,7 @@ struct SceneEvaluator::Impl {
     world.component<Transform2D>();
     world.component<SubcompositionRoot>();
     world.component<render::MaskedBlend>();
+    world.component<render::SourceSampling>();
     world.component<FrameContext>().add(flecs::Singleton);
     world.set<FrameContext>({});
     layers = world.query<const CompositeLayer>();
@@ -123,9 +121,11 @@ std::shared_ptr<const render::RenderPlan> SceneEvaluator::Evaluate(media::MediaT
   state.layers.each([&](flecs::entity entity, const CompositeLayer& layer) {
     if (const auto resolved = state.Resolve(entity)) {
       const auto* mask = entity.try_get<render::MaskedBlend>();
+      const auto* sampling = entity.try_get<render::SourceSampling>();
       state.ordered.push_back({layer.order, resolved->subcomposition,
                                {layer.input_slot, layer.blend, resolved->destination,
-                                mask ? std::optional{*mask} : std::nullopt, resolved->transform}});
+                                mask ? std::optional{*mask} : std::nullopt, resolved->transform,
+                                sampling ? std::optional{*sampling} : std::nullopt}});
     } else {
       invalid_transform = true;
     }

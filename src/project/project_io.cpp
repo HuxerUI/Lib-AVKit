@@ -81,7 +81,10 @@ void Project::Save(const File& destination) const {
   const bool tracked = any_clip([](const auto& clip) {
     return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.anchor.has_value(); });
   });
-  const int version = tracked ? 4 : versioned_assets || reversed ? 3 : project.transitions.empty() ? 1 : 2;
+  const bool backgrounds = any_clip([](const auto& clip) { return clip.background.has_value(); });
+  const bool selected_models = any_clip([](const auto& clip) { return clip.background && !clip.background->model_id.empty(); });
+  const int version = selected_models ? 6 : backgrounds ? 5 : tracked ? 4 : versioned_assets || reversed ? 3 :
+                      project.transitions.empty() ? 1 : 2;
   output << "AVKIT_PROJECT " << version << '\n';
   output << "canvas " << project.canvas.width << ' ' << project.canvas.height << '\n';
   output << "revision " << project.revision << ' ' << project.next_id << '\n';
@@ -109,6 +112,17 @@ void Project::Save(const File& destination) const {
       Put(output, clip.destination);
       output << ' ' << clip.stickers.size();
       if (version >= 3) output << ' ' << placement.source.reverse;
+      if (version >= 5) {
+        output << ' ' << clip.background.has_value();
+        if (clip.background) {
+          const auto& effect = *clip.background;
+          output << ' ' << effect.color.red << ' ' << effect.color.green << ' ' << effect.color.blue << ' '
+                 << effect.color.alpha << ' ';
+          Put(output, effect.source_crop);
+          output << ' ' << effect.mirrored;
+          if (version >= 6) output << ' ' << std::quoted(effect.model_id);
+        }
+      }
       output << '\n';
       for (const auto& sticker : clip.stickers) {
         const auto& resource = sticker.spec.resource;
@@ -162,7 +176,7 @@ Project Project::Open(const File& source) {
   input.imbue(std::locale::classic());
   Tag(input, "AVKIT_PROJECT");
   const auto version = Read<unsigned>(input);
-  if (version < 1 || version > 4) throw std::runtime_error("Unsupported project document version");
+  if (version < 1 || version > 6) throw std::runtime_error("Unsupported project document version");
   ProjectSnapshot project;
   Tag(input, "canvas");
   project.canvas = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
@@ -192,6 +206,11 @@ Project Project::Open(const File& source) {
           ReadRect(input), {}};
       const auto sticker_count = Read<std::size_t>(input);
       if (version >= 3) clip.placement.source.reverse = Read<bool>(input);
+      if (version >= 5 && Read<bool>(input)) {
+        const Color color{Read<float>(input), Read<float>(input), Read<float>(input), Read<float>(input)};
+        clip.background = BackgroundReplacement{color, ReadRect(input), Read<bool>(input),
+                                                 version >= 6 ? Text(input) : std::string{}};
+      }
       for (auto stickers = sticker_count; stickers; --stickers) {
         Tag(input, "sticker");
         StickerInstance sticker{{Read<std::uint64_t>(input)}, {{Text(input), Text(input), Text(input)}, ReadRect(input)}};

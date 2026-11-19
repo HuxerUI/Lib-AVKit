@@ -1,10 +1,12 @@
 #pragma once
 
 /// @file
-/// @brief CPU landmark analysis using versioned ncnn model packs. Link AVKit::NCNN.
+/// @brief CPU vision analysis using versioned ncnn model packs. Link AVKit::NCNN.
 
 #include <huxerui/avkit/analysis.h>
 #include <huxerui/resource.h>
+
+#include <string_view>
 
 namespace huxerui::avkit::analysis {
 
@@ -20,15 +22,24 @@ struct NcnnBodyHandModels {
   NcnnModelAssets palm_detector, hand_landmarks;
 };
 
-/// @brief Model packs loaded into one CPU landmark provider.
+/// @brief Model IDs accepted by the ncnn portrait capability and stored in timeline effects.
+inline constexpr std::string_view kMediaPipeSelfieModelId = "mediapipe-selfie-256-v1";
+inline constexpr std::string_view kPPHumanSegV2LiteModelId = "pp-humansegv2-lite-192-v1";
+
+/// @brief Model packs loaded into one CPU analysis provider.
 struct NcnnAnalysisModels {
   std::optional<NcnnModelAssets> face;
   std::optional<NcnnBodyHandModels> body_hand;
+  /// MediaPipe Selfie Segmentation 256x256, selected by default.
+  std::optional<NcnnModelAssets> portrait;
+  /// PP-HumanSegV2-Lite general model converted using the documented 256x256 RGB and coverage interface.
+  std::optional<NcnnModelAssets> portrait_wide;
 };
 
 /// @brief Loads shared models and opens independent analysis sessions for unrotated SDR I420 CPU frames.
 /// Body sessions associate observations with their first valid reference picture. Hand sessions
 /// require body-derived regions and return source-space points with the input region index.
+/// Portrait sessions use one full picture per job and return R8Unorm foreground coverage.
 [[nodiscard]] Result<std::shared_ptr<AnalysisProvider>, std::string> CreateNcnnAnalysisProvider(
     const NcnnAnalysisModels& models);
 

@@ -93,6 +93,10 @@ public:
   std::optional<media::AudioFrame> ReadAudio(std::stop_token stop = {});
 
 private:
+  friend class TimelineSession;
+  // Retain mapped CPU preroll for the reverse cache while filtering platform pictures at the seek time.
+  std::optional<media::VideoFrame> ReadVideoInternal(std::stop_token stop, std::optional<media::MediaTimestamp> cpu_preroll);
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

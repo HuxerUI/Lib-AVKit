@@ -35,7 +35,17 @@ if (NOT TARGET ncnn)
     avkit_fetch_ncnn()
 endif ()
 
-add_library(avkit_ncnn STATIC src/analysis/ncnn_face.cpp src/analysis/ncnn_body.cpp)
+add_library(avkit_ncnn STATIC
+        src/analysis/ncnn_body.cpp
+        src/analysis/ncnn_face.cpp
+        src/analysis/ncnn_model.cpp
+        src/analysis/ncnn_portrait.cpp
+        src/analysis/ncnn_provider.cpp
+)
 add_library(AVKit::NCNN ALIAS avkit_ncnn)
 target_link_libraries(avkit_ncnn PUBLIC AVKit::Core PRIVATE ncnn)
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    find_package(Threads REQUIRED)
+    target_link_libraries(avkit_ncnn PRIVATE Threads::Threads)
+endif ()
 set_target_properties(avkit_ncnn PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)

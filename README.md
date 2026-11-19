@@ -10,7 +10,7 @@ Lib-AVKit is a C++20 audio and video post-processing library for HuxerUI. The in
 | `AVKit::Media` | Optional Lib-Media codec adapter, file readers, timeline sampling, thumbnails, waveforms, and MP4 output. |
 | `AVKit::FFmpeg` | Optional FFmpeg software codec provider for the file profile. |
 | `AVKit::Bgfx` | Shared GPU compositor with platform shader binaries and SDK texture transfer. |
-| `AVKit::NCNN` | Optional cross-platform CPU provider for face, body, and hand landmarks. |
+| `AVKit::NCNN` | Optional cross-platform CPU provider for face, body, and hand landmarks and portrait segmentation. |
 | `HuxerUI::AVKit` | HuxerUI library integration and application hook. Exposes Core and the bgfx compositor. |
 
 Core and the media orchestration use public HuxerUI and Lib-Media types. The file profile accepts MP4 or MOV with H.264 video and AAC-LC audio. The macOS example integrates Metal textures, file media, and capture. The other preview entry points run the shared compositor with a small generated image, sticker, and mask. [Platform plan](docs/architecture.md#external-video-frames)
@@ -57,3 +57,5 @@ The [video texture API](include/huxerui/avkit/video_texture.h) accepts HuxerUI c
 `AVKIT_ENABLE_FILE_MEDIA` enables the file module and defaults to off. With file media enabled, `AVKIT_ENABLE_FFMPEG=OFF` builds the module with the Lib-Media adapter. The macOS camera and microphone example can be enabled separately with `AVKIT_ENABLE_CAPTURE_PREVIEW`. It uses Lib-Camera and Lib-AudioCapture alongside the bgfx and FFmpeg targets.
 
 Set `AVKIT_ENABLE_NCNN=ON` to build `AVKit::NCNN`. The provider accepts verified [YuNet](models/yunet/2023mar) and [MediaPipe body and hand](models/mediapipe/body-hand) model packs through the [C++ factories](include/huxerui/avkit/ncnn.h). See the [tracking verification](docs/architecture.md#ncnn-body-and-hand-provider) for the macOS preview, seek, and export commands.
+
+Portrait background replacement uses [MediaPipe Selfie Segmentation](models/mediapipe/selfie-segmentation) by default. Clips can select the optional [PP-HumanSegV2-Lite](models/paddle/pp-humansegv2-lite) pack independently. [Model selection and verification](docs/architecture.md#ncnn-portrait-segmentation)

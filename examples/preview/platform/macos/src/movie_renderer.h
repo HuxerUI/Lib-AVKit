@@ -15,7 +15,7 @@ public:
   explicit MovieRenderer(huxerui::avkit::PixelSize size);
   ~MovieRenderer();
 
-  huxerui::avkit::render::ColorSurface ImportFrame(const huxerui::media::VideoFrame& input);
+  huxerui::avkit::render::ImportedVideoFrame ImportFrame(const huxerui::media::VideoFrame& input);
   huxerui::avkit::render::ColorSurface Draw(const huxerui::avkit::render::ColorSurface& input,
       huxerui::media::MediaTimestamp time, bool cue = false);
   huxerui::avkit::render::ColorSurface Draw(const huxerui::media::VideoFrame& input, bool cue = false);

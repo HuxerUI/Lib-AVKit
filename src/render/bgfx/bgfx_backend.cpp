@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "texture_bridge.h"
+#include "support/geometry.h"
 #include "avkit_fs_composite.h"
 #include "avkit_fs_masked_blend.h"
 #include "avkit_vs_composite.h"
@@ -23,6 +24,7 @@ static_assert(BGFX_CONFIG_MULTITHREADED == 0, "The bgfx compositor requires inli
 
 constexpr std::uint64_t kSamplerFlags =
     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_POINT;
+constexpr std::uint32_t kCoverageSamplerFlags = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
 const detail::CompositeShaders kCompositeShaders{avkit_vs_composite, avkit_fs_composite, avkit_fs_masked_blend};
 std::atomic_flag bgfx_in_use = ATOMIC_FLAG_INIT;
 
@@ -58,17 +60,6 @@ bool IsColor(PixelFormat format) {
   return format == PixelFormat::Rgba8Unorm || format == PixelFormat::Bgra8Unorm;
 }
 
-class PixelStorage final : public SurfaceStorage {
-public:
-  PixelStorage(ImageDesc image, BufferReference bytes, std::size_t stride, RowOrigin origin)
-      : image(image), bytes(std::move(bytes)), stride(stride), origin(origin) {}
-
-  ImageDesc image;
-  BufferReference bytes;
-  std::size_t stride;
-  RowOrigin origin;
-};
-
 std::size_t RowBytes(ImageDesc image) {
   const auto width = std::size_t(image.size.width);
   return image.format == PixelFormat::R8Unorm ? width : width * 4;
@@ -89,14 +80,12 @@ struct Vertex {
   float x, y, z, u, v;
 };
 
-bgfx::VertexBufferHandle CreateQuad(bool flip_v) {
-  const float top = flip_v ? 1.0F : 0.0F;
-  const float bottom = 1.0F - top;
+bgfx::VertexBufferHandle CreateQuad() {
   const Vertex vertices[] = {
-      {-1.0F, +1.0F, 0.0F, 0.0F, top},
-      {-1.0F, -1.0F, 0.0F, 0.0F, bottom},
-      {+1.0F, +1.0F, 0.0F, 1.0F, top},
-      {+1.0F, -1.0F, 0.0F, 1.0F, bottom},
+      {-1.0F, +1.0F, 0.0F, 0.0F, 0.0F},
+      {-1.0F, -1.0F, 0.0F, 0.0F, 1.0F},
+      {+1.0F, +1.0F, 0.0F, 1.0F, 0.0F},
+      {+1.0F, -1.0F, 0.0F, 1.0F, 1.0F},
   };
   bgfx::VertexLayout layout;
   layout.begin()
@@ -178,14 +167,14 @@ public:
     input_alpha_ = bgfx::createUniform("u_input_alpha", bgfx::UniformType::Vec4);
     mask_parameters_ = bgfx::createUniform("u_mask_parameters", bgfx::UniformType::Vec4);
     mask_region_ = bgfx::createUniform("u_mask_region", bgfx::UniformType::Vec4);
+    sampling_ = bgfx::createUniform("u_sampling", bgfx::UniformType::Vec4, 6);
     destination_ = bgfx::createUniform("u_destination", bgfx::UniformType::Vec4);
     off_diagonal_ = bgfx::createUniform("u_off_diagonal", bgfx::UniformType::Vec4);
-    top_left_ = CreateQuad(false);
-    bottom_left_ = CreateQuad(true);
+    top_left_ = CreateQuad();
     if (!bgfx::isValid(program_) || !bgfx::isValid(masked_program_) || !bgfx::isValid(sampler_) ||
         !bgfx::isValid(incoming_sampler_) || !bgfx::isValid(mask_sampler_) || !bgfx::isValid(input_flips_) ||
         !bgfx::isValid(input_alpha_) || !bgfx::isValid(mask_parameters_) || !bgfx::isValid(mask_region_) || !bgfx::isValid(destination_) ||
-        !bgfx::isValid(off_diagonal_) || !bgfx::isValid(top_left_) || !bgfx::isValid(bottom_left_)) {
+        !bgfx::isValid(off_diagonal_) || !bgfx::isValid(top_left_) || !bgfx::isValid(sampling_)) {
       throw std::runtime_error("Could not create the composite program or quad");
     }
 
@@ -215,7 +204,6 @@ public:
     for (const auto& target : subcomposition_targets_) DestroyTarget(target);
     Destroy(completion_);
     Destroy(top_left_);
-    Destroy(bottom_left_);
     Destroy(sampler_);
     Destroy(incoming_sampler_);
     Destroy(mask_sampler_);
@@ -223,6 +211,7 @@ public:
     Destroy(input_alpha_);
     Destroy(mask_parameters_);
     Destroy(mask_region_);
+    Destroy(sampling_);
     Destroy(destination_);
     Destroy(off_diagonal_);
     Destroy(masked_program_);
@@ -379,7 +368,8 @@ private:
         request.data_inputs.size() > limits.maxTextures - reserved_textures - request.inputs.size()) return false;
 
     auto remaining_draws = std::size_t(limits.maxDrawCalls);
-    const auto validate = [&](std::span<const Draw> draws, std::size_t colors, std::size_t masks) {
+    const auto masks = request.data_inputs.size();
+    const auto validate = [&](std::span<const Draw> draws, std::size_t colors, bool final_pass) {
       const auto count = std::max<std::size_t>(1, draws.size());
       if (count > remaining_draws) return false;
       remaining_draws -= count;
@@ -388,19 +378,31 @@ private:
         const auto quad = Destination(draw);
         const auto finite = [](float value) { return std::isfinite(value); };
         if (!std::ranges::all_of(quad.destination, finite) || !std::ranges::all_of(quad.off_diagonal, finite)) return false;
+        if (draw.source_sampling) {
+          const auto& sampling = *draw.source_sampling;
+          if (draw.masked_blend || !avkit::detail::IsFinite(sampling.draw_to_source_uv)) return false;
+          if (sampling.background) {
+            const auto& background = *sampling.background;
+            const auto& color = background.color;
+            if (background.mask_slot >= masks || !avkit::detail::IsFinite(background.draw_to_mask_uv) ||
+                !avkit::detail::IsUnitRect(background.valid_uv) ||
+                !std::ranges::all_of(std::array{color.red, color.green, color.blue, color.alpha},
+                                     [](float value) { return value >= 0 && value <= 1; })) return false;
+          }
+        }
         if (!draw.masked_blend) return true;
         const auto& mask = *draw.masked_blend;
         const auto& region = mask.mask_region;
-        return mask.incoming_slot < colors && mask.mask_slot < masks &&
+        return final_pass && mask.incoming_slot < colors && mask.mask_slot < masks &&
                std::isfinite(mask.feather) && mask.feather >= 0 && mask.feather <= 1 && !region.IsEmpty() &&
                std::isfinite(region.x) && std::isfinite(region.y) &&
                std::isfinite(region.width) && std::isfinite(region.height);
       });
     };
     for (const auto& pass : plan.subcompositions) {
-      if (!validate(pass.draws, request.inputs.size(), 0)) return false;
+      if (!validate(pass.draws, request.inputs.size(), false)) return false;
     }
-    return validate(plan.draws, request.inputs.size() + passes, request.data_inputs.size());
+    return validate(plan.draws, request.inputs.size() + passes, true);
   }
 
   bool FitsDevice(PixelSize size) const {
@@ -413,22 +415,20 @@ private:
   bool ValidInput(const ImageSurface& input) const {
     if (!FitsDevice(input.image.size)) return false;
     if (FindTarget(input)) return true;
-    if (const auto* pixels = dynamic_cast<const PixelStorage*>(input.storage.get())) {
-      return pixels->image == input.image && pixels->origin == input.origin &&
-             bgfx::isTextureValid(0, false, 1, BgfxFormat(input.image.format), BGFX_TEXTURE_NONE);
-    }
+    if (GetImagePixels(input))
+      return bgfx::isTextureValid(0, false, 1, BgfxFormat(input.image.format), BGFX_TEXTURE_NONE);
     return bridge_ && bridge_->GetTexture(input) != 0;
   }
 
   bgfx::TextureHandle ImportInput(const ImageSurface& input) const {
-    if (const auto* pixels = dynamic_cast<const PixelStorage*>(input.storage.get())) {
+    if (const auto pixels = GetImagePixels(input)) {
       const auto row_bytes = RowBytes(input.image);
       const auto size = std::uint64_t(row_bytes) * input.image.size.height;
       if (size > std::numeric_limits<std::uint32_t>::max()) return BGFX_INVALID_HANDLE;
       const auto* memory = bgfx::alloc(static_cast<std::uint32_t>(size));
       const auto bytes = pixels->bytes.AsBytes();
       for (std::size_t row = 0; row < input.image.size.height; ++row) {
-        std::memcpy(memory->data + row * row_bytes, bytes.data() + row * pixels->stride, row_bytes);
+        std::memcpy(memory->data + row * row_bytes, bytes.data() + row * pixels->row_bytes, row_bytes);
       }
       return CreateTexture(input.image, BGFX_TEXTURE_NONE, memory);
     }
@@ -514,10 +514,9 @@ private:
                              0.0F, 0.0F};
       bgfx::setUniform(input_alpha_, modes.data());
       auto program = program_;
-      auto vertices = origin(draw.input_slot) == RowOrigin::BottomLeft ? bottom_left_ : top_left_;
+      const auto flip = [](RowOrigin value) { return value == RowOrigin::BottomLeft ? 1.0F : 0.0F; };
       if (draw.masked_blend) {
         const auto& blend = *draw.masked_blend;
-        const auto flip = [](RowOrigin value) { return value == RowOrigin::BottomLeft ? 1.0F : 0.0F; };
         const std::array flips{flip(origin(draw.input_slot)), flip(origin(blend.incoming_slot)),
                                flip(request.data_inputs[blend.mask_slot].origin), 0.0F};
         const std::array parameters{blend.feather, blend.inverted ? 1.0F : 0.0F, 0.0F, 0.0F};
@@ -529,9 +528,35 @@ private:
         bgfx::setTexture(1, incoming_sampler_, color(blend.incoming_slot));
         bgfx::setTexture(2, mask_sampler_, handles[external_colors + blend.mask_slot]);
         program = masked_program_;
-        vertices = top_left_;
+      } else {
+        const auto sampling = draw.source_sampling.value_or(SourceSampling{});
+        std::array<std::array<float, 4>, 6> uniforms{};
+        const auto put = [&](std::size_t index, const Transform2D& uv) {
+          uniforms[index] = {uv.m11, uv.m21, uv.translate_x, 0};
+          uniforms[index + 1] = {uv.m12, uv.m22, uv.translate_y, 0};
+        };
+        put(0, sampling.draw_to_source_uv);
+        std::array flips{flip(origin(draw.input_slot)), 0.0F, 0.0F, 0.0F};
+        auto coverage = color(draw.input_slot);
+        if (sampling.background) {
+          const auto& background = *sampling.background;
+          uniforms[0][3] = 1;
+          put(2, background.draw_to_mask_uv);
+          const auto& mask = request.data_inputs[background.mask_slot];
+          uniforms[2][3] = 0.5F / mask.image.size.width;
+          uniforms[3][3] = 0.5F / mask.image.size.height;
+          const auto& valid = background.valid_uv;
+          uniforms[4] = {valid.x, valid.y, valid.width, valid.height};
+          const auto& bg = background.color;
+          uniforms[5] = {bg.red * bg.alpha, bg.green * bg.alpha, bg.blue * bg.alpha, bg.alpha};
+          flips[2] = flip(mask.origin);
+          coverage = handles[external_colors + background.mask_slot];
+        }
+        bgfx::setUniform(input_flips_, flips.data());
+        bgfx::setUniform(sampling_, uniforms.data(), uniforms.size());
+        bgfx::setTexture(2, mask_sampler_, coverage, sampling.background ? kCoverageSamplerFlags : UINT32_MAX);
       }
-      bgfx::setVertexBuffer(0, vertices);
+      bgfx::setVertexBuffer(0, top_left_);
       std::uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_PT_TRISTRIP;
       if (draw.blend == Blend::PremultipliedOver) {
         state |= BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA);
@@ -557,10 +582,10 @@ private:
   bgfx::UniformHandle input_alpha_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_parameters_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_region_ = BGFX_INVALID_HANDLE;
+  bgfx::UniformHandle sampling_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle destination_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle off_diagonal_ = BGFX_INVALID_HANDLE;
   bgfx::VertexBufferHandle top_left_ = BGFX_INVALID_HANDLE;
-  bgfx::VertexBufferHandle bottom_left_ = BGFX_INVALID_HANDLE;
   // Shutdown drains bgfx before the leases retaining its external textures are destroyed.
   BgfxContext context_;
 };
@@ -594,12 +619,7 @@ ImageSurface RetainBgfxPixels(ImageDesc image, BufferReference bytes, std::size_
   if (width == 0 || height == 0 || width > UINT16_MAX || height > UINT16_MAX) {
     throw std::invalid_argument("Invalid bgfx upload dimensions");
   }
-  const auto packed = RowBytes(image);
-  const auto size = bytes.AsBytes().size();
-  if (row_bytes < packed || size < packed || height - 1 > (size - packed) / row_bytes) {
-    throw std::invalid_argument("Pixel storage does not cover the specified rows");
-  }
-  return {image, origin, std::make_shared<PixelStorage>(image, std::move(bytes), row_bytes, origin)};
+  return RetainImagePixels(image, {std::move(bytes), row_bytes}, origin);
 }
 
 Result<BufferReference, RenderError> ReadBgfxPixels(RenderBackend& backend, const ColorSurface& surface) {

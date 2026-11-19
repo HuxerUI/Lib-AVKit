@@ -1,10 +1,10 @@
 #pragma once
 
 /// @file
-/// @brief In-process landmark inference requests, retained frame windows, and tracking anchors.
+/// @brief In-process inference requests, retained frame windows, and tracking anchors.
 ///
 /// Providers may run inference asynchronously. The sampling session validates result identity on its
-/// owning sequence before using landmarks in a render plan.
+/// owning sequence before using analysis results in a render plan.
 
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +18,7 @@
 #include <huxerui/data.h>
 #include <huxerui/geometry.h>
 #include <huxerui/media_format.h>
+#include <huxerui/avkit/render.h>
 
 namespace huxerui::avkit::analysis {
 
@@ -62,7 +63,7 @@ struct Landmark {
 };
 
 /// @brief Output requested from one model session.
-enum class AnalysisCapability { BodyLandmarks, FaceLandmarks, HandLandmarks };
+enum class AnalysisCapability { BodyLandmarks, FaceLandmarks, HandLandmarks, PortraitMask };
 
 /// @brief Exact picture format, storage, and region input requirements for a model.
 struct AnalysisConfig {
@@ -70,6 +71,8 @@ struct AnalysisConfig {
   media::VideoFormat format;
   media::VideoStorage storage;
   bool uses_roi{};
+  /// Stable model ID. An empty value selects the provider's default for this capability.
+  std::string model_id;
 };
 
 /// @brief Runtime person identity scoped to a source and analysis generation.
@@ -96,7 +99,7 @@ struct AnalysisFrame {
   media::VideoFrame image;
 };
 
-/// @brief One landmark request with the exact frame to report and its temporal context.
+/// @brief One analysis request with the exact frame to report and its temporal context.
 struct AnalysisJob {
   std::uint64_t id;
   FrameKey target;
@@ -127,18 +130,41 @@ struct AnalysisCompletion {
   Result<std::optional<std::vector<TrackingDetection>>, std::string> result;
 };
 
+/// @brief Retained R8Unorm coverage in a possibly partial source region.
+struct AnalysisTexture {
+  render::ImageSurface surface;
+  /// Maps the oriented, visible source before mirroring to the texture's logical UVs.
+  Transform2D source_to_texture_uv;
+  Rect valid_uv{0, 0, 1, 1};
+};
+
+/// @brief Coverage for one exact job. An empty optional is a skipped frame.
+/// A valid all-zero mask reports a frame with no foreground.
+struct MaskCompletion {
+  std::uint64_t job_id;
+  FrameKey target;
+  Result<std::optional<AnalysisTexture>, std::string> result;
+};
+
 /// @brief Executes jobs with the format and capability selected by the provider.
 class AnalysisSession {
 public:
   using Completion = std::function<void(AnalysisCompletion)>;
+  using MaskCallback = std::function<void(MaskCompletion)>;
 
   virtual ~AnalysisSession() = default;
-  /// @brief Submits owned frame references on the session's owning sequence.
+  /// @brief Submits a landmark job on the session's owning sequence.
+  /// The stop token requests cooperative cancellation. Release input leases promptly when cancelled.
   /// @param job Retained input frames and region assignments.
-  /// @param stop Cooperative cancellation for this job. Release input leases promptly when cancelled.
   /// @param complete May run inline or on another sequence, including after session destruction.
   /// Deliver one matching completion for each job that reaches completion.
-  virtual void Submit(AnalysisJob job, std::stop_token stop, Completion complete) = 0;
+  virtual void Submit(AnalysisJob job, std::stop_token, Completion complete) {
+    complete({job.id, job.target, decltype(AnalysisCompletion::result)::Failure("Landmark submission is unavailable")});
+  }
+  /// @brief Submits a portrait mask job under the same lifetime and cancellation contract as Submit.
+  virtual void SubmitMask(AnalysisJob job, std::stop_token, MaskCallback complete) {
+    complete({job.id, job.target, decltype(MaskCompletion::result)::Failure("Portrait mask submission is unavailable")});
+  }
 };
 
 /// @brief Probes an input contract and opens independent model sessions.

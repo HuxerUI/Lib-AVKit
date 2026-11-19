@@ -74,10 +74,10 @@ struct MovieRenderer::Impl {
   }
 
   ColorSurface Draw(const VideoFrame& input, bool cue) {
-    return DrawSticker(ImportFrame(input), input.pts, cue);
+    return DrawSticker(ImportFrame(input).surface, input.pts, cue);
   }
 
-  ColorSurface ImportFrame(const VideoFrame& input) {
+  ImportedVideoFrame ImportFrame(const VideoFrame& input) {
     auto result = render::detail::ImportDecodedBgfxFrame(*backend_, input, {size_.width, size_.height},
                                                          TextureTransferPolicy::AllowCpuTransfer);
     if (!result.Succeeded() && input.Storage() == VideoStorage::Platform &&
@@ -102,15 +102,15 @@ struct MovieRenderer::Impl {
       inputs.reserve(frame.inputs.size());
       for (const auto& input : frame.inputs) {
         if (const auto* picture = std::get_if<VideoFrame>(&input)) {
-          inputs.push_back(ImportFrame(*picture));
+          inputs.push_back(ImportFrame(*picture).surface);
         } else if (const auto* surface = std::get_if<ColorSurface>(&input)) {
           inputs.push_back(*surface);
         } else {
           inputs.push_back(Sticker(std::get<ResourceRef>(input)));
         }
       }
-      std::vector<ImageSurface> masks;
-      masks.reserve(frame.masks.size());
+      auto masks = frame.analysis_masks;
+      masks.reserve(masks.size() + frame.masks.size());
       for (const auto& sample : frame.masks) masks.push_back(Mask(sample));
       return Render({frame.plan, std::move(inputs), std::move(masks)});
     }
@@ -271,7 +271,7 @@ private:
 MovieRenderer::MovieRenderer(PixelSize size) : impl_(std::make_unique<Impl>(size)) {}
 MovieRenderer::~MovieRenderer() = default;
 
-ColorSurface MovieRenderer::ImportFrame(const VideoFrame& input) { return impl_->ImportFrame(input); }
+ImportedVideoFrame MovieRenderer::ImportFrame(const VideoFrame& input) { return impl_->ImportFrame(input); }
 
 ColorSurface MovieRenderer::Draw(const ColorSurface& input, MediaTimestamp time, bool cue) {
   return impl_->Draw(input, time, cue);

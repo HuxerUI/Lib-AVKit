@@ -6,6 +6,7 @@
 /// Render plans carry normalized layout and input indices. A platform bridge supplies retained color
 /// and data surfaces, and the backend owns GPU submission and completion.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include <huxerui/data.h>
+#include <huxerui/color.h>
 #include <huxerui/geometry.h>
 
 namespace huxerui::avkit {
@@ -59,10 +61,30 @@ struct ImageSurface {
   std::shared_ptr<const SurfaceStorage> storage;
 };
 
+/// @brief Retained packed CPU rows accepted by render backends that support texture uploads.
+struct ImagePixels {
+  BufferReference bytes;
+  std::size_t row_bytes;
+};
+
+/// @brief Creates a backend-independent image lease from retained CPU rows.
+ImageSurface RetainImagePixels(ImageDesc image, ImagePixels pixels, RowOrigin origin = RowOrigin::TopLeft);
+
+/// @brief Returns the retained rows of a CPU-backed image, if available.
+std::optional<ImagePixels> GetImagePixels(const ImageSurface& surface);
+
 /// @brief Retained color image with an explicit alpha interpretation.
 struct ColorSurface {
   ImageSurface pixels;
   AlphaMode alpha{AlphaMode::Premultiplied};
+};
+
+/// @brief A prepared video texture and its source-space sampling map.
+struct ImportedVideoFrame {
+  ColorSurface surface;
+  /// Maps normalized, oriented visible source coordinates before clip mirroring to logical texture UVs.
+  /// RowOrigin is handled by the renderer. A texture containing the full oriented source uses the identity map.
+  Transform2D source_to_texture_uv{};
 };
 
 /// @brief Operation used to composite a draw into its target.
@@ -81,6 +103,22 @@ struct MaskedBlend {
   bool operator==(const MaskedBlend&) const = default;
 };
 
+/// @brief Numeric foreground coverage and the solid color behind it.
+struct BackgroundMask {
+  std::uint32_t mask_slot;
+  Transform2D draw_to_mask_uv;
+  Rect valid_uv{0, 0, 1, 1};
+  Color color;
+  bool operator==(const BackgroundMask&) const = default;
+};
+
+/// @brief Maps draw-local coordinates to a logical color texture, before backend row-origin handling.
+struct SourceSampling {
+  Transform2D draw_to_source_uv;
+  std::optional<BackgroundMask> background;
+  bool operator==(const SourceSampling&) const = default;
+};
+
 /// @brief One draw in a compositing pass.
 struct Draw {
   /// Color slot. Final draws can also address subcomposition outputs after the external color inputs.
@@ -91,6 +129,7 @@ struct Draw {
   std::optional<MaskedBlend> masked_blend;
   /// Optional affine map applied to the rectangle in the same normalized coordinates.
   std::optional<Transform2D> transform;
+  std::optional<SourceSampling> source_sampling;
   bool operator==(const Draw&) const = default;
 };
 

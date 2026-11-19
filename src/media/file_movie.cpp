@@ -347,7 +347,7 @@ struct MovieReader::Impl {
     ready = true;
   }
 
-  std::optional<VideoFrame> ReadVideo(std::stop_token stop) {
+  std::optional<VideoFrame> ReadVideo(std::stop_token stop, std::optional<MediaTimestamp> cpu_preroll = {}) {
     if (selected == TrackKind::Audio) throw std::logic_error("The movie reader selected only the audio track");
     if (!ready) throw std::runtime_error("Seek has not opened the selected movie tracks");
     for (;;) {
@@ -370,8 +370,9 @@ struct MovieReader::Impl {
         frame->format.rotation = asset.video.rotation;
         std::vector<MediaPresentationSlice> slices;
         Require(MapToPresentation(asset.video.edits, frame->pts, Add(frame->pts, *frame->duration), slices));
+        const auto cutoff = frame->Storage() == VideoStorage::Cpu ? cpu_preroll.value_or(target) : target;
         for (const auto& slice : slices) {
-          if (!Before(target, slice.presentation.end)) continue;
+          if (!Before(cutoff, slice.presentation.end)) continue;
           auto copy = *frame;
           copy.pts = slice.presentation.start;
           copy.duration = Difference(slice.presentation.end, slice.presentation.start);
@@ -497,7 +498,10 @@ void MovieReader::Seek(MediaTimestamp at) {
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
 std::optional<VideoFrame> MovieReader::ReadVideo(std::stop_token stop) {
-  try { return impl_->ReadVideo(stop); }
+  return ReadVideoInternal(stop, std::nullopt);
+}
+std::optional<VideoFrame> MovieReader::ReadVideoInternal(std::stop_token stop, std::optional<MediaTimestamp> cpu_preroll) {
+  try { return impl_->ReadVideo(stop, cpu_preroll); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
 VideoFrame MovieReader::RetryVideoFrame(const VideoFrame& rejected, const PlatformVideoImportError& cause,

@@ -25,6 +25,9 @@ using namespace huxerui::avkit;
 using namespace huxerui::media;
 using huxerui::macos::MetalTexture;
 
+constexpr auto kPreviewPcmCapacity = 250ms;
+constexpr double kMaxPreviewLagMs = 100;
+
 template<class T, class E> T Require(Result<T, E> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
   if constexpr (!std::is_void_v<T>) return std::move(result).Value();
@@ -49,15 +52,20 @@ std::optional<bool> pending_seek;
 std::shared_ptr<const ProjectSnapshot> pending_project;
 std::jthread worker;
 
+render::ColorSurface DrawTimelineSample(TimelineSession& session, MovieRenderer& renderer, MediaTimestamp at,
+                                        std::stop_token stop) {
+  const auto frame = session.SampleVideo(at, render::PixelFormat::Bgra8Unorm, stop,
+                                         [&](const auto& video) { return renderer.ImportFrame(video); }, 12ms);
+  return renderer.Draw(frame);
+}
+
 } // namespace
 
 MovieCodecProviders TimelineProviders() { return {CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()}; }
 
 void RenderTimelineSample(TimelineSession& session, MovieRenderer& renderer, MediaTimestamp at, MetalTexture& mailbox,
                           std::stop_token stop) {
-  auto frame = session.SampleVideo(at, render::PixelFormat::Bgra8Unorm, stop,
-                                  [&](const auto& video) { return renderer.ImportFrame(video); });
-  PublishPreviewSurface(mailbox, renderer.Draw(frame));
+  PublishPreviewSurface(mailbox, DrawTimelineSample(session, renderer, at, stop));
 }
 
 TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, MovieRenderer& renderer,
@@ -69,23 +77,52 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
   if (range.end != end || at.Compare(range.start) == -1 || at.Compare(range.end) != -1 || next.ticks >= end.ticks)
     throw std::invalid_argument("Timeline preview needs an in-range start and a sample-aligned end");
 
-  auto playback = Require(DecodedPlayback::Create({AudioPlaybackConfig{.format = pcm}}));
+  const auto open_playback = [&](const AudioFormat& format) {
+    auto result = Require(DecodedPlayback::Create({AudioPlaybackConfig{.format = format, .buffer_capacity = kPreviewPcmCapacity}}));
+    Require(result.SetMuted(muted));
+    return result;
+  };
+  auto playback = open_playback(pcm);
   auto epoch = playback.Epoch();
-  Require(playback.SetMuted(muted));
-  Require(playback.Play());
   RenderTimelineSample(session, renderer, at, mailbox, stop);
   auto presented = at;
   std::optional<AudioFrame> sound;
   bool sealed = false;
+  bool play_requested = false;
   auto last_progress = std::chrono::steady_clock::now();
   std::optional<MediaTimestamp> position;
   TimelinePlaybackStats stats;
+  std::uint64_t retired_underruns = 0;
+
+  const auto refill = [&](MediaTimestamp buffered) {
+    const std::int64_t capacity = (kPreviewPcmCapacity.count() * pcm.sample_rate + 999) / 1000;
+    const auto remaining = end.ticks - next.ticks;
+    const auto count = std::min(remaining, capacity - buffered.ticks);
+    // Fill the available window before video can hold the producer through another decode or render.
+    if (!sound && remaining > 0 && count >= std::min<std::int64_t>({1024, capacity, remaining}))
+      sound = session.SampleAudio(next, static_cast<std::uint32_t>(count));
+    bool submitted = false;
+    if (sound && Require(playback.TrySubmitAudio(epoch, *sound)) == SubmitStatus::Accepted) {
+      next.ticks += sound->sample_count;
+      sound.reset();
+      submitted = true;
+    }
+    if (next == end) {
+      Require(playback.FinishAudio(epoch));
+      sealed = true;
+    }
+    if (submitted && !play_requested) {
+      Require(playback.Play());
+      play_requested = true;
+    }
+    return submitted || sealed;
+  };
 
   while (!stop.stop_requested()) {
     @autoreleasepool {
-      const auto state = playback.Snapshot();
+      auto state = playback.Snapshot();
       if (state.error) throw std::runtime_error(state.error->message);
-      stats.audio_underruns = std::max(stats.audio_underruns, state.audio_underruns);
+      stats.audio_underruns = retired_underruns + state.audio_underruns;
       bool progressed = position != state.position;
       position = state.position;
       if (state.state != PlaybackState::Starting && state.state != PlaybackState::Resetting) {
@@ -95,51 +132,49 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
           const auto anchor = ToGrid(*requested, format.sample_rate);
           if (new_end != range.end || requested->Compare(range.start) == -1 || requested->Compare(range.end) != -1 ||
               anchor.ticks >= new_end.ticks) throw std::out_of_range("Preview seek is outside the timeline or the PCM grid");
+          retired_underruns += playback.Snapshot().audio_underruns;
           if (format != pcm) {
             pcm = format;
             end = new_end;
-            playback = Require(DecodedPlayback::Create({AudioPlaybackConfig{.format = pcm}}));
-            Require(playback.SetMuted(muted));
+            playback = open_playback(pcm);
             epoch = playback.Epoch();
           } else {
             epoch = Require(playback.Reset());
           }
-          session.Reset();
+          session.Seek(*requested);
           sound.reset();
           sealed = false;
+          play_requested = false;
+          position.reset();
           next = anchor;
           RenderTimelineSample(session, renderer, *requested, mailbox, stop);
           presented = *requested;
-          Require(playback.Play());
           last_progress = std::chrono::steady_clock::now();
           continue;
         }
         if (stop.stop_requested()) break;
-        if (!sealed) {
-          if (!sound && next.ticks < end.ticks) {
-            const auto count = static_cast<std::uint32_t>(std::min<std::int64_t>(1024, end.ticks - next.ticks));
-            sound = session.SampleAudio(next, count);
-          }
-          if (!sound) {
-            Require(playback.FinishAudio(epoch));
-            sealed = progressed = true;
-          } else if (Require(playback.TrySubmitAudio(epoch, *sound)) == SubmitStatus::Accepted) {
-            next.ticks += sound->sample_count;
-            sound.reset();
-            progressed = true;
-          }
+        if (!sealed && refill(state.audio_buffered_duration)) {
+          progressed = true;
+          state = playback.Snapshot();
         }
       }
-      if (state.position) {
+      if (state.position && (state.state == PlaybackState::Playing || state.state == PlaybackState::Ended)) {
         auto draw_at = ToGrid(*state.position, kTimelinePreviewRate);
-        if (draw_at.Compare(*state.position) == 1) --draw_at.ticks;
+        if (draw_at.Compare(*state.position) == 1 || draw_at.Compare(range.end) >= 0) --draw_at.ticks;
         if (draw_at.Compare(presented) == 1 && draw_at.Compare(range.end) == -1) {
-          RenderTimelineSample(session, renderer, draw_at, mailbox, stop);
+          const auto surface = DrawTimelineSample(session, renderer, draw_at, stop);
           const auto clock = playback.Snapshot().position.value_or(*state.position);
-          const auto lag = 1000.0 * (double(clock.ticks) / clock.timescale - double(draw_at.ticks) / draw_at.timescale);
-          stats.maximum_video_lag_ms = std::max(stats.maximum_video_lag_ms, lag);
-          ++stats.clocked_frames;
-          presented = draw_at;
+          const auto frame_on_pcm_clock = ToGrid(draw_at, clock.timescale);
+          const auto lag = 1000.0 * (clock.ticks - frame_on_pcm_clock.ticks) / clock.timescale;
+          if (lag < kMaxPreviewLagMs) {
+            PublishPreviewSurface(mailbox, surface);
+            stats.maximum_video_lag_ms = std::max(stats.maximum_video_lag_ms, lag);
+            ++stats.clocked_frames;
+            presented = draw_at;
+          } else {
+            // Keep the last publication until a current frame can catch up with the PCM clock.
+            ++stats.late_video_frames;
+          }
           progressed = true;
         }
       }
@@ -148,6 +183,7 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
       if (!progressed) std::this_thread::sleep_for(2ms);
     }
   }
+  stats.audio_underruns = retired_underruns + playback.Snapshot().audio_underruns;
   mailbox.Finish();
   return stats;
 }
@@ -218,7 +254,7 @@ void StopTimelinePreview() {
 
 void ExportComposedTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& file,
                             const MovieCodecProviders& providers, MovieRenderer& renderer, CodecPolicy policy,
-                            OnCodecFallback on_fallback) {
+                            OnCodecFallback on_fallback, std::shared_ptr<analysis::AnalysisProvider> analyzer) {
   FileExportSettings settings;
   settings.policy = policy;
   settings.video = PreviewVideoConfig(project->canvas);
@@ -228,15 +264,16 @@ void ExportComposedTimeline(std::shared_ptr<const ProjectSnapshot> project, cons
         @autoreleasepool {
           return renderer.EncoderFrame(renderer.Draw(frame), bound, frame.pts, duration);
         }
-      }, std::move(on_fallback), {}, [&](const auto& video) { return renderer.ImportFrame(video); });
+      }, std::move(on_fallback), std::move(analyzer), [&](const auto& video) { return renderer.ImportFrame(video); });
 }
 
-void ExportTimelinePreview(std::string_view path, std::string_view destination, bool software_only) {
+void ExportTimelinePreview(std::string_view path, std::string_view destination, bool software_only,
+                           std::shared_ptr<analysis::AnalysisProvider> analyzer) {
   @autoreleasepool {
     auto project = Project::Open(File(path)).Snapshot();
     MovieRenderer renderer(project->canvas);
     ExportComposedTimeline(std::move(project), File(destination), TimelineProviders(), renderer,
-                           software_only ? CodecPolicy::SoftwareOnly : CodecPolicy::Auto);
+                           software_only ? CodecPolicy::SoftwareOnly : CodecPolicy::Auto, {}, std::move(analyzer));
   }
 }
 

@@ -42,7 +42,7 @@ if (AVKIT_ENABLE_FILE_MEDIA)
     option(AVKIT_ENABLE_FFMPEG "Build the FFmpeg software codec provider" ON)
 endif ()
 
-option(AVKIT_ENABLE_NCNN "Build the ncnn CPU landmark provider" OFF)
+option(AVKIT_ENABLE_NCNN "Build the ncnn CPU vision analysis provider" OFF)
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
@@ -61,6 +61,7 @@ add_library(avkit_core STATIC
         src/project/edit_template.cpp
         src/project/project.cpp
         src/project/project_io.cpp
+        src/render/image_surface.cpp
 )
 add_library(AVKit::Core ALIAS avkit_core)
 target_compile_features(avkit_core PUBLIC cxx_std_20)

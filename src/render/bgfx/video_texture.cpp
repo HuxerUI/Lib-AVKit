@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <span>
 #include <stdexcept>
+#include <vector>
 
 #include <huxerui/avkit/bgfx.h>
+
+#include "support/video_geometry.h"
 
 namespace huxerui::avkit::render {
 
@@ -125,23 +129,56 @@ Task<detail::ImportedTexture> CompleteImport(detail::ImportedTexture result) {
   co_return result;
 }
 
-double SamplePlane(const media::VideoPlane& plane, media::VideoRectangle bounds, double x, double y,
-                   std::size_t channel = 0) {
-  const auto right = bounds.x + bounds.width - 1;
-  const auto bottom = bounds.y + bounds.height - 1;
-  x = std::clamp(x, double(bounds.x), double(right));
-  y = std::clamp(y, double(bounds.y), double(bottom));
-  const auto x0 = static_cast<std::uint32_t>(x), y0 = static_cast<std::uint32_t>(y);
-  const auto x1 = std::min(x0 + 1, right), y1 = std::min(y0 + 1, bottom);
-  const auto bytes = plane.data.AsBytes();
-  const auto read = [&](std::uint32_t col, std::uint32_t row) {
-    return double(std::to_integer<unsigned>(bytes[row * plane.row_stride + col * plane.pixel_stride + channel]));
-  };
-  return std::lerp(std::lerp(read(x0, y0), read(x1, y0), x - x0),
-                   std::lerp(read(x0, y1), read(x1, y1), x - x0), y - y0);
+struct SampleAxis {
+  SampleAxis(double position, std::uint32_t start, std::uint32_t extent) {
+    const auto end = start + extent - 1;
+    position = std::clamp(position, double(start), double(end));
+    first = static_cast<std::uint32_t>(position);
+    second = std::min(first + 1, end);
+    weight = position - first;
+  }
+
+  std::uint32_t first, second;
+  double weight;
+};
+
+struct VideoSampleAxis {
+  SampleAxis luma, chroma;
+};
+
+std::vector<VideoSampleAxis> VideoSampleAxes(std::uint32_t length, double crop, bool invert,
+                                          std::uint32_t start, std::uint32_t extent) {
+  const auto chroma_start = start / 2;
+  const auto chroma_extent = (start + extent - 1) / 2 - chroma_start + 1;
+  std::vector<VideoSampleAxis> axes;
+  axes.reserve(length);
+  for (std::uint32_t i = 0; i < length; ++i) {
+    const auto t = 0.5 + ((i + 0.5) / length - 0.5) * crop;
+    const auto position = start + (invert ? 1 - t : t) * extent;
+    axes.push_back({{position - 0.5, start, extent}, {position / 2 - 0.5, chroma_start, chroma_extent}});
+  }
+  return axes;
 }
 
-detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::VideoTextureOptions options) {
+struct CpuPlaneView {
+  explicit CpuPlaneView(const media::VideoPlane& plane)
+      : bytes(plane.data.AsBytes()), row_stride(plane.row_stride), pixel_stride(plane.pixel_stride) {}
+
+  double Sample(const SampleAxis& x, const SampleAxis& y, std::size_t channel = 0) const {
+    const auto row = [&](std::uint32_t index) {
+      const auto* samples = bytes.data() + index * row_stride + channel;
+      return std::lerp(double(std::to_integer<unsigned>(samples[x.first * pixel_stride])),
+                       double(std::to_integer<unsigned>(samples[x.second * pixel_stride])), x.weight);
+    };
+    return std::lerp(row(y.first), row(y.second), y.weight);
+  }
+
+  std::span<const std::byte> bytes;
+  std::size_t row_stride, pixel_stride;
+};
+
+detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::VideoTextureOptions options,
+                                       const avkit::detail::VideoTextureFit& fit) {
   using R = detail::ImportedTexture;
   using namespace media;
   const auto& format = frame.format;
@@ -153,27 +190,16 @@ detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::Vi
   }
 
   const auto visible = format.visible;
-  double width = double(visible.width) * format.aspect_width / format.aspect_height;
-  double height = visible.height;
-  if (format.rotation == VideoRotation::Clockwise90 || format.rotation == VideoRotation::Clockwise270)
-    std::swap(width, height);
-  const auto scale_x = options.width / width, scale_y = options.height / height;
-  VideoRectangle area{0, 0, options.width, options.height};
-  double crop_width = 1, crop_height = 1;
-  if (options.fit == ImageFit::Cover) {
-    const auto scale = std::max(scale_x, scale_y);
-    crop_width = scale_x / scale;
-    crop_height = scale_y / scale;
-  } else {
-    const auto scale = std::min(scale_x, scale_y);
-    area.width = static_cast<std::uint32_t>(std::clamp(std::lround(width * scale), 1L, long(options.width)));
-    area.height = static_cast<std::uint32_t>(std::clamp(std::lround(height * scale), 1L, long(options.height)));
-    area.x = (options.width - area.width) / 2;
-    area.y = (options.height - area.height) / 2;
-  }
-  const VideoRectangle chroma{visible.x / 2, visible.y / 2,
-      (visible.x + visible.width - 1) / 2 - visible.x / 2 + 1,
-      (visible.y + visible.height - 1) / 2 - visible.y / 2 + 1};
+  const bool rotated = format.rotation == VideoRotation::Clockwise90 || format.rotation == VideoRotation::Clockwise270;
+  const auto& [area, crop_width, crop_height] = fit;
+  // Resolve crop and bilinear weights once per axis. Quarter turns exchange the output axes.
+  const auto columns = VideoSampleAxes(rotated ? area.height : area.width, rotated ? crop_height : crop_width,
+      format.rotation == VideoRotation::Clockwise180 || format.rotation == VideoRotation::Clockwise270,
+      visible.x, visible.width);
+  const auto rows = VideoSampleAxes(rotated ? area.width : area.height, rotated ? crop_width : crop_height,
+      format.rotation == VideoRotation::Clockwise180 || format.rotation == VideoRotation::Clockwise90,
+      visible.y, visible.height);
+  const CpuPlaneView y_plane(frame.planes[0]), u_plane(frame.planes[1]), v_plane(frame.planes[planar ? 2 : 1]);
   const bool full = format.range == ColorRange::Full;
   const double kr = format.matrix == ColorMatrix::BT709 ? 0.2126 : 0.299;
   const double kb = format.matrix == ColorMatrix::BT709 ? 0.0722 : 0.114;
@@ -184,22 +210,11 @@ detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::Vi
   for (std::size_t i = 3; i < bytes->size(); i += 4) (*bytes)[i] = std::byte{255};
   for (std::uint32_t y = 0; y < area.height; ++y) {
     for (std::uint32_t x = 0; x < area.width; ++x) {
-      const auto u = 0.5 + ((x + 0.5) / area.width - 0.5) * crop_width;
-      const auto v = 0.5 + ((y + 0.5) / area.height - 0.5) * crop_height;
-      auto sx = u, sy = v;
-      switch (format.rotation) {
-        case VideoRotation::None: break;
-        case VideoRotation::Clockwise90: sx = v; sy = 1 - u; break;
-        case VideoRotation::Clockwise180: sx = 1 - u; sy = 1 - v; break;
-        case VideoRotation::Clockwise270: sx = 1 - v; sy = u; break;
-      }
-      sx = visible.x + sx * visible.width;
-      sy = visible.y + sy * visible.height;
-      const auto luma = (SamplePlane(frame.planes[0], visible, sx - 0.5, sy - 0.5) - (full ? 0 : 16)) /
-          (full ? 255 : 219);
-      const auto cb = (SamplePlane(frame.planes[1], chroma, sx / 2 - 0.5, sy / 2 - 0.5) - 128) / (full ? 255 : 224);
-      const auto cr = (SamplePlane(frame.planes[planar ? 2 : 1], chroma, sx / 2 - 0.5, sy / 2 - 0.5, planar ? 0 : 1) -
-          128) / (full ? 255 : 224);
+      const auto& sx = columns[rotated ? y : x];
+      const auto& sy = rows[rotated ? x : y];
+      const auto luma = (y_plane.Sample(sx.luma, sy.luma) - (full ? 0 : 16)) / (full ? 255 : 219);
+      const auto cb = (u_plane.Sample(sx.chroma, sy.chroma) - 128) / (full ? 255 : 224);
+      const auto cr = (v_plane.Sample(sx.chroma, sy.chroma, planar ? 0 : 1) - 128) / (full ? 255 : 224);
       const auto red = luma + 2 * (1 - kr) * cr, blue = luma + 2 * (1 - kb) * cb;
       auto* pixel = bytes->data() + (area.y + y) * stride + (area.x + x) * 4;
       pixel[0] = byte(red);
@@ -262,26 +277,33 @@ Task<Result<ColorSurface, RenderError>> ImportBgfxTexture(
 
 Task<Result<ColorSurface, RenderError>> ImportBgfxVideoFrame(
     RenderBackend& backend, media::VideoFrame frame, media::VideoTextureOptions options, TextureTransferPolicy policy) {
-  return CompleteImport(detail::ImportDecodedBgfxFrame(backend, frame, options, policy));
+  auto result = detail::ImportDecodedBgfxFrame(backend, frame, options, policy);
+  return CompleteImport(result.Succeeded() ? detail::ImportedTexture::Success(std::move(result).Value().surface)
+                                           : detail::ImportedTexture::Failure(result.Error()));
 }
 
-detail::ImportedTexture detail::ImportDecodedBgfxFrame(RenderBackend& backend, const media::VideoFrame& frame,
-                                                        media::VideoTextureOptions options, TextureTransferPolicy policy) {
-  using R = ImportedTexture;
+detail::ImportedFrame detail::ImportDecodedBgfxFrame(RenderBackend& backend, const media::VideoFrame& frame,
+                                                     media::VideoTextureOptions options, TextureTransferPolicy policy) {
+  using R = ImportedFrame;
   if (!frame.Validate() || !options.width || !options.height || options.width > 8192 || options.height > 8192 ||
       (options.fit != ImageFit::Contain && options.fit != ImageFit::Cover)) {
     return R::Failure({kInvalidFrame, "Invalid video frame or texture options"});
   }
+  const auto fit = avkit::detail::FitVideoTexture(frame.format, options);
+  const auto wrap = [&](ImportedTexture surface) {
+    if (!surface.Succeeded()) return R::Failure(surface.Error());
+    return R::Success({std::move(surface).Value(), fit.SourceToTextureUv(options)});
+  };
   if (frame.Storage() == media::VideoStorage::Platform) {
     auto texture = media::MakeExternalTexture(frame, options);
     if (!texture.Succeeded()) return R::Failure({kUnsupported, texture.Error().message});
-    return AcquireTexture(backend, *texture.Value());
+    return wrap(AcquireTexture(backend, *texture.Value()));
   }
   if (policy == TextureTransferPolicy::GpuOnly) {
     return R::Failure({kUnsupported, "A GPU transfer requires a platform video frame"});
   }
   try {
-    return ImportCpuVideo(frame, options);
+    return wrap(ImportCpuVideo(frame, options, fit));
   } catch (const std::bad_alloc&) {
     return R::Failure({RenderErrorCode::OutOfMemory, "Cannot allocate the CPU video upload"});
   }
