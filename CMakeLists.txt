@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 
 # CMake initializes Apple deployment defaults during the first project() call.
 # Explicit settings and toolchains retain ownership of their target platform.
@@ -42,11 +42,7 @@ if (AVKIT_ENABLE_FILE_MEDIA)
     option(AVKIT_ENABLE_FFMPEG "Build the FFmpeg software codec provider" ON)
 endif ()
 
-set(avkit_bgfx_default OFF)
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(avkit_bgfx_default ON)
-endif ()
-option(AVKIT_ENABLE_BGFX "Build the bgfx rendering adapter for the target platform" ${avkit_bgfx_default})
+option(AVKIT_ENABLE_NCNN "Build the ncnn CPU landmark provider" OFF)
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
@@ -74,7 +70,6 @@ target_include_directories(avkit_core
 )
 target_link_libraries(avkit_core PUBLIC flecs::flecs_static HuxerUI::Media)
 set_target_properties(avkit_core PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(huxerui_avkit PUBLIC AVKit::Core)
 if (TARGET HuxerUI::huxerui)
     set(avkit_sdk_target HuxerUI::huxerui)
 else ()
@@ -84,15 +79,13 @@ target_include_directories(avkit_core SYSTEM PUBLIC
         "$<TARGET_PROPERTY:${avkit_sdk_target},INTERFACE_INCLUDE_DIRECTORIES>"
 )
 
-if (AVKIT_ENABLE_BGFX)
-    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        message(FATAL_ERROR "AVKIT_ENABLE_BGFX currently requires the macOS target platform")
-    endif ()
-    enable_language(OBJCXX)
-    include(cmake/AVKitBgfx.cmake)
-    include(cmake/platform/MacOS.cmake)
-endif ()
+include(cmake/AVKitBgfx.cmake)
+target_link_libraries(huxerui_avkit PUBLIC AVKit::Bgfx)
 
 if (AVKIT_ENABLE_FILE_MEDIA)
     include(cmake/AVKitMedia.cmake)
+endif ()
+
+if (AVKIT_ENABLE_NCNN)
+    include(cmake/AVKitNCNN.cmake)
 endif ()

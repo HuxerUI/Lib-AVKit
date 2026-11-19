@@ -37,7 +37,8 @@ TrackedPoints FaceAt(std::uint64_t person, const Actor& pose) {
                            PointAt("left_eye", pose.left_eye)}};
 }
 
-AnalysisWindow Window(AnalysisCapability capability) {
+AnalysisWindow Window(AnalysisCapability capability, bool ordered) {
+  if (ordered) return {.stateful = capability == BodyLandmarks};
   switch (capability) {
     case BodyLandmarks: return {2, 1, Tick(1), false, true};
     case FaceLandmarks: return {};
@@ -46,7 +47,7 @@ AnalysisWindow Window(AnalysisCapability capability) {
   throw std::invalid_argument("Unknown mock model");
 }
 
-std::vector<TrackingDetection> Detect(const AnalysisJob& job, AnalysisCapability capability) {
+std::vector<TrackingDetection> Detect(const AnalysisJob& job, AnalysisCapability capability, bool ordered) {
   const int frame = FrameNumber(job.target.pts);
   std::vector<TrackingDetection> results;
   if (capability == BodyLandmarks) {
@@ -54,8 +55,13 @@ std::vector<TrackingDetection> Detect(const AnalysisJob& job, AnalysisCapability
     for (const auto person : {kSecondary, kPrimary}) {
       if (person == kPrimary && frame == kMissingBody) continue;
       const auto pose = Pose(person, frame);
-      results.push_back({{person, {PointAt("head", pose.head), PointAt("left_wrist", pose.left_wrist),
-                                  PointAt("right_wrist", pose.right_wrist)}}, {}});
+      const auto confidence = ordered && person == kPrimary && frame == kWristConfidenceDrop ? 0.2F : 1.F;
+      const bool forearm = ordered && person == kPrimary && frame == kForearmRetry;
+      const auto wrist = forearm ? pose.right_wrist - kMockForearm * 0.60F : pose.right_wrist;
+      TrackedPoints body{person, {PointAt("head", pose.head), PointAt("left_wrist", pose.left_wrist, confidence),
+                                  PointAt("right_wrist", wrist, confidence)}};
+      if (forearm) body.points.push_back(PointAt("right_elbow", wrist - kMockForearm));
+      results.push_back({std::move(body), {}});
     }
     if (frame % 2) std::ranges::reverse(results);
     return results;
@@ -64,6 +70,15 @@ std::vector<TrackingDetection> Detect(const AnalysisJob& job, AnalysisCapability
     for (const auto person : {kSecondary, kPrimary}) results.push_back({FaceAt(person, Pose(person, frame)), {}});
     return results;
   }
+  if (ordered && capability == HandLandmarks && frame == kWristConfidenceDrop)
+    Check(std::ranges::count_if(job.regions, [](const auto& region) {
+            return region.person.value == kPrimary && region.predicted;
+          }) == 2, "A source wrist drop did not request both predictions");
+  const bool retry_frame = ordered && capability == HandLandmarks && frame == kWristConfidenceDrop + 1;
+  const bool retry = retry_frame && std::ranges::any_of(job.regions, &AnalysisRegion::predicted);
+  if (retry)
+    Check(job.regions.size() == 1 && job.regions.front().person.value == kPrimary && job.regions.front().part == LeftHand,
+          "A retry searched a hand that did not need it");
   for (std::size_t index = job.regions.size(); index-- > 0;) {
     const auto& region = job.regions[index];
     const auto person = region.person.value;
@@ -78,7 +93,29 @@ std::vector<TrackingDetection> Detect(const AnalysisJob& job, AnalysisCapability
       Check(region.part == LeftHand || region.part == RightHand, "Hand request lacks a subject side");
       const bool left = region.part == LeftHand;
       auto center = left ? pose.left_wrist : pose.right_wrist;
-      Check(region.bounds.Contains(center), "Hand region is attached to the wrong person or side");
+      if (ordered && primary && !left && frame == kForearmRetry - 1) continue;
+      if (ordered && primary && !left && frame == kForearmRetry) {
+        if (!region.predicted) continue;
+        Check(region.forearm && std::hypot(region.forearm->x - kMockForearm.x, region.forearm->y - kMockForearm.y) < 1e-5F &&
+              std::hypot(region.bounds.x + region.bounds.width / 2 - center.x,
+                         region.bounds.y + region.bounds.height / 2 - center.y) < 1e-5F,
+              "Wrist search ignored the target-frame forearm");
+        results.push_back({{16000 + person * 2, {PointAt("wrist", center)}}, index});
+        continue;
+      }
+      const bool prediction = ordered && primary && (frame == kWristConfidenceDrop || retry);
+      Check(region.predicted == prediction && region.bounds.Contains(center), "Unexpected hand search origin, person, or side");
+      if (ordered && primary && left && frame == kWristConfidenceDrop - 1) center = center + kObservedWristOffset;
+      if (prediction) {
+        const auto projected = Point{region.bounds.x + region.bounds.width / 2, region.bounds.y + region.bounds.height / 2};
+        const auto expected = retry ? center - kObservedWristOffset * 0.35F : (left ? center + kObservedWristOffset : center);
+        Check(std::hypot(projected.x - expected.x, projected.y - expected.y) < 1e-5F,
+              "Wrist prediction ignored the preceding observation or body motion");
+        if (retry) center = center + kObservedWristOffset;
+        else if (left) center = center - kObservedWristOffset;
+        else center = center + Point{0.05F, 0};
+      }
+      if (retry_frame && !retry && primary && left) continue;
       if (primary && left && frame == kMissingLeft) continue;
       if (primary && !left && frame == kAmbiguousWrist) {
         center = (center + Pose(kSecondary, frame).left_wrist) * 0.5F;
@@ -99,7 +136,7 @@ public:
 
   void Submit(AnalysisJob job, std::stop_token stop, Completion complete) override {
     const auto frame = FrameNumber(job.target.pts);
-    const auto window = Window(config_.capability);
+    const auto window = Window(config_.capability, state_->ordered_wrist_prediction);
     const auto first = std::max(0, frame - int(window.past_frames));
     const auto end = std::min(kLength, frame + int(window.future_frames) + 1);
     Check(window.accepts_gaps || end - first == int(window.past_frames + window.future_frames + 1),
@@ -112,7 +149,7 @@ public:
                 input.image.format == config_.format && input.image.Storage() == config_.storage && input.image.Validate(),
             "Analysis input leaked across sources or does not match its retained presentation frame");
     }
-    auto detections = Detect(job, config_.capability);
+    auto detections = Detect(job, config_.capability, state_->ordered_wrist_prediction);
     state_->trace.push_back({config_.capability, job.target, job.frames.size()});
     if (config_.capability == BodyLandmarks && state_->holds > 0 && frame == kCrossing) {
       --state_->holds;
@@ -139,7 +176,7 @@ public:
     if ((config.capability == BodyLandmarks && config.uses_roi) ||
         (config.capability == HandLandmarks && !config.uses_roi) || !config.format.Validate())
       return ProbeResult::Failure("Mock model cannot use the requested input");
-    return ProbeResult::Success(Window(config.capability));
+    return ProbeResult::Success(Window(config.capability, state_->ordered_wrist_prediction));
   }
 
   std::unique_ptr<AnalysisSession> Open(const AnalysisConfig& config) override {

@@ -1,5 +1,6 @@
 #include "timeline_preview.h"
 
+#include "bgfx_metal_texture.h"
 #include "verification/codec_verification.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
@@ -238,7 +239,7 @@ void VerifyExports(const File& first, const File& second, const MovieCodecProvid
   Check(complete(a_asset) && complete(b_asset) && a_asset.pcm == b_asset.pcm, "Export changed the audio or video presentation range");
   MovieReader a(a_asset, providers, kSoftware), b(b_asset, providers, kSoftware);
   MetalTexture mailbox({320, 180});
-  const auto plan = std::make_shared<RenderPlan>(RenderPlan{{kCanvas, render::ImageFormat::Bgra8Unorm}, {{0, Blend::Replace}}});
+  const auto plan = std::make_shared<RenderPlan>(RenderPlan{{kCanvas, render::PixelFormat::Bgra8Unorm}, {{0, Blend::Replace}}});
   const auto check_preview = [&](const VideoFrame& frame, const Bytes& preview) {
     PublishPreviewSurface(mailbox, renderer.Draw({frame.pts, plan, {frame}}));
     const auto decoded = ReadPreview(mailbox);
@@ -526,7 +527,7 @@ void VerifyTransitionExport(const File& output, const std::shared_ptr<const Proj
   Check(written == kTransitionMovieFrames, "Export sampled the wrong number of pictures");
   const auto movie = ImportMovie(output);
   MovieReader reader(movie, providers, kSoftware);
-  const auto plan = std::make_shared<RenderPlan>(RenderPlan{{kCanvas, render::ImageFormat::Bgra8Unorm}, {{0, Blend::Replace}}});
+  const auto plan = std::make_shared<RenderPlan>(RenderPlan{{kCanvas, render::PixelFormat::Bgra8Unorm}, {{0, Blend::Replace}}});
   double worst_mean = 0;
   for (int index = 0; index < written; ++index) {
     const auto frame = reader.ReadVideo();
@@ -668,6 +669,52 @@ void VerifyTimelineCodecs(std::string_view path, std::string_view directory_path
       CheckDecodeFallback(events, inject_fault);
     }
     VerifyExports(baseline, fallback, providers, renderer, early, late, false);
+
+    bool reject_texture = false;
+    std::vector<CodecFallback> texture_fallbacks;
+    const MovieCodecProviders incompatible_decoder{
+        std::make_shared<ObservedCodecProvider>(providers.platform, nullptr, VideoFaults{}, [&](VideoFrame& frame) {
+          if (reject_texture) frame.format.matrix = ColorMatrix::BT2020;
+        }), providers.software};
+    const auto report_texture = [&](const CodecFallback& event) {
+      reject_texture = false;
+      texture_fallbacks.push_back(event);
+    };
+    for (const bool reverse : {false, true}) {
+      auto edited = std::make_shared<ProjectSnapshot>(*project);
+      edited->tracks.at(0).clips.at(0).placement.source.reverse = reverse;
+      TimelineSession session(edited, incompatible_decoder, CodecPolicy::Auto, report_texture);
+      texture_fallbacks.clear();
+      const auto at = std::get<VideoFrame>(session.SampleVideo(Tick(6)).inputs.at(0)).pts;
+      session.Reset();
+      reject_texture = true;
+      MetalTexture mailbox({320, 180});
+      const auto recovered = Sample(session, renderer, Tick(6), mailbox);
+      CheckFixtureLayers(recovered, false, 241, 38);
+      const auto sampled = session.SampleVideo(Tick(6));
+      Check(texture_fallbacks.size() == 1 && texture_fallbacks.front().operation == CodecOperation::VideoDecode &&
+                texture_fallbacks.front().resume_at == at && std::get<VideoFrame>(sampled.inputs.at(0)).pts == at &&
+                std::get<VideoFrame>(sampled.inputs.at(0)).Storage() == VideoStorage::Cpu &&
+                std::get<VideoFrame>(sampled.inputs.at(2)).Storage() == VideoStorage::Platform,
+            "Texture rejection changed the source PTS or switched the neighboring clip to software");
+      session.Reset();
+      if (!reverse) VerifyPlayback(*edited, session, renderer, recovered, late);
+      else {
+        Sample(session, renderer, Tick(18), mailbox);
+        Check(Sample(session, renderer, Tick(6), mailbox) == recovered,
+              "Backward seek changed the recovered reverse clip's pixels");
+      }
+      Check(texture_fallbacks.size() == 1, "Seeking reopened hardware for the recovered clip");
+    }
+    reject_texture = true;
+    texture_fallbacks.clear();
+    const File texture_output(directory, "decoder-texture-fallback.mp4");
+    ExportComposedTimeline(project, texture_output, incompatible_decoder, renderer, CodecPolicy::Auto, report_texture);
+    Check(texture_fallbacks.size() == 1 && texture_fallbacks.front().operation == CodecOperation::VideoDecode &&
+              texture_fallbacks.front().resume_at == Tick(6),
+          "Timeline export did not retry the rejected source frame at its original trim PTS");
+    VerifyExports(baseline, texture_output, providers, renderer, early, late, false);
+    std::cout << "Decoder texture recovery preserved both timeline seek directions, reverse clips, and export timing.\n";
   }
 }
 

@@ -1,4 +1,5 @@
 #include "live_capture.h"
+#include "bgfx_metal_texture.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
 #include "sticker_scene.h"

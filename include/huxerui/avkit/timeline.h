@@ -21,8 +21,12 @@ namespace huxerui::avkit {
 /// @brief Inspects a supported MP4 or MOV and returns its importable source tracks and ranges.
 AssetReference InspectTimelineMovie(const File& file);
 
-/// @brief Retained picture or versioned resource bound to a color input slot.
-using TimelineInput = std::variant<media::VideoFrame, ResourceRef>;
+/// @brief Decoded picture, versioned resource, or prepared color surface bound to an input slot.
+using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::ColorSurface>;
+
+/// @brief Prepares a decoded input on the compositor sequence.
+/// Throw PlatformVideoImportError when a platform video texture cannot be shared with the compositor.
+using ImportVideoFrame = std::function<render::ColorSurface(const media::VideoFrame&)>;
 
 /// @brief Mask resource sampled at a transition-local time.
 struct TransitionMaskSample {
@@ -62,9 +66,11 @@ public:
   /// @param at Exact time on the project clock.
   /// @param output Requested color format for the render target.
   /// @param stop Cancels pending decode and analysis waits. Cancellation retires sampling state.
+  /// @param import Optionally prepares each visible video input. A rejected platform frame is retried from its
+  /// exact source PTS on the software provider for that clip.
   /// @return Immutable plan and retained inputs. Required analysis is sampled at its exact source PTS.
-  TimelineFrame SampleVideo(media::MediaTimestamp at, render::ImageFormat output = render::ImageFormat::Bgra8Unorm,
-                            std::stop_token stop = {});
+  TimelineFrame SampleVideo(media::MediaTimestamp at, render::PixelFormat output = render::PixelFormat::Bgra8Unorm,
+                            std::stop_token stop = {}, const ImportVideoFrame& import = {});
   /// @brief Returns the PCM format shared by the timeline's selected audio clips.
   media::AudioFormat PcmFormat() const;
   /// @brief Mixes an interval on the project PCM sample grid, filling gaps with silence.
@@ -87,9 +93,10 @@ using ComposeTimelineFrame = std::function<media::VideoFrame(const TimelineFrame
 /// @param destination New local path separate from project sources.
 /// @param compose Compositor callback. A recoverable platform encoder failure can replay it from the start.
 /// @param analysis Provider for tracked stickers when required by the project.
+/// @param import Optionally prepares video inputs with the same per-clip software retry as preview.
 void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
                     const MovieCodecProviders& providers, const FileExportSettings& settings,
                     const ComposeTimelineFrame& compose, OnCodecFallback on_fallback = {},
-                    std::shared_ptr<analysis::AnalysisProvider> analysis = {});
+                    std::shared_ptr<analysis::AnalysisProvider> analysis = {}, const ImportVideoFrame& import = {});
 
 } // namespace huxerui::avkit

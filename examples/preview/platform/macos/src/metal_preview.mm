@@ -1,4 +1,5 @@
 #include "metal_preview.h"
+#include "bgfx_metal_texture.h"
 #include "sticker_scene.h"
 
 #include <cmath>
@@ -9,7 +10,6 @@
 #include <string>
 #include <utility>
 
-#include <huxerui/avkit/macos/bgfx.h>
 #include <huxerui/macos/external_texture.h>
 
 namespace avkit_preview {
@@ -18,6 +18,7 @@ namespace {
 using namespace huxerui::avkit;
 using namespace huxerui::avkit::render;
 using huxerui::macos::MetalTexture;
+namespace metal = huxerui::avkit::macos;
 
 constexpr PixelSize kSize{320, 180};
 constexpr huxerui::Size kPreviewSize{640.0F, 360.0F};
@@ -49,7 +50,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 template<class Generator>
-RenderSurface Upload(id<MTLDevice> device, Generator pixel, RowOrigin origin = RowOrigin::TopLeft,
+ColorSurface Upload(id<MTLDevice> device, Generator pixel, RowOrigin origin = RowOrigin::TopLeft,
                      MTLPixelFormat format = MTLPixelFormatRGBA8Unorm) {
   auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
                                                                         width:kSize.width
@@ -74,13 +75,13 @@ RenderSurface Upload(id<MTLDevice> device, Generator pixel, RowOrigin origin = R
              mipmapLevel:0
                withBytes:pixels.data()
              bytesPerRow:kSize.width * sizeof(Pixel)];
-  return macos::RetainMetalTexture(texture, origin);
+  return metal::RetainMetalTexture(texture, origin);
 }
 
 struct Fixture {
-  explicit Fixture(ImageFormat format = ImageFormat::Rgba8Unorm)
+  explicit Fixture(PixelFormat format = PixelFormat::Rgba8Unorm)
       : target{kSize, format},
-        backend(macos::CreateBgfxBackend(device, target)) {
+        backend(metal::CreateBgfxBackend(device, target)) {
     InstallStickerScene(scene);
   }
 
@@ -88,7 +89,7 @@ struct Fixture {
   const ImageDesc target;
   std::unique_ptr<RenderBackend> backend;
   SceneEvaluator scene;
-  RenderSurface sticker = CreatePreviewSticker(device);
+  ColorSurface sticker = CreatePreviewSticker(device);
 
   RenderRequest Request(bool alternate = false, RowOrigin origin = RowOrigin::TopLeft,
                         huxerui::media::MediaTimestamp time = {}) {
@@ -105,7 +106,7 @@ RenderTicket Submit(RenderBackend& backend, const RenderRequest& request) {
   return *result.Value();
 }
 
-RenderSurface Complete(RenderBackend& backend, RenderTicket ticket) {
+ColorSurface Complete(RenderBackend& backend, RenderTicket ticket) {
   backend.Pump();
   auto result = backend.TryTake(ticket);
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
@@ -113,9 +114,9 @@ RenderSurface Complete(RenderBackend& backend, RenderTicket ticket) {
   return std::move(result.Value().value());
 }
 
-void Publish(MetalTexture& mailbox, const RenderSurface& surface) {
+void Publish(MetalTexture& mailbox, const ColorSurface& surface) {
   mailbox.Publish({
-      .texture = macos::GetMetalTexture(surface),
+      .texture = metal::GetMetalTexture(surface),
       .origin = MetalTexture::Origin::TopLeft,
       .alpha = MetalTexture::Alpha::Premultiplied,
   });
@@ -199,13 +200,13 @@ id<MTLTexture> Acquire(const MetalTexture& mailbox) {
   return texture;
 }
 
-void CheckSurface(const RenderSurface& surface, ImageDesc target) {
+void CheckSurface(const ColorSurface& surface, ImageDesc target) {
   Require(surface.pixels.image == target && surface.pixels.origin == RowOrigin::TopLeft &&
               surface.alpha == AlphaMode::Premultiplied,
           "The output metadata does not match the plan");
 }
 
-void Verify(ImageFormat format) {
+void Verify(PixelFormat format) {
   Fixture fixture(format);
   auto& backend = *fixture.backend;
   const auto request_a = fixture.Request();
@@ -216,11 +217,11 @@ void Verify(ImageFormat format) {
 
   const auto first = Complete(backend, ticket);
   CheckSurface(first, fixture.target);
-  CheckPixels(macos::GetMetalTexture(first), false, "A");
+  CheckPixels(metal::GetMetalTexture(first), false, "A");
   MetalTexture mailbox(kPreviewSize);
   Publish(mailbox, first);
   id<MTLTexture> first_snapshot = Acquire(mailbox);
-  Require(first_snapshot != macos::GetMetalTexture(first), "Publication did not produce an independent snapshot");
+  Require(first_snapshot != metal::GetMetalTexture(first), "Publication did not produce an independent snapshot");
   CheckPixels(first_snapshot, false, "published A");
 
   const SurfaceStorage* reusable_slot{};
@@ -228,8 +229,8 @@ void Verify(ImageFormat format) {
     const auto second = Complete(backend, Submit(backend, request_b));
     CheckSurface(second, fixture.target);
     Require(first.pixels.storage != second.pixels.storage, "A leased target was reused for B");
-    CheckPixels(macos::GetMetalTexture(second), true, "B");
-    CheckPixels(macos::GetMetalTexture(first), false, "leased A after B");
+    CheckPixels(metal::GetMetalTexture(second), true, "B");
+    CheckPixels(metal::GetMetalTexture(first), false, "leased A after B");
     Publish(mailbox, second);
     CheckPixels(Acquire(mailbox), true, "published B");
     const auto blocked = backend.TrySubmit(request_a);
@@ -240,8 +241,8 @@ void Verify(ImageFormat format) {
   const auto third = Complete(backend, Submit(backend, request_a));
   CheckSurface(third, fixture.target);
   Require(third.pixels.storage.get() == reusable_slot, "The pool did not reuse B's released target");
-  CheckPixels(macos::GetMetalTexture(third), false, "A after reuse");
-  CheckPixels(macos::GetMetalTexture(first), false, "leased A after reuse");
+  CheckPixels(metal::GetMetalTexture(third), false, "A after reuse");
+  CheckPixels(metal::GetMetalTexture(first), false, "leased A after reuse");
   Publish(mailbox, third);
   CheckPixels(Acquire(mailbox), false, "republished A");
   CheckPixels(first_snapshot, false, "retained HuxerUI snapshot");
@@ -249,7 +250,7 @@ void Verify(ImageFormat format) {
 }
 
 void VerifyAnimatedSticker() {
-  Fixture fixture(ImageFormat::Bgra8Unorm);
+  Fixture fixture(PixelFormat::Bgra8Unorm);
   fixture.sticker = CreatePreviewSticker(fixture.device, true);
   MetalTexture mailbox(kPreviewSize);
   const huxerui::media::MediaTimestamp times[] = {{}, {1, 2}, {0, 44100}};
@@ -265,7 +266,7 @@ void VerifyAnimatedSticker() {
 
 } // namespace
 
-RenderSurface CreatePreviewSticker(id<MTLDevice> device, bool cue) {
+ColorSurface CreatePreviewSticker(id<MTLDevice> device, bool cue) {
   if (cue) return Upload(device, [](int x, int y) {
     if (std::abs(x - 196) < 15 && std::abs(y - 80) < 15) return Pixel{16, 250, 32, 255};
     return Sticker(x, y);
@@ -273,7 +274,7 @@ RenderSurface CreatePreviewSticker(id<MTLDevice> device, bool cue) {
   return Upload(device, Sticker);
 }
 
-RenderSurface CreateTrackingSticker(id<MTLDevice> device, analysis::TrackedPart part) {
+ColorSurface CreateTrackingSticker(id<MTLDevice> device, analysis::TrackedPart part) {
   using enum analysis::TrackedPart;
   return Upload(device, [part](int x, int y) {
     const float u = (x + 0.5F) / kSize.width, v = (y + 0.5F) / kSize.height;
@@ -302,7 +303,7 @@ huxerui::Bytes ReadPreviewPixels(id<MTLTexture> texture) {
   return {bytes.begin(), bytes.end()};
 }
 
-void PublishPreviewSurface(MetalTexture& mailbox, const RenderSurface& surface) { Publish(mailbox, surface); }
+void PublishPreviewSurface(MetalTexture& mailbox, const ColorSurface& surface) { Publish(mailbox, surface); }
 
 std::shared_ptr<huxerui::ExternalTexture> CreateMetalPreview() {
   @autoreleasepool {
@@ -320,8 +321,8 @@ int VerifyMetalPreview() {
   @autoreleasepool {
     try {
       VerifyStickerScene();
-      Verify(ImageFormat::Rgba8Unorm);
-      Verify(ImageFormat::Bgra8Unorm);
+      Verify(PixelFormat::Rgba8Unorm);
+      Verify(PixelFormat::Bgra8Unorm);
       VerifyAnimatedSticker();
       std::cout << "Flecs sticker verified: external component and system, parent lifetimes, equivalent media PTS, "
                    "backward sampling, and animated Metal preview pixels.\n";

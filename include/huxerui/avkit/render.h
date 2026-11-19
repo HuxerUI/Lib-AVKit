@@ -27,7 +27,7 @@ struct PixelSize {
 namespace render {
 
 /// @brief Color and data texture formats supported by the render contract.
-enum class ImageFormat {
+enum class PixelFormat {
   Rgba8Unorm, ///< Color with red, green, blue, and alpha in byte order.
   Bgra8Unorm, ///< Color with blue, green, red, and alpha in byte order.
   R8Unorm,    ///< Single-channel normalized data such as mask coverage.
@@ -42,7 +42,7 @@ enum class AlphaMode { Opaque, Straight, Premultiplied };
 /// @brief Pixel extent and storage format of an image.
 struct ImageDesc {
   PixelSize size;
-  ImageFormat format;
+  PixelFormat format;
   bool operator==(const ImageDesc&) const = default;
 };
 
@@ -53,15 +53,15 @@ public:
 };
 
 /// @brief Retained image storage with a known format and row origin.
-struct DataSurface {
+struct ImageSurface {
   ImageDesc image;
   RowOrigin origin{RowOrigin::TopLeft};
   std::shared_ptr<const SurfaceStorage> storage;
 };
 
 /// @brief Retained color image with an explicit alpha interpretation.
-struct RenderSurface {
-  DataSurface pixels;
+struct ColorSurface {
+  ImageSurface pixels;
   AlphaMode alpha{AlphaMode::Premultiplied};
 };
 
@@ -112,8 +112,8 @@ struct RenderPlan {
 /// @brief Binds a compiled render plan to the retained surfaces needed for one submission.
 struct RenderRequest {
   std::shared_ptr<const RenderPlan> plan;
-  std::vector<RenderSurface> inputs;
-  std::vector<DataSurface> data_inputs;
+  std::vector<ColorSurface> inputs;
+  std::vector<ImageSurface> data_inputs;
 };
 
 /// @brief Categories of render validation, resource, and submission failures.
@@ -132,7 +132,7 @@ struct RenderTicket {
 };
 
 using SubmitResult = Result<std::optional<RenderTicket>, RenderError>;
-using TakeResult = Result<std::optional<RenderSurface>, RenderError>;
+using TakeResult = Result<std::optional<ColorSurface>, RenderError>;
 
 /// @brief Executes render requests and publishes leased results after GPU completion.
 /// Use and destroy a backend on its owning execution sequence.

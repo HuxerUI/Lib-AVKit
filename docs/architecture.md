@@ -12,7 +12,7 @@ The Lib-AVKit design separates a headless C++ production engine, embeddable Huxe
 | `AVKit::Bgfx` | Executes Core render plans and owns GPU programs, textures, attachments, synchronization, and submission queues. |
 | `AVKit::Media` | Optional C++ file media module. Defines the codec provider API, adapts Lib-Media, and coordinates import, decoded reads, seek, and MP4 export. |
 | `AVKit::FFmpeg` | Optional software codec adapter. Each distribution platform declares the full configurations for which it supports fallback. |
-| `HuxerUI::AVKit` | Links Core and integrates Camera, AudioCapture, device playback, file providers, the media library, and UI. The editor combines preview, timeline, asset library, template selection, effects, and subtitle components. |
+| `HuxerUI::AVKit` | Links Core and the bgfx compositor and integrates Camera, AudioCapture, device playback, file providers, the media library, and UI. The editor combines preview, timeline, asset library, template selection, effects, and subtitle components. |
 
 Core reuses the HuxerUI SDK's `File`, `FileReference`, `RawAsset`, `ImageAsset`, `Result`, and stream types. Media interfaces use Lib-Media's `MediaTimestamp`, `VideoFrame`, `AudioFrame`, `EncodedPacket`, and container types. The UI uses `Task` for device integration and asynchronous I/O, and `ExternalTexture` to publish composited frames. `Rect` describes layout, and `PixelSize` represents dimensions in whole physical pixels. The main application headers are separate from Flecs extensions and the PAG and bgfx implementations. [Lib-Media shared formats](../../Lib-Media/include/huxerui/media_format.h) · [Camera API](../../Lib-Camera/include/huxerui/camera.h) · [AudioCapture API](../../Lib-AudioCapture/include/huxerui/audiocapture.h)
 
@@ -806,7 +806,7 @@ The first release uses bgfx two-input compositing for general transitions. Trans
 
 ### Render plan integration
 
-Static textures use `AssetImage`. The PAG adapter takes a resource version, local `MediaTimestamp`, replacement content, and target pixel dimensions. It passes the rasterized result as a leased `RenderSurface` to `SurfaceInput`, and `FrameImage` brings it into the render plan. Preview and export own separate mutable playback instances. Cache reusable raster output by resource, sample time, size, and replacement content. Enable direct GPU handoff on combinations with verified graphics devices, formats, synchronization, and leases. Measure PAG rendering, readback, and bgfx upload separately on the CPU-accessible output path. [PAGDecoder and PAGSurface](https://github.com/Tencent/libpag/blob/main/include/pag/pag.h) · [PAG GPU types](https://github.com/Tencent/libpag/blob/main/include/pag/gpu.h)
+Static textures use `AssetImage`. The PAG adapter takes a resource version, local `MediaTimestamp`, replacement content, and target pixel dimensions. It passes the rasterized result as a leased `ColorSurface` to `SurfaceInput`, and `FrameImage` brings it into the render plan. Preview and export own separate mutable playback instances. Cache reusable raster output by resource, sample time, size, and replacement content. Enable direct GPU handoff on combinations with verified graphics devices, formats, synchronization, and leases. Measure PAG rendering, readback, and bgfx upload separately on the CPU-accessible output path. [PAGDecoder and PAGSurface](https://github.com/Tencent/libpag/blob/main/include/pag/pag.h) · [PAG GPU types](https://github.com/Tencent/libpag/blob/main/include/pag/gpu.h)
 
 Before compositing, normalize transparent layers to premultiplied linear-light values using their known channel order, transfer function, and alpha semantics. For premultiplied output with a nonlinear transfer function, recover straight RGB first, then apply the transfer conversion and premultiply in linear light. Set the RGB of fully transparent pixels to zero. Background-dependent blend modes receive the background frame as an additional pass input. Selected `gl-transitions` shaders must match the library's UV origin and straight RGBA contract. Reuse the existing cross-backend build and check both images, semitransparent edges, and sample positions. Project time and the overlap determine transition progress, and each clip samples its frame in its own source time.
 
@@ -814,7 +814,7 @@ Sample sticker sequences and vector animations at the given time using the resou
 
 ## C++ rendering contract
 
-The following declarations define the rendering backend contract. Codecs and audio devices use Lib-Media types. RGB(A) composite surfaces and data textures share pixel storage, row origin, and synchronization. Composite surfaces add color and alpha semantics. The ECS render system advances the backend on a fixed submission sequence.
+The following declarations describe the planned rendering backend contract. Codecs and audio devices use Lib-Media types. `ImageDesc` gives the pixel size and `PixelFormat`. RGB(A) composites and numeric data textures use `ImageSurface` for retained pixel storage, row origin, and synchronization. `ColorSurface` adds color and alpha semantics. The ECS render system advances the backend on a fixed submission sequence. [Current render API](../include/huxerui/avkit/render.h)
 
 ```cpp
 #include <array>
@@ -833,11 +833,11 @@ The following declarations define the rendering backend contract. Codecs and aud
 namespace huxerui::avkit::render {
 
 struct ImageId { std::uint32_t index; };
-enum class ImageFormat {
+enum class PixelFormat {
     R8Unorm, Rg8Unorm, R16Unorm, Rg16Unorm, R16Float, R32Float,
     Rgba8Unorm, Bgra8Unorm, Rgba16Float, Depth32Float
 };
-struct ImageDesc { PixelSize size; ImageFormat format; };
+struct ImageDesc { PixelSize size; PixelFormat format; };
 
 struct RgbColorSpace {
     media::ColorPrimaries primaries{media::ColorPrimaries::BT709};
@@ -858,19 +858,19 @@ struct CpuSurfaceStorage final : SurfaceStorage {
     BufferReference bytes;
     std::size_t row_stride;
 };
-struct DataSurface {
+struct ImageSurface {
     ImageDesc image;
     RowOrigin origin{RowOrigin::TopLeft};
     std::shared_ptr<const SurfaceStorage> storage;
     std::shared_ptr<const SurfaceSync> ready;
 };
-struct RenderSurface {
-    DataSurface pixels;
+struct ColorSurface {
+    ImageSurface pixels;
     RgbColorSpace color;
     AlphaMode alpha{AlphaMode::Premultiplied};
 };
 struct SurfaceInput {
-    RenderSurface surface;
+    ColorSurface surface;
     Rect crop{0, 0, 1, 1};
     media::VideoRotation rotation{media::VideoRotation::None};
     bool mirrored{};
@@ -946,7 +946,7 @@ struct RenderPlan {
 };
 
 struct FormatSupport {
-    ImageFormat format;
+    PixelFormat format;
     bool sampled, color_target, depth_target, storage_write, linear_filter;
 };
 struct RenderCapabilities {
@@ -960,7 +960,7 @@ enum class OutputStorage { Platform, Cpu };
 struct RenderRequest {
     std::shared_ptr<const RenderPlan> plan;
     std::vector<RenderInput> inputs;
-    std::vector<DataSurface> data_inputs;
+    std::vector<ImageSurface> data_inputs;
     VideoFallback fallback{VideoFallback::RejectCpu};
     OutputStorage output_storage{OutputStorage::Platform};
 };
@@ -973,7 +973,7 @@ struct RenderError { RenderErrorCode code; std::string message; };
 struct RenderTicket { std::uint64_t value; };
 
 using SubmitResult = Result<std::optional<RenderTicket>, RenderError>;
-using TakeResult = Result<std::optional<RenderSurface>, RenderError>;
+using TakeResult = Result<std::optional<ColorSurface>, RenderError>;
 
 class RenderBackend {
 public:
@@ -1000,7 +1000,7 @@ CPU data reuses `BufferReference` with a row stride. Upload each input once for 
 namespace huxerui::avkit::analysis {
 
 struct AnalysisTexture {
-    render::DataSurface surface;
+    render::ImageSurface surface;
     Transform2D source_to_texture_uv;
     Rect valid_uv{0, 0, 1, 1};
 };
@@ -1026,7 +1026,7 @@ Live effects wait for the corresponding frame result and bridge preparation with
 
 The render service resolves `ProgramKey` from an immutable program library. Cache entries are keyed by program version, variant, and device generation. Resource packs use versioned manifests to reference programs, parameter defaults, keyframe support, textures, masks, LUTs, subtitle glyphs, models, and analysis dependencies. Project snapshots pin resource versions or content digests. The first release can represent a 3D LUT as a 2D atlas. Passes use the asset registry to reference 3D meshes and dynamic glyph atlases. Use separate resource keys for different atlas versions.
 
-bgfx uses `shaderc` pinned to the runtime version to build artifacts offline for each target. CI checks required shader variants, logical bindings, and platform artifacts. Shared source holds reusable YUV, color grading, warping, and filtering logic. Keep bgfx `.sc` entry points, `varying.def.sc`, and binding maps in the backend directory. A new backend can reuse plans, parameter structures, and algorithm functions and supply its own entry points and compiled artifacts. [bgfx shaderc documentation](https://bkaradzic.github.io/bgfx/tools.html#shader-compiler-shaderc)
+bgfx uses `shaderc` pinned to the runtime version to build artifacts offline for each target. Cross builds compile the tool for the host from the same pinned sources. CI checks required shader variants, logical bindings, and platform artifacts. Shared source holds reusable YUV, color grading, warping, and filtering logic. Keep bgfx `.sc` entry points, `varying.def.sc`, and binding maps in the backend directory. A new backend can reuse plans, parameter structures, and algorithm functions and supply its own entry points and compiled artifacts. [bgfx shaderc documentation](https://bkaradzic.github.io/bgfx/tools.html#shader-compiler-shaderc)
 
 ### Render passes and framebuffers
 
@@ -1052,17 +1052,21 @@ The default working space uses linear BT.709 RGB with premultiplied alpha. Negot
 
 The file decode path accepts Lib-Media's `media::VideoFrame` and uses its `VideoFormat` geometry and color, `VideoPlane` row and pixel strides, and `BufferReference` storage leases. Platform-decoded frames use the public texture bridge. During the callback, the camera adapter acquires a retained platform snapshot for `camera::PreviewOutput` and attaches crop, orientation, and mirroring to `SurfaceInput`. The compositor samples raw planes through `Plane0/1/2` or uses `WorkingRgba`, already converted to the working space, premultiplied, and oriented. Asset interpretation rules fill missing metadata such as chroma location.
 
-`RenderSurface` uses `pixels` to carry storage and synchronization for an RGB(A) surface. An empty synchronization object means the producer guarantees readability. Rendering, texture publication, and encoding each retain a reference through their final read. Adapt composite output for publication to an SDK `ExternalTexture`, or construct a `media::VideoFrame` with the encoding layout and PTS. Serialize producer publication and encoder snapshot acquisition to associate them with the target frame.
+`ColorSurface` uses `pixels` to carry storage and synchronization for an RGB(A) surface. An empty synchronization object means the producer guarantees readability. Rendering, texture publication, and encoding each retain a reference through their final read. Adapt composite output for publication to an SDK `ExternalTexture`, or construct a `media::VideoFrame` with the encoding layout and PTS. Serialize producer publication and encoder snapshot acquisition to associate them with the target frame.
 
-Validate platform adapters on the paths below and measure GPU copies, CPU uploads, and readbacks separately. `VideoFallback` controls whether a platform frame may be read back and reuploaded when the GPU path cannot import it. Explicitly supplied CPU planes can be uploaded directly. `OutputStorage::Cpu` explicitly requests CPU output. Static asset uploads use the separate resource-loading path.
+Validate platform adapters on the paths below and measure GPU copies, CPU uploads, and readbacks separately. `ImportBgfxVideoFrame` imports a hardware-decoded frame through Lib-Media's `MakeExternalTexture` and the platform texture bridge. The platform bridge acquires the concrete SDK texture and keeps it alive through GPU use. If the texture cannot be shared, the import returns `Unsupported`. `TextureTransferPolicy::AllowCpuTransfer` accepts software-decoded SDR I420 or NV12 planes and uploads fitted pixels directly.
+
+File preview prepares each video picture before admitting it to playback. File export retries an input when its compositor reports `PlatformVideoImportError`. `MovieReader::RetryVideoFrame` replaces only the video cursor with the configured software provider and decodes the same source presentation timestamp and duration. Playback retains prepared surfaces until their timestamps are presented or dropped. Later seeks keep the software video provider. Timeline preview and export use an input importer to apply the same retry to the affected clip. Other clips, audio, and the open encoder keep their existing sessions.
 
 | Platform | Initial integration and handoff |
 | --- | --- |
-| Windows | Use bgfx D3D11. Validate the first path with Lib-Media's existing BGRA snapshot bridge. Match codec and composition devices by adapter LUID. The platform frame bridge will retain DXGI subresource identity. Publish BGRA8 as `windows::D3D11Texture`. Lib-Media converts it to NV12 for encoding. |
-| Apple | Use bgfx Metal. Map an IOSurface-backed `CVPixelBuffer` to sampleable Metal `R8/RG8` planes and wait for actual GPU completion before handoff. Prefer a retainable `PixelBufferTexture` for preview or use a `MetalTexture` GPU snapshot. Encoding output uses a pixel buffer pool that VideoToolbox accepts. |
-| Android | Use bgfx GLES. Use Lib-Media's `GlTexture` bridge or import an EGLImage in a compatible EGL environment. When an external texture requires a dedicated sampler, convert it first to a usable 2D texture. Preview publishes `GlTexture`. For encoding, Lib-Media delivers GPU frames to the MediaCodec input Surface. |
-| Linux | Start with decoded CPU plane uploads and a verifiable preview path. Direct GL publication requires a matching `GdkGLContext` and share group. The DMA-BUF route uses retainable GDK textures. Validate formats, modifiers, synchronization, and encoding support per backend. |
-| Web | bgfx Wasm uses WebGL2. WebCodecs frames are sampled or uploaded through browser-supported WebGL paths. Construct a `VideoFrame` from the composite via a canvas and hand it to `VideoFrameTexture` and WebCodecs. Operate on these objects on their owning browser thread. Basic effects provide fragment shader implementations. |
+| Windows | D3D11 builds copy the SDK's immutable BGRA8 snapshot on a compatible adapter and wait for the copy. A BGRA8 output can publish to `D3D11Texture` and use Lib-Media's NV12 conversion. Windows builds hosted on other systems use Vulkan and the CPU transfer path. |
+| macOS and iOS | Each platform's Metal bridge retains its SDK `MetalTexture` snapshots and wraps compatible CoreVideo BGRA storage. Core Image converts decoded SDR video to BGRA and renders the composite to pooled BT.709 NV12 for encoding. |
+| Android | The background GLES compositor imports a retained `GlFrame` through EGLImage. It publishes an RGBA8 snapshot to HuxerUI and can provide opaque encoder frames to Lib-Media for delivery to the MediaCodec input Surface. A driver that rejects publication of a reused render target can receive a copy into a separate GL texture. A decoder texture that cannot be published reports a transfer failure. |
+| Linux | With a current compatible GDK/EGL context, the OpenGL compositor samples compatible `linux::GlTexture` leases and publishes RGBA8 snapshots to HuxerUI. The independent Vulkan compositor uses pixel transfer. Lib-Media's Linux video path uses CPU planes. |
+| Web | On the browser main thread, WebGL 2 uploads open `VideoFrame` objects and publishes RGBA8 composites through a canvas and `VideoFrameTexture`. Lib-Media accepts the resulting opaque frame for WebCodecs. |
+
+`MovieReader` restarts a video cursor with the software provider after a recoverable decoder error. `ImportBgfxTexture` selects the SDK texture revision at the call site. Capture and other SDK textures can use the SDK snapshot path when CPU transfer is allowed. `MakeBgfxPreviewImage` publishes a platform texture or an immutable bitmap. `MakeBgfxEncoderFrame` produces one `media::VideoFrame` with the supplied PTS and duration using the open encoder's negotiated format and input storage. A file or timeline compositor can report `PlatformVideoTransferError` so the writer can reopen the media and retry with a CPU encoder configuration. [Video texture API](../include/huxerui/avkit/video_texture.h)
 
 The existing Lib-Media `MakeExternalTexture` and `MakeVideoFrame` APIs can establish the first path. The public Windows and Android bridges create GPU snapshots and may convert color. Apple's `MetalTexture::Publish` also creates a GPU snapshot. Use the actual SDK contracts to determine capabilities and cost. If measurements call for a shorter handoff, negotiate a public platform frame API with retained leases in Lib-Media. The media adapter layer consumes that API.
 
@@ -1194,7 +1198,7 @@ struct LiveVideo {
     CaptureStamp capture;
 };
 struct LiveAudio { media::AudioFrame frame; CaptureStamp capture; };
-struct PreviewFrame { render::RenderSurface surface; media::MediaTimestamp pts; };
+struct PreviewFrame { render::ColorSurface surface; media::MediaTimestamp pts; };
 
 class RealtimeRecording : public MovieJob {
 public:
@@ -1278,11 +1282,13 @@ Switching encoders can change parameter sets, B-frame reordering, timestamps, an
 - **One view per pass.** Set the view and framebuffer in plan order. Use `Sequential` for alpha blending and bind sampled, draw, and compute resources by declared format and usage. The backend tracks asynchronous frame uploads, dependencies across views, and resource destruction. The texture pool owns attachments. Framebuffer destruction follows that attachment ownership. [bgfx view and framebuffer API](https://bkaradzic.github.io/bgfx/bgfx.html)
 - **Submission and GPU completion.** `bgfx::frame()` advances submission. The external frame bridge verifies platform texture imports, output handoff, and GPU completion mechanisms for each backend. First verify the path where the adapter allocates a compatible texture to use as the backend's target. Chain submissions where synchronization objects can be passed between components. On other combinations, the bridge waits for a verifiable completion condition on its own sequence. Each platform's integration tests cover synchronization and external ownership. [bgfx frame and external texture API](https://bkaradzic.github.io/bgfx/bgfx.html)
 
-The first bgfx adapter uses Metal on macOS. The platform plan covers D3D11 on Windows, Metal on iOS, GLES on Android, GL on Linux, and WebGL2. The scaffold sets deployment targets of macOS 12, iOS 15, and Android API 23. Verify each adapter and its linked dependencies against the deployment target before distribution. Lib-Media GPU codec paths depend on the platform version and device capabilities. [bgfx platform support](https://github.com/bkaradzic/bgfx#what-is-it) · [macOS configuration](../CMakeLists.txt) · [iOS configuration](../platform/ios/AVKit/Package.swift) · [Android configuration](../platform/android/build.gradle)
+The shared bgfx compositor and texture lifetime code live in `src/render/bgfx/`. One shader source set is compiled for Metal, GLES and WebGL, Direct3D, Vulkan, and desktop OpenGL. Each platform selects its graphics context and provides its own texture bridge under `platform/`. `BgfxPlatformHandles` supplies optional window and display handles for context creation. Web uses the window field for the canvas selector. Platform texture leases remain valid through GPU use and keep output slots busy until the caller releases them. The scaffold sets deployment targets of macOS 12, iOS 15, and Android API 23. Verify the pinned dependencies and GPU capabilities against the deployment targets before distribution. [bgfx C++ API](../include/huxerui/avkit/bgfx.h) · [Renderer build](../cmake/AVKitBgfx.cmake) · [bgfx platform support](https://bkaradzic.github.io/bgfx/overview.html)
+
+The portable entry point accepts retained pixel rows and previous GPU output leases. It composes into reusable GPU textures, and the output surface declares the renderer's row origin. Backend-owned output uses a one-pixel staging readback to establish completion. The platform bridges wait for GPU completion with the platform renderer. Explicit full-frame readback supports the bitmap and CPU encoder paths. The preview samples its first GPU output in a second pass, applies an R8 mask, and checks the result before publishing it. [Compositor API](../include/huxerui/avkit/bgfx.h) · [Preview fixture](../examples/preview/src/bgfx_preview.cpp)
 
 ## First milestone and acceptance checks
 
-**Start with a minimal texture-in, texture-out path on macOS.** Pin bgfx, bx, bimg, and shaderc versions compatible with the target system and set up minimal `AVKit::Core` and `AVKit::Bgfx` targets. Use the bridge to prepare two source textures and a sampleable offscreen target on the same Metal device. The inputs are a base image with known colors and a semitransparent sticker. Verify external texture imports through bgfx's `createTexture2D`, execute one composition pass, and retrieve a leased GPU `RenderSurface`. Show the same result in `examples/preview`. [bgfx external texture parameter](https://bkaradzic.github.io/bgfx/bgfx.html#_CPPv4N4bgfx15createTexture2DE8uint16_t8uint16_tb8uint16_tN13TextureFormat4EnumE8uint64_tPK6Memory8uint64_t)
+**Start with a minimal texture-in, texture-out path on macOS.** Pin bgfx, bx, bimg, and shaderc versions compatible with the target system and set up minimal `AVKit::Core` and `AVKit::Bgfx` targets. Use the bridge to prepare two source textures and a sampleable offscreen target on the same Metal device. The inputs are a base image with known colors and a semitransparent sticker. Verify external texture imports through bgfx's `createTexture2D`, execute one composition pass, and retrieve a leased GPU `ColorSurface`. Show the same result in `examples/preview`. [bgfx external texture parameter](https://bkaradzic.github.io/bgfx/bgfx.html#_CPPv4N4bgfx15createTexture2DE8uint16_t8uint16_tb8uint16_tN13TextureFormat4EnumE8uint64_tPK6Memory8uint64_t)
 
 The milestone has three acceptance checks.
 
@@ -1469,7 +1475,9 @@ The test checks source PTS against an independent frame grid and compares stereo
 
 `TimelineSession` and `ExportTimeline` accept an in-process `AnalysisProvider` for exact file sampling. The first implementation probes body, face, and hand landmark capabilities against the decoded frame's format and storage before opening their model sessions. A face-only clip uses full-frame face tracks. Clips that use hand tracking derive regions from the body's `head`, `left_wrist`, and `right_wrist` landmarks. The provider returns each region index and a `face_center` or `wrist` landmark for association. Core checks confidence and position against that region and competing regions on the same frame. [Analysis API](../include/huxerui/avkit/analysis.h)
 
-File sampling uses stateless models with a fixed interval for temporal windows of up to eight neighboring frames. A separate video decoder gathers retained source frames in increasing PTS order, including available frames outside the clip trim. At file boundaries, models with strict windows skip the target when a sample is missing. Each clip owns a generation and chooses its primary track from the source trim start when a valid reference is available. A missing part or temporarily absent primary hides its dependent stickers. A seek resets the clip's analysis generation. The owner waits for the exact frame and job, and a stop request retires the wait and its model sessions. Late completions release their retained resources through the provider.
+Stateless file models can request up to eight neighboring frames. A separate video decoder gathers their temporal windows in increasing source PTS order, including available frames outside the clip trim. Models with strict windows skip the target when a sample is missing. Each clip owns a generation and chooses its primary track from the source trim start when a valid reference is available. A missing part or temporarily absent primary hides its dependent stickers. A seek resets stateless reference sampling. The owner waits for the exact frame and job, and cancellation during inference retires the pending job and its sessions. Late completions release their retained resources through the provider.
+
+A full-frame body provider can declare an ordered stateful session with no explicit neighbors. Core opens a separate video cursor at the clip's source trim start and advances it in source presentation order even when the first request is a seek or a reverse sample. It caches the selected person's anchor results, including absent results, under the exact source PTS in that clip. A seek reuses the completed prefix and advances it only when needed. A project revision or relink recreates the clip session. Export builds its own ordered prefix from the same trim. A cold seek near the end of a long clip may require substantial preroll.
 
 A tracked sticker persists its subject part and semantic point names in project version 4. The Flecs sticker layer is a spatial child of a tracking anchor within its clip. One point supplies a position. Two points also define the local pixel scale and direction. The Metal compositor applies the resulting affine draw in the fitted video coordinates, including in clip subcompositions. [Project API](../include/huxerui/avkit/project.h) · [Timeline API](../include/huxerui/avkit/timeline.h)
 
@@ -1484,3 +1492,48 @@ open -n "$app" --args --timeline-tracking-preview "$work/tracking.avkit"
 ```
 
 The verifier generates two crossing figures in a 24 fps H.264/AAC fixture. A forward clip and a reversed clip share the fixture. It checks both eye positions and both subject-side wrists on the selected figure, reopens the project, and compares plans and GPU pixels at shared source PTS. It seeks directly to frames with missing eye axes, missing body tracks, and ambiguous wrists, and verifies that the corresponding stickers disappear. It also exercises capability negotiation, strict and gap-tolerant windows, and delivery of an old completion during a new clip's pending request at the same source PTS.
+
+### YuNet face provider
+
+`AVKit::NCNN` builds ncnn 20261020 for CPU when `AVKIT_ENABLE_NCNN=ON`. Supply the versioned FP32 graph and weights as `RawAsset` values. The factory opens the model and returns a diagnostic for missing assets or a load failure. Sessions accept unrotated SDR I420 CPU frames and report the face center and five named landmarks in visible-image coordinates. The macOS ncnn example uses software decoding to supply these frames. [Provider API](../include/huxerui/avkit/ncnn.h) · [YuNet pack](../models/yunet/2023mar)
+
+The first valid picture fixes the reference for the session. An empty or ambiguous reference leaves the session without a subject. Later samples need one eligible face and a close match to the eye-aligned luma patch from the reference. Each comparison uses that same reference, so requesting a target in a different playback order gives the same result for the same clip trim and input format. This selection heuristic is for a single subject. It can hide the sticker when the subject changes pose or lighting significantly. Run model inference and completion on the session's worker sequence. Cancellation skips the result before or after inference.
+
+Build the macOS preview with `-DCMAKE_BUILD_TYPE=Release -DAVKIT_ENABLE_FILE_MEDIA=ON -DAVKIT_ENABLE_NCNN=ON` and use a fresh output directory.
+
+```sh
+app="$PWD/build/preview/example_av_kit.app"
+preview="$app/Contents/MacOS/example_av_kit"
+fixture="$PWD/examples/preview/fixtures/yunet-faces.mp4"
+pack="$PWD/models/yunet/2023mar"
+work="$PWD/build/yunet-check"
+"$preview" --timeline-verify-ncnn "$fixture" "$pack" "$work"
+open -n "$app" --args --timeline-ncnn-preview "$work/yunet.avkit" "$pack"
+```
+
+The fixture contains the reference face, two faces together, a different face on its own, a blank frame, and the returned reference face. The verifier checks malformed model assets, an unsupported capability, cancellation, and independent model sessions. It checks the same source PTS in both directions and after explicit and clocked seeks. The output MP4 is reimported to check frame timing and the rendered glasses position.
+
+### ncnn body and hand provider
+
+`CreateNcnnAnalysisProvider` can load the YuNet pack and the MediaPipe body and hand pack in one provider. The two detector and landmark pairs run in ncnn on SDR I420 CPU pictures. Body analysis detects people in the full picture and reports 33 source-space landmarks. Hand analysis searches around the body-derived wrist regions and reports up to 21 landmarks per valid hand. A YuNet session can also process the head regions when the project uses both face and hand stickers. [Model preparation](../models/mediapipe/body-hand) · [Provider API](../include/huxerui/avkit/ncnn.h)
+
+Each clip initializes its body session at the source trim and selects its primary person once. The session uses source-time motion prediction and normalized torso pose in a one-to-one assignment. Torso chroma contributes a small cost and can corroborate a recovery inside the motion gate. A track that loses a reliable match hides immediately. It needs three consecutive compatible observations before becoming visible again. When trajectories merge, recovery requires additional motion or appearance evidence. If the evidence remains ambiguous, the anchor stays hidden.
+
+The body provider uses the head to stabilize motion prediction when hip landmarks move abruptly. If the pose crop collapses or pulls the torso toward another detected person, it retries with an upright crop centered below the detected head. A replacement needs a valid torso separated from neighboring detections. A short-gap tentative match can restart from the last confirmed track, with a fresh confirmation count.
+
+Hand analysis checks the coarse palm and refined wrist against the closest body region. When the first crop yields no confirmed hand, the provider tries smaller wrist-centered crops with alternate orientations. If a strong palm detection from a measured region still lacks a verified wrist, the provider can reuse its current-frame palm points for a tighter, slightly rotated landmark crop. The alternate crop requires higher landmark confidence. Both detections must remain close to the same body wrist. On the ordered path, a lone visible wrist that stays in nearly the same position while its side label flips is treated as ambiguous. A missing or ambiguous wrist hides only its own sticker while the body track stays confirmed.
+
+The ordered sampler uses the current body wrist for the first search. If it yields no verified hand, a second search for that side can translate the preceding source frame's verified wrist by the head displacement and adjust the center toward a nearby current body wrist. It submits the narrower region as `predicted`. Verified wrists from the first search retain their ownership and compete with retry candidates. Both searches use the target picture, and the two source frames must be adjacent and belong to the same confirmed person and clip.
+
+When the next frame has a usable body wrist, its retry may use the preceding frame's verified hand from either search. When the current body wrist itself is unavailable, a predicted search also requires the preceding frame to have had a usable body wrist. The provider verifies the palm and refined wrist in the target picture, and Core rejects predicted matches near competing regions. Preview, seeks, reverse playback, and export use the same source-ordered result.
+
+If the selected hand has no usable temporal reference after the first search, Core can extend the retry region along the same person's target-frame elbow-to-wrist vector. Both body joints must pass the confidence check. The optional `AnalysisRegion::forearm` carries that vector so the provider can inspect both sides of the projected forearm while validating the palm and refined wrist near its tip. This uses the existing retry for the missing hand and preserves verified hands as competing regions.
+
+The macOS verification command accepts a 640 × 480 source at 24 fps with an AAC audio track. Frame zero shows the first reference person and frame one shows the second reference person. Both clips end at the same source frame. Supply eight pixel coordinates per source frame in a text file. List the first person's left and right wrists, followed by the second person's left and right wrists. Use `0 0` for a hidden wrist. Include shared source frames with distinct wrist positions for the two people and a partial occlusion that leaves the first person's left wrist visible. Leave enough frames after a full occlusion for confirmation and sticker recovery.
+
+```sh
+"$preview" --timeline-verify-ncnn-body "$source" "$pack" "$wrists" "$work"
+open -n "$app" --args --timeline-ncnn-preview "$work/body-hand.avkit" "$pack"
+```
+
+The verifier checks both directions for each clip against the same source PTS and verifies that direct and clocked seeks reuse the ordered results. It also compares pre-encode pixels and reimported MP4 timing.

@@ -1,6 +1,8 @@
 #include "movie_renderer.h"
+#include "bgfx_metal_texture.h"
 #include "app_resources.h"
 #include "metal_preview.h"
+#include "render/bgfx/video_texture_internal.h"
 #include "sticker_scene.h"
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <ImageIO/ImageIO.h>
 
+#include <huxerui/avkit/video_texture.h>
 #include <huxerui/macos/external_texture.h>
 
 namespace avkit_preview {
@@ -23,7 +26,6 @@ using namespace huxerui;
 using namespace huxerui::avkit;
 using namespace huxerui::avkit::render;
 using namespace huxerui::media;
-using huxerui::macos::PixelBufferTexture;
 namespace metal = huxerui::avkit::macos;
 
 void Check(bool condition, const char* message) {
@@ -41,9 +43,9 @@ struct CFDeleter {
 template<class Ref> using Owned = std::unique_ptr<std::remove_pointer_t<Ref>, CFDeleter>;
 
 struct ImportedPicture {
-  Owned<CVPixelBufferRef> input, fitted;
+  Owned<CVPixelBufferRef> fitted;
   Owned<CVMetalTextureRef> view;
-  RenderSurface surface;
+  ColorSurface surface;
 };
 
 const std::array kWipeFrames{
@@ -58,44 +60,56 @@ constexpr std::array kTrackingParts{analysis::TrackedPart::Face, analysis::Track
 struct MovieRenderer::Impl {
   explicit Impl(PixelSize size)
       : size_(size),
-        target_{size, render::ImageFormat::Bgra8Unorm},
+        target_{size, render::PixelFormat::Bgra8Unorm},
         backend_(metal::CreateBgfxBackend(device_, target_)),
         sticker_(CreatePreviewSticker(device_)),
         context_([CIContext contextWithMTLDevice:device_ options:@{kCIContextCacheIntermediates: @NO}]),
-        srgb_(CGColorSpaceCreateWithName(kCGColorSpaceSRGB)),
-        bt709_(CGColorSpaceCreateWithName(kCGColorSpaceITUR_709)) {
+        srgb_(CGColorSpaceCreateWithName(kCGColorSpaceSRGB)) {
     CVMetalTextureCacheRef cache = nullptr;
     Check(CVMetalTextureCacheCreate(nullptr, nullptr, device_, nullptr, &cache) == kCVReturnSuccess,
           "Cannot create the Metal video texture cache");
     cache_.reset(cache);
-    Check(context_ != nil && srgb_ && bt709_, "Cannot create the Metal video conversion context");
+    Check(context_ != nil && srgb_, "Cannot create the Metal video conversion context");
     InstallStickerScene(scene_);
   }
 
-  RenderSurface Draw(const VideoFrame& input, bool cue) {
-    const auto image = Import(input);
-    return DrawSticker(image.surface, input.pts, cue);
+  ColorSurface Draw(const VideoFrame& input, bool cue) {
+    return DrawSticker(ImportFrame(input), input.pts, cue);
   }
 
-  RenderSurface Draw(CVPixelBufferRef image, huxerui::Rect crop, VideoRotation rotation, MediaTimestamp time, bool cue) {
+  ColorSurface ImportFrame(const VideoFrame& input) {
+    auto result = render::detail::ImportDecodedBgfxFrame(*backend_, input, {size_.width, size_.height},
+                                                         TextureTransferPolicy::AllowCpuTransfer);
+    if (!result.Succeeded() && input.Storage() == VideoStorage::Platform &&
+        result.Error().code == RenderErrorCode::Unsupported) {
+      throw PlatformVideoImportError(result.Error().message);
+    }
+    return Require(std::move(result));
+  }
+
+  ColorSurface Draw(const ColorSurface& input, MediaTimestamp time, bool cue) {
+    return DrawSticker(input, time, cue);
+  }
+
+  ColorSurface Draw(CVPixelBufferRef image, huxerui::Rect crop, VideoRotation rotation, MediaTimestamp time, bool cue) {
     const auto imported = Import(image, crop, rotation);
     return DrawSticker(imported.surface, time, cue);
   }
 
-  RenderSurface Draw(const TimelineFrame& frame) {
+  ColorSurface Draw(const TimelineFrame& frame) {
     @autoreleasepool {
-      std::vector<ImportedPicture> pictures;
-      std::vector<RenderSurface> inputs;
+      std::vector<ColorSurface> inputs;
       inputs.reserve(frame.inputs.size());
       for (const auto& input : frame.inputs) {
         if (const auto* picture = std::get_if<VideoFrame>(&input)) {
-          pictures.push_back(Import(*picture));
-          inputs.push_back(pictures.back().surface);
+          inputs.push_back(ImportFrame(*picture));
+        } else if (const auto* surface = std::get_if<ColorSurface>(&input)) {
+          inputs.push_back(*surface);
         } else {
           inputs.push_back(Sticker(std::get<ResourceRef>(input)));
         }
       }
-      std::vector<DataSurface> masks;
+      std::vector<ImageSurface> masks;
       masks.reserve(frame.masks.size());
       for (const auto& sample : frame.masks) masks.push_back(Mask(sample));
       return Render({frame.plan, std::move(inputs), std::move(masks)});
@@ -103,7 +117,7 @@ struct MovieRenderer::Impl {
   }
 
 private:
-  const RenderSurface& Sticker(const ResourceRef& resource) {
+  const ColorSurface& Sticker(const ResourceRef& resource) {
     if (resource == PreviewStickerResource()) return sticker_;
     for (std::size_t index = 0; index < kTrackingParts.size(); ++index) {
       const auto part = kTrackingParts[index];
@@ -115,7 +129,7 @@ private:
     throw std::runtime_error("The preview sticker resource is unavailable");
   }
 
-  const DataSurface& Mask(const TransitionMaskSample& sample) {
+  const ImageSurface& Mask(const TransitionMaskSample& sample) {
     Check(sample.resource == PreviewWipeResource(), "The preview mask resource is unavailable");
     const auto index = sample.FrameIndex(kPreviewWipeFrameCount);
     auto& cached = wipe_frames_[index];
@@ -154,17 +168,6 @@ private:
     return *cached;
   }
 
-  ImportedPicture Import(const VideoFrame& input) {
-    const auto fitted = Require(MakeExternalTexture(input, {size_.width, size_.height}));
-    const auto mailbox = std::dynamic_pointer_cast<PixelBufferTexture>(fitted);
-    Check(bool(mailbox), "Expected a CoreVideo-backed video texture");
-    Owned<CVPixelBufferRef> image(mailbox->AcquireFrame());
-    Check(bool(image), "Decoded video texture has no image");
-    auto imported = Import(image.get(), {0, 0, 1, 1}, VideoRotation::None);
-    imported.input = std::move(image);
-    return imported;
-  }
-
   ImportedPicture Import(CVPixelBufferRef image, huxerui::Rect crop, VideoRotation rotation) {
     const auto width = CVPixelBufferGetWidth(image), height = CVPixelBufferGetHeight(image);
     Owned<CVPixelBufferRef> fitted;
@@ -199,15 +202,15 @@ private:
           "Cannot import the video image into Metal");
     Owned<CVMetalTextureRef> owned_view(view);
     const auto base = metal::RetainMetalTexture(CVMetalTextureGetTexture(view));
-    return {{}, std::move(fitted), std::move(owned_view), base};
+    return {std::move(fitted), std::move(owned_view), base};
   }
 
-  RenderSurface DrawSticker(const RenderSurface& base, MediaTimestamp time, bool cue) {
+  ColorSurface DrawSticker(const ColorSurface& base, MediaTimestamp time, bool cue) {
     if (cue && !cue_) cue_ = CreatePreviewSticker(device_, true);
     return Render({scene_.Evaluate(time, target_), {base, cue ? *cue_ : sticker_}});
   }
 
-  RenderSurface Render(const RenderRequest& request) {
+  ColorSurface Render(const RenderRequest& request) {
     auto ticket = Require(backend_->TrySubmit(request));
     Check(ticket.has_value(), "The composition target is busy");
     backend_->Pump();
@@ -217,37 +220,14 @@ private:
   }
 
 public:
-  VideoFrame EncoderFrame(const RenderSurface& output, const VideoEncoderConfig& config, MediaTimestamp pts,
+  VideoFrame EncoderFrame(const ColorSurface& output, const VideoEncoderConfig& config, MediaTimestamp pts,
                           std::optional<MediaTimestamp> duration) {
-    @autoreleasepool {
-      const auto image = [CIImage imageWithMTLTexture:metal::GetMetalTexture(output)
-                                             options:@{kCIImageColorSpace: (__bridge id)srgb_.get()}];
-      Check(image != nil, "Cannot use the composition as an encoder input");
-      auto pixels = Allocate(nv12_, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-      CVBufferSetAttachment(pixels.get(), kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
-                            kCVAttachmentMode_ShouldPropagate);
-      CVBufferSetAttachment(pixels.get(), kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
-                            kCVAttachmentMode_ShouldPropagate);
-      CVBufferSetAttachment(pixels.get(), kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                            kCVAttachmentMode_ShouldPropagate);
-      auto* destination = [[CIRenderDestination alloc] initWithPixelBuffer:pixels.get()];
-      // The CIImage made from a Metal texture maps its first row to Core Image y=0.
-      destination.flipped = NO;
-      destination.colorSpace = bt709_.get();
-      NSError* error = nil;
-      auto* task = [context_ startTaskToRender:image toDestination:destination error:&error];
-      if (!task || ![task waitUntilCompletedAndReturnError:&error])
-        throw std::runtime_error(error.localizedDescription.UTF8String ?: "Metal NV12 conversion did not finish");
-      if (config.input_storage == VideoStorage::Platform && config.input.pixel_format == VideoPixelFormat::NV12) {
-        auto mailbox = std::make_shared<PixelBufferTexture>(huxerui::Size{float(size_.width), float(size_.height)});
-        mailbox->Publish(pixels.get());
-        mailbox->Finish();
-        return Require(MakeVideoFrame(mailbox, config.input, pts, duration));
-      }
-      Check(config.input_storage == VideoStorage::Cpu && config.input.pixel_format == VideoPixelFormat::I420,
-            "The renderer cannot supply the encoder's negotiated storage and layout");
-      return ReadI420(pixels.get(), config.input, pts, duration);
+    auto picture = MakeBgfxEncoderFrame(*backend_, output, config, pts, duration);
+    if (!picture.Succeeded() && config.input_storage == VideoStorage::Platform &&
+        picture.Error().code == RenderErrorCode::Unsupported) {
+      throw PlatformVideoTransferError(picture.Error().message);
     }
+    return Require(std::move(picture));
   }
 
 private:
@@ -271,65 +251,42 @@ private:
     return Owned<CVPixelBufferRef>(pixel);
   }
 
-  VideoFrame ReadI420(CVPixelBufferRef image, const VideoFormat& format, MediaTimestamp pts,
-                      std::optional<MediaTimestamp> duration) const {
-    const auto width = size_.width, height = size_.height;
-    auto luma = std::make_shared<Bytes>(std::size_t(width) * height);
-    auto u = std::make_shared<Bytes>(luma->size() / 4);
-    auto v = std::make_shared<Bytes>(u->size());
-    Check(CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess,
-          "Cannot read the completed NV12 buffer for software encoding");
-    const auto* y = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, 0));
-    const auto* uv = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, 1));
-    const auto y_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
-    const auto uv_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
-    for (std::uint32_t row = 0; row < height; ++row)
-      std::memcpy(luma->data() + std::size_t(row) * width, y + row * y_stride, width);
-    for (std::uint32_t row = 0; row < height / 2; ++row) {
-      for (std::uint32_t x = 0; x < width / 2; ++x) {
-        const auto pixel = std::size_t(row) * (width / 2) + x;
-        const auto source = row * uv_stride + 2 * x;
-        (*u)[pixel] = uv[source];
-        (*v)[pixel] = uv[source + 1];
-      }
-    }
-    CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-    return {format, pts, duration,
-            {{BufferReference(*luma, luma), width, 1},
-             {BufferReference(*u, u), width / 2, 1},
-             {BufferReference(*v, v), width / 2, 1}}};
-  }
-
   PixelSize size_;
   id<MTLDevice> device_ = MTLCreateSystemDefaultDevice();
   ImageDesc target_;
   SceneEvaluator scene_;
   std::unique_ptr<RenderBackend> backend_;
-  RenderSurface sticker_;
-  std::array<std::optional<RenderSurface>, kTrackingParts.size()> tracking_stickers_;
-  std::optional<RenderSurface> cue_;
+  ColorSurface sticker_;
+  std::array<std::optional<ColorSurface>, kTrackingParts.size()> tracking_stickers_;
+  std::optional<ColorSurface> cue_;
   CIContext* context_;
-  Owned<CGColorSpaceRef> srgb_, bt709_;
+  Owned<CGColorSpaceRef> srgb_;
   Owned<CVMetalTextureCacheRef> cache_;
-  Owned<CVPixelBufferPoolRef> bgra_, nv12_;
+  Owned<CVPixelBufferPoolRef> bgra_;
   std::optional<Resources> resources_;
   std::optional<PixelSize> wipe_size_;
-  std::array<std::optional<DataSurface>, kPreviewWipeFrameCount> wipe_frames_;
+  std::array<std::optional<ImageSurface>, kPreviewWipeFrameCount> wipe_frames_;
 };
 
 MovieRenderer::MovieRenderer(PixelSize size) : impl_(std::make_unique<Impl>(size)) {}
 MovieRenderer::~MovieRenderer() = default;
 
-RenderSurface MovieRenderer::Draw(const VideoFrame& input, bool cue) { return impl_->Draw(input, cue); }
+ColorSurface MovieRenderer::ImportFrame(const VideoFrame& input) { return impl_->ImportFrame(input); }
 
-RenderSurface MovieRenderer::Draw(const TimelineFrame& frame) { return impl_->Draw(frame); }
+ColorSurface MovieRenderer::Draw(const ColorSurface& input, MediaTimestamp time, bool cue) {
+  return impl_->Draw(input, time, cue);
+}
 
-RenderSurface MovieRenderer::Draw(CVPixelBufferRef input, huxerui::Rect crop, VideoRotation rotation,
+ColorSurface MovieRenderer::Draw(const VideoFrame& input, bool cue) { return impl_->Draw(input, cue); }
+
+ColorSurface MovieRenderer::Draw(const TimelineFrame& frame) { return impl_->Draw(frame); }
+
+ColorSurface MovieRenderer::Draw(CVPixelBufferRef input, huxerui::Rect crop, VideoRotation rotation,
                                   MediaTimestamp time, bool cue) {
   return impl_->Draw(input, crop, rotation, time, cue);
 }
 
-VideoFrame MovieRenderer::EncoderFrame(const RenderSurface& output, const VideoEncoderConfig& config,
+VideoFrame MovieRenderer::EncoderFrame(const ColorSurface& output, const VideoEncoderConfig& config,
                                        MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
   return impl_->EncoderFrame(output, config, pts, duration);
 }

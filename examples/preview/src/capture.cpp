@@ -73,6 +73,20 @@ Task<void> VerifyCameraCapture(camera::CameraSession camera, TaskScope tasks, co
   std::cout << "Camera MP4 " << duration.count() << " us " << movie.Path() << std::endl;
 }
 
+Task<void> VerifyCameraComposite(const std::shared_ptr<LiveCapture>& live) {
+  const auto texture = live->Texture();
+  for (const auto deadline = std::chrono::steady_clock::now() + 6s;
+       texture->Revision() < 3 && std::chrono::steady_clock::now() < deadline;) {
+    const auto status = live->Status();
+    if (!status.error.empty()) throw std::runtime_error(status.error);
+    co_await Delay(30ms);
+  }
+  if (texture->Revision() < 3 || !(co_await texture->SnapshotAsync())) {
+    throw std::runtime_error("AVKit did not publish the processed camera frames");
+  }
+  std::cout << "Camera frames reached the shared bgfx compositor and the retained HuxerUI preview texture." << std::endl;
+}
+
 using RecordingState = LiveCaptureStatus::State;
 
 bool RecordingInProgress(RecordingState state) {
@@ -137,7 +151,7 @@ void ConfigureCapturePreview(std::string_view directory, CapturePreviewMode mode
   File output(directory);
   if (!output.IsDirectory() && !output.CreateDirectories()) throw std::runtime_error("Cannot create the capture directory");
   options.emplace(CaptureOptions{std::move(output), mode});
-  if (mode != CapturePreviewMode::VerifyCamera) options->live = std::make_shared<LiveCapture>();
+  options->live = std::make_shared<LiveCapture>();
 }
 
 bool HasCapturePreview() { return options.has_value(); }
@@ -175,8 +189,12 @@ View CapturePreview() {
       active = true;
       if (verify) {
         co_await WaitForCamera(camera);
-        if (mode == CapturePreviewMode::VerifyCamera) co_await VerifyCameraCapture(camera, tasks, directory);
-        else co_await VerifyLive(application, live, microphone, microphone_active, File(directory, "avkit.mp4"));
+        if (mode == CapturePreviewMode::VerifyCamera) {
+          co_await VerifyCameraComposite(live);
+          co_await VerifyCameraCapture(camera, tasks, directory);
+        } else {
+          co_await VerifyLive(application, live, microphone, microphone_active, File(directory, "avkit.mp4"));
+        }
         verification_exit = 0;
       }
     } catch (const std::exception& error) {

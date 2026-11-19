@@ -87,6 +87,26 @@ int main(int argc, const char** argv) {
         avkit_preview::VerifyTimelineTracking(argv[2]);
         return 0;
       }
+#if defined(AVKIT_NCNN_PREVIEW)
+      if (command == "--timeline-ncnn-preview" && (argc == 4 || argc == 5)) {
+        avkit_preview::ConfigureTimelinePreview(argv[2], argc == 5 ? argv[4] : "0",
+                                                avkit_preview::CreateTimelineNcnnProvider(argv[3]), true);
+        const auto result = huxerui::RunApplication();
+        avkit_preview::StopTimelinePreview();
+        return result;
+      }
+      if (command == "--timeline-verify-ncnn" && argc == 5) {
+        avkit_preview::VerifyTimelineNcnn(argv[2], argv[3], argv[4]);
+        return 0;
+      }
+      if (command == "--timeline-verify-ncnn-body" && argc == 6) {
+        avkit_preview::VerifyTimelineNcnnBody(argv[2], argv[3], argv[4], argv[5]);
+        return 0;
+      }
+      std::cerr << "Usage: --timeline-ncnn-preview PROJECT MODEL_DIRECTORY [SECONDS]\n"
+                   "       --timeline-verify-ncnn SOURCE MODEL_DIRECTORY DIRECTORY\n"
+                   "       --timeline-verify-ncnn-body SOURCE MODEL_DIRECTORY LANDMARKS DIRECTORY\n";
+#endif
       std::cerr << "Usage: --timeline-preview PROJECT [SECONDS]\n"
                    "       --timeline-export PROJECT OUTPUT [--software-only]\n"
                    "       --timeline-verify FIRST SECOND DIRECTORY\n"

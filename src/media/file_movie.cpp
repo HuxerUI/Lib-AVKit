@@ -28,6 +28,12 @@ using detail::CheckCancelled;
 using detail::Difference;
 using detail::StagedOutput;
 
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+constexpr auto kPlatformVideoLayout = VideoPixelFormat::Opaque;
+#else
+constexpr auto kPlatformVideoLayout = VideoPixelFormat::NV12;
+#endif
+
 template<class T, class E> T Require(Result<T, E> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
   if constexpr (!std::is_void_v<T>) return std::move(result).Value();
@@ -294,7 +300,7 @@ struct MovieReader::Impl {
     // An AVC sample entry can report the cropped size. The decoder bounds include whole macroblocks.
     config.width = (*description.coded_width + 15) & ~15u;
     config.height = (*description.coded_height + 15) & ~15u;
-    config.output = VideoPixelFormat::NV12;
+    config.output = kPlatformVideoLayout;
     config.output_storage = VideoStorage::Platform;
     auto cpu = config;
     cpu.output_storage = VideoStorage::Cpu;
@@ -332,7 +338,7 @@ struct MovieReader::Impl {
     if (selected != TrackKind::Audio) {
       target = at;
       last_video.reset();
-      OpenVideo(at, software);
+      OpenVideo(at, software || software_video_after_import);
     }
     if (selected != TrackKind::Video) {
       next_audio = AtScale(at, asset.pcm.sample_rate);
@@ -378,6 +384,28 @@ struct MovieReader::Impl {
         if (report) report({failure.operation, from, video->Provider(), failure.error, last_video.value_or(target)});
       }
     }
+  }
+
+  VideoFrame RetryVideoFrame(const VideoFrame& rejected, const PlatformVideoImportError& cause, std::stop_token stop) {
+    CheckCancelled(stop);
+    if (!ready || !video || !providers.platform || !providers.software ||
+        rejected.Storage() != VideoStorage::Platform || !last_video || Before(*last_video, rejected.pts)) {
+      throw cause;
+    }
+    const auto at = rejected.pts;
+    const auto from = video->Software() ? std::string(providers.platform->Name()) : video->Provider();
+    target = at;
+    last_video.reset();
+    OpenVideo(at, true);
+    auto replacement = ReadVideo(stop);
+    if (!replacement || replacement->Storage() != VideoStorage::Cpu ||
+        replacement->pts != at || replacement->duration != rejected.duration) {
+      throw std::runtime_error("Software decode did not reproduce the rejected frame's exact presentation interval");
+    }
+    software_video_after_import = true;
+    if (report) report({CodecOperation::VideoDecode, from, video->Provider(),
+                        {CodecErrorCode::Unsupported, cause.what(), {}}, at});
+    return std::move(*replacement);
   }
 
   std::optional<AudioFrame> ReadAudio(std::stop_token stop) {
@@ -450,7 +478,7 @@ struct MovieReader::Impl {
   std::deque<VideoFrame> pending_video;
   std::deque<AudioFrame> pending_audio;
   MediaTimestamp target, next_audio;
-  bool ready{}, video_end{}, audio_end{};
+  bool ready{}, video_end{}, audio_end{}, software_video_after_import{};
 };
 
 MovieReader::MovieReader(MovieAsset asset, MovieCodecProviders providers, CodecPolicy policy, OnCodecFallback report)
@@ -470,6 +498,11 @@ void MovieReader::Seek(MediaTimestamp at) {
 }
 std::optional<VideoFrame> MovieReader::ReadVideo(std::stop_token stop) {
   try { return impl_->ReadVideo(stop); }
+  catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
+}
+VideoFrame MovieReader::RetryVideoFrame(const VideoFrame& rejected, const PlatformVideoImportError& cause,
+                                       std::stop_token stop) {
+  try { return impl_->RetryVideoFrame(rejected, cause, stop); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
 std::optional<AudioFrame> MovieReader::ReadAudio(std::stop_token stop) {
@@ -495,7 +528,7 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
                const ReadRecordingAudio& read_audio, const OnCodecFallback& report, bool software_only) {
   auto platform = settings.video;
   platform.input_storage = VideoStorage::Platform;
-  platform.input.pixel_format = VideoPixelFormat::NV12;
+  platform.input.pixel_format = kPlatformVideoLayout;
   auto software = settings.video;
   software.input_storage = VideoStorage::Cpu;
   software.input.pixel_format = VideoPixelFormat::I420;
@@ -506,11 +539,18 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
   auto bound = settings.video;
   bound.input_storage = contract->storage;
   bound.input.pixel_format = contract->layout;
+  const bool video_software = selected.software;
   Pump<VideoEncoderSession> video(std::move(selected), CodecOperation::VideoEncode, [&]() -> std::optional<VideoFrame> {
-    auto output = read_video(bound);
-    if (output && (output->format != bound.input || output->Storage() != bound.input_storage))
-      throw std::runtime_error("The source returned a video frame outside the negotiated format");
-    return output;
+    try {
+      auto output = read_video(bound);
+      if (output && (output->format != bound.input || output->Storage() != bound.input_storage))
+        throw std::runtime_error("The source returned a video frame outside the negotiated format");
+      return output;
+    } catch (const PlatformVideoTransferError& error) {
+      if (bound.input_storage != VideoStorage::Platform) throw;
+      throw CodecFailure{CodecOperation::VideoEncode, video_software,
+                         {CodecErrorCode::Unsupported, error.what(), {}}};
+    }
   });
   AudioEncoderConfig audio_config;
   audio_config.input = pcm;
@@ -585,7 +625,14 @@ void ExportAttempt(const MovieAsset& asset, const File& destination, const Movie
       [&](const VideoEncoderConfig& bound) -> std::optional<VideoFrame> {
         auto input = source.ReadVideo();
         if (!input) return std::nullopt;
-        auto output = compose(*input, bound);
+        auto output = [&] {
+          try {
+            return compose(*input, bound);
+          } catch (const PlatformVideoImportError& error) {
+            input = source.RetryVideoFrame(*input, error);
+            return compose(*input, bound);
+          }
+        }();
         if (output.pts != input->pts || output.duration != input->duration)
           throw std::runtime_error("Compositor changed source video timing");
         return output;
@@ -634,7 +681,7 @@ void WriteLiveMovie(const File& destination, const MovieCodecProviders& provider
 void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
                     const MovieCodecProviders& providers, const FileExportSettings& settings,
                     const ComposeTimelineFrame& compose, OnCodecFallback report,
-                    std::shared_ptr<analysis::AnalysisProvider> analysis) {
+                    std::shared_ptr<analysis::AnalysisProvider> analysis, const ImportVideoFrame& import) {
   if (!project || !compose) throw std::invalid_argument("Export requires a project and a compositor");
   const auto numerator = settings.video.frame_rate_numerator;
   const auto denominator = settings.video.frame_rate_denominator;
@@ -660,7 +707,7 @@ void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& 
           if (video_at == video_end) return std::nullopt;
           const MediaTimestamp pts{video_at, video_scale};
           const MediaTimestamp duration{std::min(std::int64_t(step), video_end - video_at), video_scale};
-          auto output = compose(session.SampleVideo(pts), bound, duration);
+          auto output = compose(session.SampleVideo(pts, render::PixelFormat::Bgra8Unorm, {}, import), bound, duration);
           if (output.pts != pts || output.duration != duration)
             throw std::runtime_error("Compositor changed the timeline video timing");
           video_at += duration.ticks;

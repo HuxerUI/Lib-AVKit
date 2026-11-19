@@ -1,20 +1,22 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/avkit.h>
 
+#include <exception>
+
 #if defined(AVKIT_CAPTURE_PREVIEW)
 #include <huxerui/camera.h>
 #include "capture_preview.h"
 #endif
 
 #if defined(AVKIT_MACOS_PREVIEW)
-#include <exception>
-
 #include "metal_preview.h"
 #if defined(AVKIT_FILE_MEDIA)
 #include "file_preview.h"
 #include "timeline_preview.h"
 #include "timeline_strip.h"
 #endif
+#else
+#include "bgfx_preview.h"
 #endif
 
 using namespace huxerui;
@@ -23,8 +25,8 @@ View App() {
 #if defined(AVKIT_CAPTURE_PREVIEW)
   if (avkit_preview::HasCapturePreview()) return avkit_preview::CapturePreview();
 #endif
-#if defined(AVKIT_MACOS_PREVIEW)
   try {
+#if defined(AVKIT_MACOS_PREVIEW)
     static const auto texture = [] {
 #if defined(AVKIT_FILE_MEDIA)
       if (auto timeline = avkit_preview::CreateTimelinePreview()) return timeline;
@@ -46,12 +48,13 @@ View App() {
     }
 #endif
     return Image(texture).Fit(ImageFit::Contain);
+#else
+    static const auto image = avkit_preview::CreateBgfxPreview();
+    return std::visit([](const auto& source) { return Image(source).Fit(ImageFit::Contain); }, image);
+#endif
   } catch (const std::exception& error) {
     return Text(error.what());
   }
-#else
-  return Text("AVKit preview");
-#endif
 }
 
 const Application application{

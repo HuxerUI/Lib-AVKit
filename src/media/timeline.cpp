@@ -68,6 +68,7 @@ struct VideoClip {
   flecs::entity subcomposition_root;
   std::optional<std::uint32_t> subcomposition;
   std::unique_ptr<detail::SourceTracking> tracking;
+  bool software_video{};
 };
 
 struct TransitionLayer {
@@ -248,17 +249,19 @@ struct TimelineSession::Impl {
                       ExactTicks(placement.source.range.start, pcm.sample_rate), {}, placement.source.reverse});
   }
 
-  std::unique_ptr<MovieReader> Open(const MovieAsset& movie, TrackKind track, MediaTimestamp at) {
-    return std::make_unique<MovieReader>(movie, providers, track, at, policy, report);
+  std::unique_ptr<MovieReader> Open(const MovieAsset& movie, TrackKind track, MediaTimestamp at,
+                                    bool software_video = false) {
+    return std::make_unique<MovieReader>(movie, providers, track, at,
+                                         software_video ? CodecPolicy::SoftwareOnly : policy, report);
   }
 
-  const VideoFrame* Picture(VideoClip& clip, MediaTimestamp at, std::stop_token stop) {
+  VideoFrame* Picture(VideoClip& clip, MediaTimestamp at, std::stop_token stop) {
     const auto source = SourceTime(clip.clip->placement, at);
     if (clip.clip->placement.source.reverse) return ReversePicture(clip, source, stop);
     auto& cursor = clip.cursor;
     if (!cursor.reader || (cursor.last && Before(source, *cursor.last))) {
       cursor = {};
-      cursor.reader = Open(*clip.movie, TrackKind::Video, source);
+      cursor.reader = Open(*clip.movie, TrackKind::Video, source, clip.software_video);
       cursor.frame = cursor.reader->ReadVideo(stop);
     }
     cursor.last = source;
@@ -267,16 +270,17 @@ struct TimelineSession::Impl {
     return cursor.frame && !Before(source, cursor.frame->pts) ? &*cursor.frame : nullptr;
   }
 
-  const VideoFrame* ReversePicture(VideoClip& clip, MediaTimestamp source, std::stop_token stop) {
+  VideoFrame* ReversePicture(VideoClip& clip, MediaTimestamp source, std::stop_token stop) {
     auto& cursor = clip.cursor;
     if (!cursor.reverse_window || !Before(cursor.reverse_window->start, source) || Before(cursor.reverse_window->end, source)) {
       cursor.reverse_window.reset();
       cursor.reverse_frames.clear();
+      cursor.reader.reset();
       const auto trim = clip.clip->placement.source.range.start;
       const auto earliest = Difference(source, {1, 4});
       auto begin = Before(earliest, trim) ? trim : earliest;
-      auto reader = Open(*clip.movie, TrackKind::Video, begin);
-      while (auto picture = reader->ReadVideo(stop)) {
+      cursor.reader = Open(*clip.movie, TrackKind::Video, begin, clip.software_video);
+      while (auto picture = cursor.reader->ReadVideo(stop)) {
         if (!Before(picture->pts, source)) break;
         const auto end = Add(picture->pts, *picture->duration);
         if (cursor.reverse_frames.size() == 8) {
@@ -292,6 +296,26 @@ struct TimelineSession::Impl {
       return Before(frame.pts, source) && !Before(Add(frame.pts, *frame.duration), source);
     });
     return picture == cursor.reverse_frames.end() ? nullptr : &*picture;
+  }
+
+  render::ColorSurface PreparePicture(VideoClip& clip, VideoFrame*& picture, const ImportVideoFrame& import,
+                                      std::stop_token stop) {
+    try {
+      return import(*picture);
+    } catch (const PlatformVideoImportError& error) {
+      auto replacement = clip.cursor.reader->RetryVideoFrame(*picture, error, stop);
+      clip.software_video = true;
+      if (clip.clip->placement.source.reverse) {
+        auto& cursor = clip.cursor;
+        cursor.reverse_frames.clear();
+        cursor.reverse_window = TimeRange{replacement.pts, Add(replacement.pts, *replacement.duration)};
+        cursor.reverse_frames.push_back(std::move(replacement));
+        picture = &cursor.reverse_frames.front();
+      } else {
+        *picture = std::move(replacement);
+      }
+    }
+    return import(*picture);
   }
 
   std::vector<VideoFrame> AnalysisImages(const VideoClip& clip, const VideoFrame& target,
@@ -311,7 +335,7 @@ struct TimelineSession::Impl {
       const auto at = Add(target.pts, {step.ticks * offset, step.timescale});
       if (!Contains(RangeOf(clip.movie->video_range), at)) continue;
       if (!reader) {
-        reader = Open(*clip.movie, TrackKind::Video, at);
+        reader = Open(*clip.movie, TrackKind::Video, at, clip.software_video);
         next = reader->ReadVideo(stop);
       }
       while (next && !Before(at, Add(next->pts, *next->duration))) next = reader->ReadVideo(stop);
@@ -322,7 +346,8 @@ struct TimelineSession::Impl {
     return images;
   }
 
-  TimelineFrame SampleVideo(MediaTimestamp at, render::ImageFormat output, std::stop_token stop) {
+  TimelineFrame SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
+                            const ImportVideoFrame& import) {
     CheckCancelled(stop);
     if (!Contains(range, at)) throw std::out_of_range("Sample time is outside the project interval");
     TimelineFrame frame{at, {}, {}};
@@ -349,7 +374,7 @@ struct TimelineSession::Impl {
       if (clip.subcomposition) clip.subcomposition_root.set<SubcompositionRoot>({*clip.subcomposition});
       else if (clip.subcomposition_root && clip.subcomposition_root.has<SubcompositionRoot>())
         clip.subcomposition_root.remove<SubcompositionRoot>();
-      const auto* image = NeedsPicture(clip, at) ? Picture(clip, at, stop) : nullptr;
+      auto* image = NeedsPicture(clip, at) ? Picture(clip, at, stop) : nullptr;
       const bool visible = image != nullptr;
       if (clip.visible != visible) {
         clip.visible = visible;
@@ -360,7 +385,8 @@ struct TimelineSession::Impl {
       }
       if (!image) continue;
       clip.layer.get_mut<CompositeLayer>().input_slot = static_cast<std::uint32_t>(frame.inputs.size());
-      frame.inputs.emplace_back(*image);
+      if (import) frame.inputs.emplace_back(PreparePicture(clip, image, import, stop));
+      else frame.inputs.emplace_back(*image);
       const analysis::PersonSample* primary = nullptr;
       Rect content;
       if (clip.tracking) {
@@ -369,7 +395,16 @@ struct TimelineSession::Impl {
         }, [&]() -> std::optional<VideoFrame> {
           const auto first = clip.clip->placement.source.range.start;
           if (Contains({image->pts, Add(image->pts, *image->duration)}, first)) return std::nullopt;
-          return Open(*clip.movie, TrackKind::Video, first)->ReadVideo(stop);
+          return Open(*clip.movie, TrackKind::Video, first, clip.software_video)->ReadVideo(stop);
+        }, [&] {
+          const auto trim = clip.clip->placement.source.range;
+          auto reader = std::shared_ptr<MovieReader>(Open(*clip.movie, TrackKind::Video, trim.start, clip.software_video));
+          return [reader = std::move(reader), end = trim.end](std::stop_token token) mutable -> std::optional<VideoFrame> {
+            if (!reader) return std::nullopt;
+            auto frame = reader->ReadVideo(token);
+            if (!frame || !Before(Add(frame->pts, *frame->duration), end)) reader.reset();
+            return frame;
+          };
         }, stop);
         if (tracking.primary) {
           const auto person = std::ranges::find(tracking.people, *tracking.primary, &analysis::PersonSample::person);
@@ -538,9 +573,10 @@ void TimelineSession::ApplyProject(std::shared_ptr<const ProjectSnapshot> projec
   impl_ = std::make_unique<Impl>(std::move(project), impl_->providers, impl_->policy, impl_->report, impl_->analysis_provider);
 }
 
-TimelineFrame TimelineSession::SampleVideo(MediaTimestamp at, render::ImageFormat output, std::stop_token stop) {
+TimelineFrame TimelineSession::SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
+                                           const ImportVideoFrame& import) {
   try {
-    return impl_->SampleVideo(at, output, stop);
+    return impl_->SampleVideo(at, output, stop, import);
   } catch (const std::system_error& error) {
     if (error.code() == std::errc::operation_canceled) Reset();
     throw;

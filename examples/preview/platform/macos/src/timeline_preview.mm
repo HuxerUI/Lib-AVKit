@@ -40,6 +40,7 @@ struct PreviewOptions {
   std::shared_ptr<const ProjectSnapshot> project;
   MediaTimestamp start;
   std::shared_ptr<analysis::AnalysisProvider> analysis;
+  CodecPolicy policy;
 };
 
 std::optional<PreviewOptions> preview;
@@ -54,7 +55,9 @@ MovieCodecProviders TimelineProviders() { return {CreateLibMediaCodecProvider(),
 
 void RenderTimelineSample(TimelineSession& session, MovieRenderer& renderer, MediaTimestamp at, MetalTexture& mailbox,
                           std::stop_token stop) {
-  PublishPreviewSurface(mailbox, renderer.Draw(session.SampleVideo(at, render::ImageFormat::Bgra8Unorm, stop)));
+  auto frame = session.SampleVideo(at, render::PixelFormat::Bgra8Unorm, stop,
+                                  [&](const auto& video) { return renderer.ImportFrame(video); });
+  PublishPreviewSurface(mailbox, renderer.Draw(frame));
 }
 
 TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, MovieRenderer& renderer,
@@ -150,7 +153,7 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
 }
 
 void ConfigureTimelinePreview(std::string_view path, std::string_view seconds,
-                              std::shared_ptr<analysis::AnalysisProvider> analysis) {
+                              std::shared_ptr<analysis::AnalysisProvider> analysis, bool software_only) {
   auto project = Project::Open(File(path)).Snapshot();
   std::size_t length = 0;
   const auto value = std::stod(std::string(seconds), &length);
@@ -158,7 +161,8 @@ void ConfigureTimelinePreview(std::string_view path, std::string_view seconds,
   if (length != seconds.size() || !std::isfinite(value) || value < 0 ||
       value >= double(end.ticks) / end.timescale || value >= double(std::numeric_limits<std::int64_t>::max()) / 1000000)
     throw std::invalid_argument("Preview start is outside the timeline");
-  preview = PreviewOptions{std::move(project), {std::llround(value * 1000000), 1000000}, std::move(analysis)};
+  preview = PreviewOptions{std::move(project), {std::llround(value * 1000000), 1000000}, std::move(analysis),
+                           software_only ? CodecPolicy::SoftwareOnly : CodecPolicy::Auto};
 }
 
 bool HasTimelinePreview() { return preview.has_value(); }
@@ -172,7 +176,7 @@ std::shared_ptr<ExternalTexture> CreateTimelinePreview() {
     @autoreleasepool {
       try {
         MovieRenderer renderer(options.project->canvas);
-        TimelineSession session(options.project, TimelineProviders(), CodecPolicy::Auto, {}, options.analysis);
+        TimelineSession session(options.project, TimelineProviders(), options.policy, {}, options.analysis);
         const auto range = options.project->Range();
         PlayTimeline(session, range, renderer, *mailbox, options.start, false, [&](MediaTimestamp presented) -> std::optional<MediaTimestamp> {
           std::optional<bool> command;
@@ -224,7 +228,7 @@ void ExportComposedTimeline(std::shared_ptr<const ProjectSnapshot> project, cons
         @autoreleasepool {
           return renderer.EncoderFrame(renderer.Draw(frame), bound, frame.pts, duration);
         }
-      }, std::move(on_fallback));
+      }, std::move(on_fallback), {}, [&](const auto& video) { return renderer.ImportFrame(video); });
 }
 
 void ExportTimelinePreview(std::string_view path, std::string_view destination, bool software_only) {

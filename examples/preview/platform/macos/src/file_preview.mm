@@ -1,4 +1,5 @@
 #include "file_preview.h"
+#include "bgfx_metal_texture.h"
 #include "verification/codec_verification.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -17,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <utility>
 #include <vector>
 
@@ -100,6 +103,9 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
   Require(playback.SetMuted(muted));
   Require(playback.Play());
   std::optional<VideoFrame> picture;
+  ColorSurface pending_surface;
+  using PreparedFrame = std::pair<MediaTimestamp, ColorSurface>;
+  std::deque<PreparedFrame> prepared;
   std::optional<AudioFrame> sound;
   bool video_finished = false, audio_finished = false;
   bool audio_eof = false, ended_reported = false;
@@ -114,6 +120,8 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
         if (auto requested = take_seek(stats.published)) {
           epoch = Require(playback.Reset());
           picture.reset();
+          pending_surface = {};
+          prepared.clear();
           sound.reset();
           reader.Seek(*requested);
           Require(playback.Play());
@@ -138,11 +146,22 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
       bool progressed = position != snapshot.position;
       position = snapshot.position;
       if (!video_finished) {
-        if (!picture) picture = reader.ReadVideo();
+        if (!picture) {
+          picture = reader.ReadVideo(stop);
+          if (picture) {
+            try {
+              pending_surface = renderer.ImportFrame(*picture);
+            } catch (const PlatformVideoImportError& error) {
+              picture = reader.RetryVideoFrame(*picture, error, stop);
+              pending_surface = renderer.ImportFrame(*picture);
+            }
+          }
+        }
         if (!picture) {
           Require(playback.FinishVideo(epoch));
           video_finished = true;
         } else if (Require(playback.TrySubmitVideo(epoch, *picture)) == SubmitStatus::Accepted) {
+          prepared.emplace_back(picture->pts, std::move(pending_surface));
           picture.reset();
           progressed = true;
         }
@@ -162,11 +181,16 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
         }
       }
       const auto presented = Require(playback.PresentVideo(epoch, [&](const VideoFrame& frame) {
-        const auto composed = renderer.Draw(frame, cue);
+        const auto input = std::ranges::find(prepared, frame.pts, &PreparedFrame::first);
+        Check(input != prepared.end(), "Playback needs the prepared surface for the presented PTS");
+        const auto composed = renderer.Draw(input->second, frame.pts, cue);
         mailbox.Publish({.texture = metal::GetMetalTexture(composed), .alpha = MetalTexture::Alpha::Opaque});
         if (!stats.first_video) stats.first_video = frame.pts;
         stats.last_video = frame.pts;
       }));
+      const auto retired = presented.dropped + (presented.lag_ms ? 1 : 0);
+      Check(retired <= prepared.size(), "Playback retired an unknown video surface");
+      for (std::size_t i = 0; i < retired; ++i) prepared.pop_front();
       stats.dropped += presented.dropped;
       if (presented.lag_ms) {
         ++stats.published;
@@ -354,6 +378,27 @@ void VerifyFilePreview(std::string_view input, std::string_view output) {
               << stats.dropped << ", maximum audio-clock lag " << stats.maximum_lag_ms << " ms, underruns "
               << stats.underruns << std::endl;
 
+    bool reject_texture = false;
+    const MovieCodecProviders incompatible_decoder{
+        std::make_shared<ObservedCodecProvider>(providers.platform, nullptr, VideoFaults{}, [&](VideoFrame& picture) {
+          if (reject_texture) picture.format.matrix = ColorMatrix::BT2020;
+        }), providers.software};
+    fallbacks.clear();
+    unsigned seeks = 0;
+    MetalTexture texture_mailbox(LogicalSize(OutputSize(asset)));
+    const auto texture_stats = PlayMovie(asset, {}, texture_mailbox, true, incompatible_decoder, report,
+        [&](std::size_t published) -> std::optional<MediaTimestamp> {
+          if (published < 2 || seeks == 2) return std::nullopt;
+          reject_texture = true;
+          return ++seeks == 1 ? seek : MediaTimestamp{};
+        }, {}, true);
+    Check(seeks == 2 && texture_stats.first_audio == MediaTimestamp{} &&
+              texture_stats.first_video == baseline.pictures.front().first && !texture_stats.underruns &&
+              fallbacks.size() == 1 && fallbacks.front().operation == CodecOperation::VideoDecode &&
+              fallbacks.front().cause.code == CodecErrorCode::Unsupported && fallbacks.front().resume_at == video->pts,
+          "Texture rejection did not retry the exact seek picture and retain software video through a backward seek");
+    std::cout << "Rejected decoder texture retried at the seek frame PTS with audio continuity." << std::endl;
+
     const File destination(output);
     const MovieCodecProviders failing_encoder{
         std::make_shared<ObservedCodecProvider>(providers.platform, nullptr, VideoFaults{.encode_after = 5}), providers.software};
@@ -367,6 +412,43 @@ void VerifyFilePreview(std::string_view input, std::string_view output) {
     const auto result = ReadTimeline(reimported, providers, CodecPolicy::SoftwareOnly, {}, true);
     Check(reimported.pcm == asset.pcm && result.pictures == baseline.pictures && result.samples == baseline.samples,
           "Reimported MP4 did not preserve exact frame PTS, durations and presented audio sample count");
+
+    const File decoder_output(std::string(output) + ".decoder-texture-fallback.mp4");
+    reject_texture = false;
+    fallbacks.clear();
+    std::size_t composed = 0;
+    {
+      MovieRenderer renderer(OutputSize(asset));
+      ExportMovie(asset, decoder_output, incompatible_decoder, ExportSettings(OutputSize(asset), false),
+          [&](const VideoFrame& input, const VideoEncoderConfig& bound) {
+            auto frame = renderer.EncodeFrame(input, bound, true);
+            if (++composed == 5) reject_texture = true;
+            return frame;
+          }, report);
+    }
+    const auto decoder_result = ReadTimeline(ImportMovie(decoder_output), providers, CodecPolicy::SoftwareOnly, {}, true);
+    Check(composed == baseline.pictures.size() && fallbacks.size() == 1 &&
+              fallbacks.front().operation == CodecOperation::VideoDecode &&
+              fallbacks.front().resume_at == baseline.pictures[5].first &&
+              decoder_result.pictures == baseline.pictures && decoder_result.samples == baseline.samples,
+          "Export did not recover the rejected input at exact PTS without restarting encoding");
+    std::cout << "Rejected decoder texture retried in place during export, preserving all video and audio timing." << std::endl;
+
+    const File transfer_output(std::string(output) + ".texture-fallback.mp4");
+    MovieRenderer renderer(OutputSize(asset));
+    fallbacks.clear();
+    ExportMovie(asset, transfer_output, providers, ExportSettings(OutputSize(asset), false),
+        [&](const VideoFrame& input, const VideoEncoderConfig& bound) {
+          if (bound.input_storage == VideoStorage::Platform && input.pts == baseline.pictures[5].first)
+            throw PlatformVideoTransferError("Injected compositor texture sharing failure");
+          return renderer.EncodeFrame(input, bound, true);
+        }, report);
+    const auto transfer_result = ReadTimeline(ImportMovie(transfer_output), providers, CodecPolicy::SoftwareOnly, {}, true);
+    Check(fallbacks.size() == 1 && fallbacks.back().operation == CodecOperation::VideoEncode &&
+              fallbacks.back().cause.message == "Injected compositor texture sharing failure" &&
+              transfer_result.pictures == baseline.pictures && transfer_result.samples == baseline.samples,
+          "Texture sharing fallback did not restart export with the original presentation timeline");
+    std::cout << "Texture sharing failure restarted export with CPU encoder input." << std::endl;
     std::cout << "Reimport verified " << result.pictures.size() << " video PTS/durations and " << result.samples
               << " contiguous audio samples." << std::endl;
     std::cout << "ECS sticker position verified in the file preview and every reimported export frame." << std::endl;

@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 
@@ -54,6 +55,12 @@ using OnCodecFallback = std::function<void(const CodecFallback&)>;
 /// @throws std::runtime_error On unsupported media metadata or I/O failure.
 MovieAsset ImportMovie(const File& file);
 
+/// @brief A decoded platform video frame could not be imported by the compositor.
+class PlatformVideoImportError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 /// @brief Pulls decoded frames in movie presentation time on a worker sequence.
 /// Each reader owns its selected track cursors and decoder sessions.
 class MovieReader {
@@ -75,6 +82,11 @@ public:
   /// @return A frame or an empty value at end of stream.
   /// @throws std::system_error With std::errc::operation_canceled when stopped.
   std::optional<media::VideoFrame> ReadVideo(std::stop_token stop = {});
+  /// @brief Reopens only the video cursor on the software provider and redecodes a rejected platform frame.
+  /// Pass a frame from this reader before admitting the frame to playback or encoding.
+  /// The replacement must have the same presentation timestamp and duration. Later seeks keep the software video provider.
+  media::VideoFrame RetryVideoFrame(const media::VideoFrame& rejected, const PlatformVideoImportError& cause,
+                                  std::stop_token stop = {});
   /// @brief Reads the next retained PCM frame on the movie's audio sample grid.
   /// @return A frame or an empty value at end of stream.
   /// @throws std::system_error With std::errc::operation_canceled when stopped.
@@ -90,6 +102,13 @@ struct FileExportSettings {
   media::VideoEncoderConfig video;
   std::uint32_t audio_bitrate{128000};
   CodecPolicy policy{CodecPolicy::Auto};
+};
+
+/// @brief A compositor could not supply a frame using the negotiated platform storage.
+/// File and timeline export can reopen their source and retry using a CPU encoder input.
+class PlatformVideoTransferError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
 };
 
 /// @brief Composites a decoded image into the encoder's confirmed layout and storage.

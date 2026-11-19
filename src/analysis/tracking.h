@@ -16,13 +16,15 @@ class SourceTracking {
 public:
   using ReadWindow = std::function<std::vector<media::VideoFrame>(const media::VideoFrame&, const analysis::AnalysisWindow&)>;
   using ReadReference = std::function<std::optional<media::VideoFrame>()>;
+  using ReadNext = std::function<std::optional<media::VideoFrame>(std::stop_token)>;
+  using OpenOrdered = std::function<ReadNext()>;
 
   SourceTracking(std::shared_ptr<analysis::AnalysisProvider> provider, std::uint64_t source,
                  std::span<const analysis::TrackedPart> parts);
   ~SourceTracking();
 
   const TrackingFrame& Sample(const media::VideoFrame& image, const ReadWindow& read, const ReadReference& reference,
-                              std::stop_token stop);
+                              const OpenOrdered& open_ordered, std::stop_token stop);
   void Reset();
 
 private:

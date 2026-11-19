@@ -35,7 +35,8 @@ struct AnalysisWindow {
   std::uint32_t past_frames{}, future_frames{}; ///< Counts on either side of the target.
   /// Positive sampling interval on the source clock. File sampling requires it for neighboring frames.
   std::optional<media::MediaTimestamp> sample_interval;
-  bool stateful{};     ///< The model uses state carried between requests.
+  /// The session carries state between requests. File tracking feeds source PTS in ascending order per clip.
+  bool stateful{};
   bool accepts_gaps{}; ///< The model accepts missing window samples.
 };
 
@@ -83,6 +84,10 @@ struct AnalysisRegion {
   TrackedPart part;
   /// Normalized oriented source coordinates. Edge regions may extend beyond the source.
   Rect bounds;
+  /// The center was inferred from pose or prior observations. Report a landmark only when verified in the target picture.
+  bool predicted{};
+  /// Optional target-frame elbow-to-wrist vector in normalized source coordinates for a hand search.
+  std::optional<Point> forearm;
 };
 
 /// @brief Retains one decoded picture and its analysis identity.

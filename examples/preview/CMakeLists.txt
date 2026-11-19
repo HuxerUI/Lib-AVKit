@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 
 # CMake initializes Apple deployment defaults during the first project() call.
 # Explicit settings and toolchains retain ownership of their target platform.
@@ -58,24 +58,31 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
                 CACHE PATH "Lib-Camera source checkout")
         huxerui_use_library(example_av_kit TARGET HuxerUI::Camera PATH "${AVKIT_LIB_CAMERA_SOURCE_DIR}")
         if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-            if (NOT TARGET AVKit::Bgfx OR NOT TARGET AVKit::FFmpeg)
-                message(FATAL_ERROR "The capture example requires the bgfx and FFmpeg adapters")
+            if (NOT TARGET AVKit::FFmpeg)
+                message(FATAL_ERROR "The capture example requires the FFmpeg adapter")
             endif ()
             target_compile_definitions(example_av_kit PRIVATE AVKIT_CAPTURE_PREVIEW=1)
         endif ()
     endif ()
 endif ()
 
-if (TARGET AVKit::Bgfx)
+if (HUXERUI_LIBRARY_GRAPH_ONLY)
+    return()
+endif ()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJCXX)
     target_sources(example_av_kit PRIVATE src/sticker_scene.cpp platform/macos/src/metal_preview.mm)
     set_target_properties(example_av_kit PROPERTIES
             OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF
     )
-    target_include_directories(example_av_kit PRIVATE src platform/macos/src)
+    target_include_directories(example_av_kit PRIVATE
+            src
+            platform/macos/src
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/macos/src"
+    )
     target_compile_definitions(example_av_kit PRIVATE AVKIT_MACOS_PREVIEW=1)
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    target_link_libraries(example_av_kit PRIVATE AVKit::Bgfx)
     if (TARGET AVKit::FFmpeg)
         target_sources(example_av_kit PRIVATE
                 src/timeline_strip.cpp
@@ -95,8 +102,15 @@ if (TARGET AVKit::Bgfx)
         )
         target_compile_definitions(example_av_kit PRIVATE AVKIT_FILE_MEDIA=1)
         target_link_libraries(example_av_kit PRIVATE AVKit::FFmpeg "-framework CoreImage" "-framework ImageIO")
+        if (TARGET AVKit::NCNN)
+            target_sources(example_av_kit PRIVATE platform/macos/verification/timeline_ncnn_verify.mm)
+            target_compile_definitions(example_av_kit PRIVATE AVKIT_NCNN_PREVIEW=1)
+            target_link_libraries(example_av_kit PRIVATE AVKit::NCNN)
+        endif ()
         if (AVKIT_ENABLE_CAPTURE_PREVIEW)
             target_sources(example_av_kit PRIVATE src/capture.cpp platform/macos/src/live_capture.mm)
         endif ()
     endif ()
+else ()
+    target_sources(example_av_kit PRIVATE src/bgfx_preview.cpp)
 endif ()

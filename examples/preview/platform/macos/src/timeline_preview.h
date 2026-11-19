@@ -17,7 +17,8 @@ namespace huxerui::avkit::analysis { class AnalysisProvider; }
 namespace avkit_preview {
 
 void ConfigureTimelinePreview(std::string_view path, std::string_view seconds,
-                              std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {});
+                              std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {},
+                              bool software_only = false);
 bool HasTimelinePreview();
 std::shared_ptr<huxerui::ExternalTexture> CreateTimelinePreview();
 void SeekTimelinePreview(bool midpoint);

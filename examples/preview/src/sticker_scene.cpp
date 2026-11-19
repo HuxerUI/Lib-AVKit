@@ -66,7 +66,7 @@ void VerifyStickerScene() {
   InstallStickerScene(preview);
   InstallStickerScene(recording);
   InstallStickerScene(export_scene);
-  const ImageDesc target{{320, 180}, render::ImageFormat::Bgra8Unorm};
+  const ImageDesc target{{320, 180}, render::PixelFormat::Bgra8Unorm};
   const auto initial = preview.Evaluate({}, target);
   Check(initial->draws == std::vector<Draw>{{0, Blend::Replace}, {1, Blend::PremultipliedOver}},
         "ECS did not produce the initial layer order");

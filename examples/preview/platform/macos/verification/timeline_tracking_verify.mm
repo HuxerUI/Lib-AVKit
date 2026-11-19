@@ -1,5 +1,6 @@
 #include "timeline_tracking_verify.h"
 
+#include "bgfx_metal_texture.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
 #include "timeline_preview.h"
@@ -173,15 +174,56 @@ void VerifyCancellation(const std::shared_ptr<const ProjectSnapshot>& project, c
   });
   bool cancelled = false;
   try {
-    (void)session.SampleVideo(Tick(kCrossing), render::ImageFormat::Bgra8Unorm, cancel.get_token());
+    (void)session.SampleVideo(Tick(kCrossing), render::PixelFormat::Bgra8Unorm, cancel.get_token());
   } catch (const std::system_error& failure) {
     cancelled = failure.code() == std::errc::operation_canceled;
   }
   Check(cancelled, "An analysis result was published after cancellation");
   VerifyPicture(renderer, session.SampleVideo(Tick(kClipLength + kLength - 1 - kCrossing),
-                                               render::ImageFormat::Bgra8Unorm, recovery.get_token()), kCrossing);
+                                               render::PixelFormat::Bgra8Unorm, recovery.get_token()), kCrossing);
   queues.join();
   if (error) std::rethrow_exception(error);
+}
+
+void VerifyWristPrediction(const std::shared_ptr<const ProjectSnapshot>& project, const MovieCodecProviders& codecs) {
+  const auto state = std::make_shared<MockState>();
+  state->ordered_wrist_prediction = true;
+  TimelineSession session(project, codecs, CodecPolicy::SoftwareOnly, {}, MakeMockTrackingProvider(state));
+  const auto verify = [&](int frame, bool reverse) {
+    const auto at = reverse ? kClipLength + kLength - 1 - frame : frame;
+    const auto sample = session.SampleVideo(Tick(at));
+    Check(std::get<VideoFrame>(sample.inputs.front()).pts == Tick(frame), "Wrist prediction changed the source PTS");
+    for (const auto side : {LeftHand, RightHand}) {
+      const auto draw = std::ranges::find_if(sample.plan->draws, [&](const auto& command) {
+        const auto* resource = std::get_if<ResourceRef>(&sample.inputs.at(command.input_slot));
+        return resource && *resource == TrackingStickerResource(side);
+      });
+      if (frame == kWristConfidenceDrop && side == LeftHand) {
+        Check(draw != sample.plan->draws.end(), "A verified wrist did not recover inside the predicted region");
+        CheckPoint(OnDraw(*draw, {0.5F, 0.5F}), Pose(kPrimary, frame).left_wrist - kObservedWristOffset);
+      } else if (frame == kWristConfidenceDrop + 1 || frame == kForearmRetry) {
+        Check(draw != sample.plan->draws.end(), "A verified wrist was lost during the second search");
+        const auto pose = Pose(kPrimary, frame);
+        auto expected = side == LeftHand ? pose.left_wrist : pose.right_wrist;
+        if (frame == kWristConfidenceDrop + 1 && side == LeftHand) expected = expected + kObservedWristOffset;
+        CheckPoint(OnDraw(*draw, {0.5F, 0.5F}), expected);
+      } else {
+        Check(draw == sample.plan->draws.end(), "A stale or unverified wrist was displayed");
+      }
+    }
+  };
+  for (const bool reverse : {false, true}) {
+    const auto start = state->trace.size();
+    verify(kWristConfidenceDrop + 1, reverse);
+    Check(std::ranges::count_if(std::span(state->trace).subspan(start), [](const auto& job) {
+            return job.capability == HandLandmarks && job.key.pts == Tick(kWristConfidenceDrop + 1);
+          }) == 2, "The current wrist search must run before the predicted retry");
+    const auto jobs = state->trace.size();
+    session.Reset();
+    verify(kWristConfidenceDrop, reverse);
+    Check(state->trace.size() == jobs, "Seeking repeated ordered wrist analysis");
+    verify(kForearmRetry, reverse);
+  }
 }
 
 } // namespace
@@ -220,6 +262,8 @@ void VerifyTimelineTracking(std::string_view directory) {
     Check(opened->tracks == project.Snapshot()->tracks, "Tracking anchor or sticker instance did not round-trip");
     VerifyMissing(opened, codecs);
     std::cout << "Tracking capability probe rejects missing hands before opening models\n";
+    VerifyWristPrediction(opened, codecs);
+    std::cout << "Ordered wrist prediction retries only failed searches and publishes current-frame detections\n";
 
     MovieRenderer renderer(kCanvas);
     VerifyCancellation(opened, codecs, renderer, first, second);

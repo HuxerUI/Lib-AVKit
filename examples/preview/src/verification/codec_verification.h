@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <utility>
 
 #include <huxerui/avkit/codec.h>
@@ -27,8 +28,9 @@ struct VideoFaults {
 
 class ObservedCodecProvider final : public CodecProvider {
 public:
-  ObservedCodecProvider(std::shared_ptr<CodecProvider> delegate, DecoderUsage* usage = nullptr, VideoFaults faults = {})
-      : delegate_(std::move(delegate)), usage_(usage), faults_(faults) {}
+  ObservedCodecProvider(std::shared_ptr<CodecProvider> delegate, DecoderUsage* usage = nullptr, VideoFaults faults = {},
+                        std::function<void(VideoFrame&)> observe_picture = {})
+      : delegate_(std::move(delegate)), usage_(usage), faults_(faults), observe_picture_(std::move(observe_picture)) {}
 
   std::string_view Name() const noexcept override { return delegate_->Name(); }
   CodecResult<CodecNegotiation> Probe(const VideoDecoderConfig& c) const override { return delegate_->Probe(c); }
@@ -37,7 +39,8 @@ public:
   CodecResult<CodecNegotiation> Probe(const AudioEncoderConfig& c) const override { return delegate_->Probe(c); }
 
   CodecResult<std::unique_ptr<VideoDecoderSession>> Open(const VideoDecoderConfig& c) const override {
-    return OpenObserved<VideoDecoderSession, VideoFrame>(c, usage_ ? &usage_->video : nullptr, faults_.decode_after, &decode_injected_);
+    return OpenObserved<VideoDecoderSession, VideoFrame>(c, usage_ ? &usage_->video : nullptr, faults_.decode_after,
+                                                         &decode_injected_, observe_picture_);
   }
   CodecResult<std::unique_ptr<AudioDecoderSession>> Open(const AudioDecoderConfig& c) const override {
     return OpenObserved<AudioDecoderSession, AudioFrame>(c, usage_ ? &usage_->audio : nullptr);
@@ -50,8 +53,10 @@ public:
 private:
   template<class Session, class Event> class ObservedSession final : public Session {
   public:
-    ObservedSession(std::unique_ptr<Session> delegate, DecoderUsage::Track* track, std::size_t remaining, bool* injected)
-        : delegate_(std::move(delegate)), track_(track), remaining_(remaining), injected_(injected) {}
+    ObservedSession(std::unique_ptr<Session> delegate, DecoderUsage::Track* track, std::size_t remaining, bool* injected,
+                    std::function<void(Event&)> observe)
+        : delegate_(std::move(delegate)), track_(track), remaining_(remaining), injected_(injected),
+          observe_(std::move(observe)) {}
     ~ObservedSession() override { Close(); }
 
     CodecNegotiation Negotiated() const noexcept override { return delegate_->Negotiated(); }
@@ -63,7 +68,12 @@ private:
             {CodecErrorCode::ResourceExhausted, "Injected failure after VideoToolbox produced output", {}});
       }
       auto event = delegate_->TryRead();
-      if (remaining_ && event.Succeeded() && event.Value() && std::holds_alternative<Event>(*event.Value())) --remaining_;
+      if (event.Succeeded() && event.Value()) {
+        if (auto* value = std::get_if<Event>(&*event.Value())) {
+          if (remaining_) --remaining_;
+          if (observe_) observe_(*value);
+        }
+      }
       return event;
     }
     CodecResult<void> FinishInput() override { return delegate_->FinishInput(); }
@@ -78,17 +88,19 @@ private:
     DecoderUsage::Track* track_;
     std::size_t remaining_;
     bool* injected_;
+    std::function<void(Event&)> observe_;
     bool closed_{};
   };
 
   template<class Session, class Event, class Config>
   CodecResult<std::unique_ptr<Session>> OpenObserved(const Config& config, DecoderUsage::Track* track,
-                                                     std::size_t fail_after = 0, bool* injected = nullptr) const {
+                                                     std::size_t fail_after = 0, bool* injected = nullptr,
+                                                     std::function<void(Event&)> observe = {}) const {
     auto result = delegate_->Open(config);
     const bool arm = injected && !*injected && fail_after;
-    if (!result.Succeeded() || !result.Value() || (!track && !arm)) return result;
+    if (!result.Succeeded() || !result.Value() || (!track && !arm && !observe)) return result;
     auto session = std::make_unique<ObservedSession<Session, Event>>(std::move(result).Value(), track, fail_after,
-                                                                    arm ? injected : nullptr);
+                                                                    arm ? injected : nullptr, std::move(observe));
     if (track) {
       ++track->opened;
       ++track->active;
@@ -101,6 +113,7 @@ private:
   std::shared_ptr<CodecProvider> delegate_;
   DecoderUsage* usage_;
   VideoFaults faults_;
+  std::function<void(VideoFrame&)> observe_picture_;
   mutable bool decode_injected_{}, encode_injected_{};
 };
 

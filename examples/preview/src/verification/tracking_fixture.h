@@ -14,6 +14,10 @@ inline constexpr huxerui::avkit::PixelSize kCanvas{320, 180};
 inline constexpr int kRate = 24, kLength = 96, kClipLength = 72, kCrossing = 48;
 inline constexpr int kMissingLeft = 42, kWrongFace = 47, kCoincidentEyes = 50, kMissingBody = 52, kWeakRight = 55;
 inline constexpr int kAmbiguousWrist = 66;
+inline constexpr int kWristConfidenceDrop = 33;
+inline constexpr huxerui::Point kObservedWristOffset{0.010F, -0.0075F};
+inline constexpr int kForearmRetry = 36;
+inline constexpr huxerui::Point kMockForearm{0.04F, 0.06F};
 inline constexpr std::uint64_t kPrimary = 101, kSecondary = 707;
 constexpr huxerui::media::MediaTimestamp Tick(int frame) { return {frame, kRate}; }
 constexpr huxerui::avkit::TimeRange Interval(int first, int end) { return {Tick(first), Tick(end)}; }
@@ -48,6 +52,7 @@ struct MockState {
 
   bool hands;
   int holds;
+  bool ordered_wrist_prediction{};
   std::size_t opens{};
   std::vector<Trace> trace;
   std::mutex mutex;
