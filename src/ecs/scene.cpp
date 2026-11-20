@@ -44,6 +44,7 @@ struct SceneEvaluator::Impl {
     world.component<SubcompositionRoot>();
     world.component<render::MaskedBlend>();
     world.component<render::SourceSampling>();
+    world.component<render::DepthOcclusion>();
     world.component<FrameContext>().add(flecs::Singleton);
     world.set<FrameContext>({});
     layers = world.query<const CompositeLayer>();
@@ -122,10 +123,12 @@ std::shared_ptr<const render::RenderPlan> SceneEvaluator::Evaluate(media::MediaT
     if (const auto resolved = state.Resolve(entity)) {
       const auto* mask = entity.try_get<render::MaskedBlend>();
       const auto* sampling = entity.try_get<render::SourceSampling>();
+      const auto* occlusion = entity.try_get<render::DepthOcclusion>();
       state.ordered.push_back({layer.order, resolved->subcomposition,
                                {layer.input_slot, layer.blend, resolved->destination,
                                 mask ? std::optional{*mask} : std::nullopt, resolved->transform,
-                                sampling ? std::optional{*sampling} : std::nullopt}});
+                                sampling ? std::optional{*sampling} : std::nullopt,
+                                occlusion ? std::optional{*occlusion} : std::nullopt}});
     } else {
       invalid_transform = true;
     }

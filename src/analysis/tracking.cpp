@@ -23,6 +23,7 @@ const char* Name(AnalysisCapability capability) {
     case AnalysisCapability::FaceLandmarks: return "face landmarks";
     case AnalysisCapability::HandLandmarks: return "hand landmarks";
     case AnalysisCapability::PortraitMask: return "portrait mask";
+    case AnalysisCapability::DepthMap: return "depth map";
   }
   throw std::invalid_argument("Unknown analysis capability");
 }

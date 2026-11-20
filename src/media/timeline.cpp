@@ -14,7 +14,7 @@
 #include <system_error>
 #include <thread>
 
-#include "analysis/source_mask.h"
+#include "analysis/source_texture.h"
 #include "analysis/tracking.h"
 #include "project/project_internal.h"
 #include "support/cancellation.h"
@@ -167,6 +167,7 @@ struct StickerLayer {
   const StickerSpec* spec;
   flecs::entity entity;
   flecs::entity anchor;
+  InstanceId instance;
 };
 
 struct VideoClip {
@@ -183,6 +184,7 @@ struct VideoClip {
   std::unique_ptr<detail::SourceTracking> tracking;
   bool software_video{};
   std::unique_ptr<detail::SourceMask> mask;
+  std::unique_ptr<detail::SourceDepth> depth;
 };
 
 struct VideoPrerollSlot {
@@ -253,6 +255,18 @@ Transform2D DrawToSource(const BackgroundReplacement& effect) {
   return transform;
 }
 
+Transform2D InvertUv(const Transform2D& uv) {
+  const auto determinant = double(uv.m11) * uv.m22 - double(uv.m12) * uv.m21;
+  if (!std::isfinite(determinant) || determinant == 0)
+    throw std::invalid_argument("Depth occlusion requires an invertible video UV mapping");
+  Transform2D inverse{float(uv.m22 / determinant), float(-uv.m12 / determinant),
+                      float(-uv.m21 / determinant), float(uv.m11 / determinant)};
+  const auto origin = inverse.Apply({-uv.translate_x, -uv.translate_y});
+  inverse.translate_x = origin.x;
+  inverse.translate_y = origin.y;
+  return inverse;
+}
+
 std::optional<Transform2D> AnchorTransform(const analysis::TrackingAnchor& anchor, const analysis::PersonSample& person,
                                            const Transform2D& source_to_clip, PixelSize canvas) {
   const auto& part = anchor.part == analysis::TrackedPart::Face ? person.face
@@ -275,22 +289,7 @@ std::optional<Transform2D> AnchorTransform(const analysis::TrackingAnchor& ancho
 } // namespace
 
 std::uint32_t TransitionMaskSample::FrameIndex(std::uint32_t frame_count) const {
-  if (!frame_count || Before(offset, {}) || !Before(offset, duration))
-    throw std::invalid_argument("Mask sampling requires a nonempty sequence and time within the transition");
-  const auto scale = std::lcm<std::uint64_t>(offset.timescale, duration.timescale);
-  if (scale > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("Incompatible transition clocks");
-  const auto at = static_cast<std::uint64_t>(ExactTicks(offset, static_cast<std::uint32_t>(scale)));
-  const auto length = static_cast<std::uint64_t>(ExactTicks(duration, static_cast<std::uint32_t>(scale)));
-  const auto whole = length / frame_count, remainder = length % frame_count;
-  std::uint32_t first = 0, last = frame_count - 1;
-  while (first < last) {
-    const auto middle = static_cast<std::uint32_t>((std::uint64_t(first) + last + 1) / 2);
-    // Compare ticks to ceil(length * middle / frame_count) without multiplying the full length.
-    const auto threshold = whole * middle + (remainder * middle + frame_count - 1) / frame_count;
-    if (at >= threshold) first = middle;
-    else last = middle - 1;
-  }
-  return first;
+  return detail::UniformFrameIndex(offset, duration, frame_count);
 }
 
 std::uint32_t AnimatedMaskSample::FrameIndex(MediaTimestamp frame_interval, std::uint32_t frame_count) const {
@@ -364,6 +363,8 @@ struct TimelineSession::Impl {
     auto& node = pictures.emplace_back(VideoClip{&clip, &movie, AddLayer(clip.destination, blend)});
     if (clip.background && !packaged_mask)
       node.mask = std::make_unique<detail::SourceMask>(analysis_provider, clip.id.value, clip.background->model_id);
+    if (std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.depth_meters.has_value(); }))
+      node.depth = std::make_unique<detail::SourceDepth>(analysis_provider, clip.id.value);
     std::vector<analysis::TrackedPart> parts;
     for (const auto& instance : clip.stickers) {
       auto entity = AddLayer(instance.spec.destination, render::Blend::PremultipliedOver);
@@ -374,7 +375,7 @@ struct TimelineSession::Impl {
         scene.SetSpatialParent(anchor, node.layer);
       }
       scene.SetSpatialParent(entity, anchor ? anchor : node.layer);
-      node.stickers.push_back({&instance.spec, entity, anchor});
+      node.stickers.push_back({&instance.spec, entity, anchor, instance.id});
     }
     if (!parts.empty()) node.tracking = std::make_unique<detail::SourceTracking>(analysis_provider, clip.id.value, parts);
   }
@@ -669,7 +670,7 @@ struct TimelineSession::Impl {
   }
 
   TimelineFrame SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
-                            const ImportVideoFrame& import, std::optional<std::chrono::milliseconds> mask_wait) {
+                            const ImportVideoFrame& import, std::optional<std::chrono::milliseconds> analysis_wait) {
     CheckCancelled(stop);
     if (!Contains(range, at)) throw std::out_of_range("Sample time is outside the project interval");
     TimelineFrame frame{at, {}, {}};
@@ -682,6 +683,7 @@ struct TimelineSession::Impl {
         clip.cursor = {};
         if (clip.tracking) clip.tracking->Reset();
         if (clip.mask) clip.mask->Reset();
+        if (clip.depth) clip.depth->Reset();
       }
       clip.subcomposition.reset();
     }
@@ -697,14 +699,35 @@ struct TimelineSession::Impl {
         node.to->subcomposition = subcomposition_count++;
       }
     }
-    struct MaskSample {
+    struct ClipSample {
       VideoClip& clip;
       const VideoFrame& image;
       Transform2D draw_to_source;
       render::SourceSampling sampling;
       std::unique_ptr<detail::SourceMask::Request> request;
+      std::unique_ptr<detail::SourceDepth::Request> depth_request;
     };
-    std::vector<MaskSample> masks;
+    std::vector<ClipSample> samples;
+    const auto bind_sticker = [&](const StickerLayer& sticker, const VideoClip& clip) {
+      std::optional<AnimatedStickerSample> animated;
+      if (const auto playback = sticker.spec->playback) {
+        const auto elapsed = Difference(at, clip.clip->placement.timeline.start);
+        animated = AnimatedStickerSample{sticker.spec->resource, elapsed, *playback,
+                                         sticker.instance, sticker.spec->replacements};
+      }
+      const auto found = std::ranges::find_if(frame.inputs, [&](const TimelineInput& input) {
+        if (animated) {
+          const auto* sample = std::get_if<AnimatedStickerSample>(&input);
+          return sample && *sample == *animated;
+        }
+        const auto* resource = std::get_if<ResourceRef>(&input);
+        return resource && *resource == sticker.spec->resource;
+      });
+      sticker.entity.get_mut<CompositeLayer>().input_slot = static_cast<std::uint32_t>(found - frame.inputs.begin());
+      if (found != frame.inputs.end()) return;
+      if (animated) frame.inputs.emplace_back(std::move(*animated));
+      else frame.inputs.emplace_back(sticker.spec->resource);
+    };
     for (auto& clip : pictures) {
       if (clip.subcomposition) clip.subcomposition_root.set<SubcompositionRoot>({*clip.subcomposition});
       else if (clip.subcomposition_root && clip.subcomposition_root.has<SubcompositionRoot>())
@@ -728,7 +751,7 @@ struct TimelineSession::Impl {
         frame.inputs.emplace_back(std::move(prepared.surface));
       } else {
         frame.inputs.emplace_back(*image);
-        if (clip.clip->background || clip.tracking) {
+        if (clip.clip->background || clip.tracking || clip.depth) {
           const VideoTextureOptions options{project->canvas.width, project->canvas.height, ImageFit::Contain};
           content = detail::FitVideoTexture(image->format, options).SourceToTextureUv(options);
         }
@@ -741,7 +764,9 @@ struct TimelineSession::Impl {
         source_to_clip = {1 / draw_to_source.m11, 0, 0, 1 / draw_to_source.m22,
                           -draw_to_source.translate_x / draw_to_source.m11,
                           -draw_to_source.translate_y / draw_to_source.m22};
-        masks.push_back({clip, *image, draw_to_source, {detail::Compose(content, draw_to_source)}, {}});
+        samples.push_back({clip, *image, draw_to_source, {detail::Compose(content, draw_to_source)}});
+      } else if (clip.depth) {
+        samples.push_back({clip, *image, InvertUv(content), {}});
       }
       if (clip.tracking) {
         const auto& tracking = clip.tracking->Sample(*image, [&](const auto& target, const auto& window) {
@@ -778,18 +803,14 @@ struct TimelineSession::Impl {
           sticker.anchor.set<Transform2D>(*transform);
         }
         sticker.entity.enable();
-        const auto found = std::ranges::find_if(frame.inputs, [&](const TimelineInput& input) {
-          const auto* resource = std::get_if<ResourceRef>(&input);
-          return resource && *resource == sticker.spec->resource;
-        });
-        sticker.entity.get_mut<CompositeLayer>().input_slot = static_cast<std::uint32_t>(found - frame.inputs.begin());
-        if (found == frame.inputs.end()) frame.inputs.emplace_back(sticker.spec->resource);
+        if (!sticker.spec->depth_meters) bind_sticker(sticker, clip);
       }
     }
-    for (auto& item : masks) {
-      if (item.clip.mask) item.request = item.clip.mask->Submit(item.image, stop, mask_wait);
+    for (auto& item : samples) {
+      if (item.clip.mask) item.request = item.clip.mask->Submit(item.image, stop, analysis_wait);
+      if (item.clip.depth) item.depth_request = item.clip.depth->Submit(item.image, stop, analysis_wait);
     }
-    for (auto& item : masks) {
+    for (auto& item : samples) {
       if (!item.clip.mask) continue;
       if (auto mask = item.clip.mask->Collect(std::move(item.request))) {
         item.sampling.background = render::BackgroundMask{static_cast<std::uint32_t>(frame.analysis_masks.size()),
@@ -798,19 +819,42 @@ struct TimelineSession::Impl {
         frame.analysis_masks.push_back(std::move(mask->surface));
       }
     }
-    const auto bind_packaged = [](MaskSample& item, auto& samples, const auto& sample, std::size_t first, bool inverted) {
+    for (auto& item : samples) {
+      if (!item.clip.depth) continue;
+      auto depth = item.clip.depth->Collect(std::move(item.depth_request));
+      const auto& destination = item.clip.clip->destination;
+      const auto slot = static_cast<std::uint32_t>(frame.analysis_masks.size() + frame.depth_maps.size());
+      if (depth) {
+        const auto target_to_source = detail::Compose(item.draw_to_source, InvertUv(UvRect(destination)));
+        const auto target_to_depth = detail::Compose(depth->source_to_texture_uv, target_to_source);
+        frame.depth_maps.push_back(std::move(depth->surface));
+        for (const auto& sticker : item.clip.stickers) {
+          if (!sticker.spec->depth_meters || sticker.entity.has(flecs::Disabled)) continue;
+          sticker.entity.set<render::DepthOcclusion>({slot, target_to_depth, depth->valid_uv, destination,
+                                                      *sticker.spec->depth_meters});
+          bind_sticker(sticker, item.clip);
+        }
+      } else {
+        for (const auto& sticker : item.clip.stickers)
+          if (sticker.spec->depth_meters) sticker.entity.disable();
+      }
+    }
+    const auto first_static = frame.analysis_masks.size() + frame.depth_maps.size();
+    const auto bind_packaged = [](ClipSample& item, auto& samples, const auto& sample, std::size_t first, bool inverted) {
       const auto found = std::ranges::find(samples, sample);
       const auto slot = static_cast<std::uint32_t>(first + (found - samples.begin()));
       if (found == samples.end()) samples.push_back(sample);
       item.sampling.background = render::BackgroundMask{slot, item.draw_to_source, {0, 0, 1, 1},
                                                         item.clip.clip->background->color, inverted};
     };
-    for (auto& item : masks) {
+    for (auto& item : samples) {
+      if (!item.clip.clip->background) continue;
       if (const auto& mask = item.clip.clip->background->static_mask)
-        bind_packaged(item, frame.static_masks, mask->resource, frame.analysis_masks.size(), mask->inverted);
+        bind_packaged(item, frame.static_masks, mask->resource, first_static, mask->inverted);
     }
-    const auto first_animation = frame.analysis_masks.size() + frame.static_masks.size();
-    for (auto& item : masks) {
+    const auto first_animation = first_static + frame.static_masks.size();
+    for (auto& item : samples) {
+      if (!item.clip.clip->background) continue;
       if (const auto& mask = item.clip.clip->background->animated_mask) {
         const auto offset = Difference(at, item.clip.clip->placement.timeline.start);
         const AnimatedMaskSample sample{mask->resource, offset, mask->playback};
@@ -823,10 +867,16 @@ struct TimelineSession::Impl {
       if (!node.visible) continue;
       if (!node.from->visible || !node.to->visible) throw std::runtime_error("Transition requires both source pictures");
       const auto offset = Difference(at, spec.range.start);
-      const auto mask_slot = static_cast<std::uint32_t>(first_animation + frame.animated_masks.size() + frame.masks.size());
-      frame.masks.push_back({spec.mask, offset, Difference(spec.range.end, spec.range.start)});
+      const auto duration = Difference(spec.range.end, spec.range.start);
       const auto first = static_cast<std::uint32_t>(frame.inputs.size());
       node.layer.get_mut<CompositeLayer>().input_slot = first + *node.from->subcomposition;
+      if (const auto& animation = spec.animation) {
+        frame.transition_animations.push_back({*animation, node.transition->id, offset, duration,
+                                              *node.from->subcomposition, *node.to->subcomposition});
+        continue;
+      }
+      const auto mask_slot = static_cast<std::uint32_t>(first_animation + frame.animated_masks.size() + frame.masks.size());
+      frame.masks.push_back({spec.mask, offset, duration});
       node.layer.set<render::MaskedBlend>({first + *node.to->subcomposition, mask_slot, FeatherAt(spec, offset),
                                           spec.inverted, node.from->clip->destination});
     }
@@ -951,6 +1001,7 @@ struct TimelineSession::Impl {
       }
       if (clip.tracking) clip.tracking->Reset();
       if (clip.mask) clip.mask->Reset();
+      if (clip.depth) clip.depth->Reset();
     }
     for (auto& clip : sounds) {
       clip.cursor = {};
@@ -994,9 +1045,9 @@ void TimelineSession::ApplyProject(std::shared_ptr<const ProjectSnapshot> projec
 
 TimelineFrame TimelineSession::SampleVideo(MediaTimestamp at, render::PixelFormat output, std::stop_token stop,
                                            const ImportVideoFrame& import,
-                                           std::optional<std::chrono::milliseconds> mask_wait) {
+                                           std::optional<std::chrono::milliseconds> analysis_wait) {
   try {
-    return impl_->SampleVideo(at, output, stop, import, mask_wait);
+    return impl_->SampleVideo(at, output, stop, import, analysis_wait);
   } catch (const std::system_error& error) {
     if (error.code() == std::errc::operation_canceled) Reset();
     throw;

@@ -1,4 +1,4 @@
-$input v_texcoord0
+$input v_texcoord0, v_targetcoord
 
 #include <bgfx_shader.sh>
 #include "avkit_alpha.sh"

@@ -63,7 +63,7 @@ struct Landmark {
 };
 
 /// @brief Output requested from one model session.
-enum class AnalysisCapability { BodyLandmarks, FaceLandmarks, HandLandmarks, PortraitMask };
+enum class AnalysisCapability { BodyLandmarks, FaceLandmarks, HandLandmarks, PortraitMask, DepthMap };
 
 /// @brief Exact picture format, storage, and region input requirements for a model.
 struct AnalysisConfig {
@@ -130,7 +130,7 @@ struct AnalysisCompletion {
   Result<std::optional<std::vector<TrackingDetection>>, std::string> result;
 };
 
-/// @brief Retained R8Unorm coverage in a possibly partial source region.
+/// @brief Retained numeric image in a possibly partial source region.
 struct AnalysisTexture {
   render::ImageSurface surface;
   /// Maps the oriented, visible source before mirroring to the texture's logical UVs.
@@ -138,9 +138,17 @@ struct AnalysisTexture {
   Rect valid_uv{0, 0, 1, 1};
 };
 
-/// @brief Coverage for one exact job. An empty optional is a skipped frame.
+/// @brief R8Unorm coverage for one exact job. An empty optional is a skipped frame.
 /// A valid all-zero mask reports a frame with no foreground.
 struct MaskCompletion {
+  std::uint64_t job_id;
+  FrameKey target;
+  Result<std::optional<AnalysisTexture>, std::string> result;
+};
+
+/// @brief R32Float optical-axis Z in meters, registered to the video in the target frame.
+/// An empty optional is a skipped frame. Zero and nonfinite pixels have no usable depth.
+struct DepthCompletion {
   std::uint64_t job_id;
   FrameKey target;
   Result<std::optional<AnalysisTexture>, std::string> result;
@@ -151,6 +159,7 @@ class AnalysisSession {
 public:
   using Completion = std::function<void(AnalysisCompletion)>;
   using MaskCallback = std::function<void(MaskCompletion)>;
+  using DepthCallback = std::function<void(DepthCompletion)>;
 
   virtual ~AnalysisSession() = default;
   /// @brief Submits a landmark job on the session's owning sequence.
@@ -164,6 +173,10 @@ public:
   /// @brief Submits a portrait mask job under the same lifetime and cancellation contract as Submit.
   virtual void SubmitMask(AnalysisJob job, std::stop_token, MaskCallback complete) {
     complete({job.id, job.target, decltype(MaskCompletion::result)::Failure("Portrait mask submission is unavailable")});
+  }
+  /// @brief Submits a metric depth job under the same lifetime and cancellation contract as Submit.
+  virtual void SubmitDepth(AnalysisJob job, std::stop_token, DepthCallback complete) {
+    complete({job.id, job.target, decltype(DepthCompletion::result)::Failure("Depth submission is unavailable")});
   }
 };
 

@@ -43,7 +43,8 @@ AnalysisWindow Window(AnalysisCapability capability, bool ordered) {
     case BodyLandmarks: return {2, 1, Tick(1), false, true};
     case FaceLandmarks: return {};
     case HandLandmarks: return {1, 2, Tick(1), false, false};
-    case PortraitMask: break;
+    case PortraitMask:
+    case DepthMap: break;
   }
   throw std::invalid_argument("Unknown mock model");
 }

@@ -21,10 +21,10 @@ public:
 
 ImageSurface RetainImagePixels(ImageDesc image, ImagePixels pixels, RowOrigin origin) {
   const auto [width, height] = image.size;
-  const auto channels = image.format == PixelFormat::R8Unorm ? 1 : 4;
-  if (!width || !height || width > std::numeric_limits<std::size_t>::max() / channels)
+  const auto pixel_bytes = image.format == PixelFormat::R8Unorm ? 1 : 4;
+  if (!width || !height || width > std::numeric_limits<std::size_t>::max() / pixel_bytes)
     throw std::invalid_argument("Invalid image dimensions");
-  const auto packed = std::size_t(width) * channels;
+  const auto packed = std::size_t(width) * pixel_bytes;
   const auto size = pixels.bytes.AsBytes().size();
   if (pixels.row_bytes < packed || size < packed || height - 1 > (size - packed) / pixels.row_bytes)
     throw std::invalid_argument("Pixel storage does not cover the specified rows");

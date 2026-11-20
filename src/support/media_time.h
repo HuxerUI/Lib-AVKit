@@ -46,6 +46,25 @@ inline std::int64_t ExactTicks(MediaTimestamp time, std::uint32_t scale) {
   return converted.ticks;
 }
 
+inline std::uint32_t UniformFrameIndex(MediaTimestamp offset, MediaTimestamp duration, std::uint32_t frame_count) {
+  if (!frame_count || !offset.timescale || !duration.timescale || offset.ticks < 0 || offset.Compare(duration) != -1)
+    throw std::invalid_argument("Frame sampling requires a nonempty sequence and time within its duration");
+  const auto scale = std::lcm<std::uint64_t>(offset.timescale, duration.timescale);
+  if (scale > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("Incompatible transition clocks");
+  const auto at = static_cast<std::uint64_t>(ExactTicks(offset, static_cast<std::uint32_t>(scale)));
+  const auto length = static_cast<std::uint64_t>(ExactTicks(duration, static_cast<std::uint32_t>(scale)));
+  const auto whole = length / frame_count, remainder = length % frame_count;
+  std::uint32_t first = 0, last = frame_count - 1;
+  while (first < last) {
+    const auto middle = static_cast<std::uint32_t>((std::uint64_t(first) + last + 1) / 2);
+    // Compare ticks to ceil(length * middle / frame_count) without multiplying the full length.
+    const auto threshold = whole * middle + (remainder * middle + frame_count - 1) / frame_count;
+    if (at >= threshold) first = middle;
+    else last = middle - 1;
+  }
+  return first;
+}
+
 inline MediaTimestamp Retime(MediaTimestamp time, MediaTimestamp previous, MediaTimestamp duration) {
   if (!time.timescale || !previous.timescale || !duration.timescale || time.ticks < 0 ||
       previous.ticks <= 0 || duration.ticks <= 0)

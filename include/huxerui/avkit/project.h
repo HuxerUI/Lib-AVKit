@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <huxerui/avkit/analysis.h>
+#include <huxerui/avkit/animation.h>
 #include <huxerui/avkit/render.h>
 #include <huxerui/file.h>
 #include <huxerui/media_container.h>
@@ -87,12 +88,39 @@ TimeRange MapClipToSource(const ClipPlacement& clip, TimeRange project);
 /// @return Ascending project boundaries for either playback direction.
 TimeRange MapClipToProject(const ClipPlacement& clip, TimeRange source);
 
-/// @brief Sticker resource, layout, and optional semantic tracking binding.
+/// @brief Text for a named slot in an animation resource. An empty string replaces the authored text.
+struct StickerTextReplacement {
+  std::string slot;
+  std::string text;
+  bool operator==(const StickerTextReplacement&) const = default;
+};
+
+/// @brief Versioned image resource for a named slot in an animation resource.
+struct StickerImageReplacement {
+  std::string slot;
+  ResourceRef image;
+  bool operator==(const StickerImageReplacement&) const = default;
+};
+
+/// @brief Per-instance values for named animation slots. Omitted slots use their authored content.
+struct StickerReplacements {
+  std::vector<StickerTextReplacement> texts;
+  std::vector<StickerImageReplacement> images;
+  bool Empty() const { return texts.empty() && images.empty(); }
+  bool operator==(const StickerReplacements&) const = default;
+};
+
+/// @brief Sticker resource, layout, and optional tracking and animation settings.
 struct StickerSpec {
   ResourceRef resource;
   /// Bounds in the owning clip, or in tracking anchor coordinates when an anchor is present.
   Rect destination;
   std::optional<analysis::TrackingAnchor> anchor;
+  /// Positive optical-axis depth of a flat sticker in meters. Uses the owning clip's metric depth map.
+  std::optional<float> depth_meters;
+  /// When set, resolve the resource as an animation on the owning clip's project clock.
+  std::optional<AnimationPlayback> playback;
+  StickerReplacements replacements;
   bool operator==(const StickerSpec&) const = default;
 };
 
@@ -114,14 +142,16 @@ template<class T> struct Keyframe {
   bool operator==(const Keyframe&) const = default;
 };
 
-/// @brief Masked transition and feather curve for an overlap on one visual track.
+/// @brief Masked or authored animation transition for an overlap on one visual track.
 struct TransitionSpec {
   TimeRange range;
-  ResourceRef mask;
+  ResourceRef mask; ///< Coverage resource for a masked transition.
   float feather{0.5F}; ///< Base feather in [0, 1], used when the curve is empty.
   bool inverted{};
   /// Times are relative to the transition start. A final key can sit at the exclusive end.
   std::vector<Keyframe<float>> feather_keys;
+  /// Versioned animation with outgoing and incoming video slots. Leave the mask empty when set.
+  std::optional<ResourceRef> animation;
   bool operator==(const TransitionSpec&) const = default;
 };
 
@@ -226,6 +256,8 @@ public:
   InstanceId AddSticker(ClipId clip, StickerSpec spec);
   /// @brief Sets an instance's bounds in its clip or anchor coordinates.
   void SetStickerLayout(InstanceId instance, Rect destination);
+  /// @brief Replaces all slot values on an animated sticker. Pass an empty set to restore authored content.
+  void SetStickerReplacements(InstanceId instance, StickerReplacements replacements);
   /// @brief Creates or updates the transition between adjacent visual clips.
   /// @return The stable new or existing transition ID.
   InstanceId SetTransition(ClipId from, ClipId to, TransitionSpec spec);
@@ -243,6 +275,7 @@ private:
   explicit ProjectEdit(ProjectSnapshot& draft) : draft_(draft) {}
   std::uint64_t AllocateId();
   ClipInfo& Clip(ClipId clip);
+  StickerSpec& Sticker(InstanceId instance);
 
   ProjectSnapshot& draft_;
 };

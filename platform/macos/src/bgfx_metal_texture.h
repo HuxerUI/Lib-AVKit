@@ -15,8 +15,10 @@ namespace huxerui::avkit::macos {
 /// @brief Creates a headless bgfx backend on the given Metal device.
 /// @param device Metal device shared with the platform texture producers and consumers.
 /// @param target Format and physical dimensions of each output texture.
-/// @return A backend with two leased output slots. Use it on the calling sequence.
-std::unique_ptr<render::RenderBackend> CreateBgfxBackend(id<MTLDevice> device, render::ImageDesc target);
+/// @param output_slots Number of independently leased output textures.
+/// @return A backend used on the calling sequence.
+std::unique_ptr<render::RenderBackend> CreateBgfxBackend(id<MTLDevice> device, render::ImageDesc target,
+                                                       std::size_t output_slots = 2);
 
 /// @brief Retains a producer-complete RGBA8 or BGRA8 texture with premultiplied color.
 /// The producer leaves the submitted texture immutable for the duration of the lease.

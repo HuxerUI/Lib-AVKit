@@ -38,6 +38,8 @@ public:
           return ProbeResult::Failure("Unavailable ncnn portrait model: " + std::string(id));
         }
         break;
+      case AnalysisCapability::DepthMap:
+        return ProbeResult::Failure("The ncnn provider has no metric depth model");
     }
     const auto& format = config.format;
     if (config.storage != VideoStorage::Cpu || format.pixel_format != VideoPixelFormat::I420 ||

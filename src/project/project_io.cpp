@@ -85,7 +85,21 @@ void Project::Save(const File& destination) const {
   const bool selected_models = any_clip([](const auto& clip) { return clip.background && !clip.background->model_id.empty(); });
   const bool static_masks = any_clip([](const auto& clip) { return clip.background && clip.background->static_mask; });
   const bool animated_masks = any_clip([](const auto& clip) { return clip.background && clip.background->animated_mask; });
-  const int version = animated_masks ? 8 : static_masks ? 7 : selected_models ? 6 : backgrounds ? 5 :
+  const bool depth_stickers = any_clip([](const auto& clip) {
+    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.depth_meters.has_value(); });
+  });
+  const bool animated_stickers = any_clip([](const auto& clip) {
+    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.playback.has_value(); });
+  });
+  const bool replaced_stickers = any_clip([](const auto& clip) {
+    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return !sticker.spec.replacements.Empty(); });
+  });
+  const bool animated_transitions = std::ranges::any_of(project.transitions, [](const auto& transition) {
+    return transition.spec.animation.has_value();
+  });
+  const int version = animated_transitions ? 12 : replaced_stickers ? 11 : animated_stickers ? 10 : depth_stickers ? 9 :
+                      animated_masks ? 8 : static_masks ? 7 :
+                      selected_models ? 6 : backgrounds ? 5 :
                       tracked ? 4 : versioned_assets || reversed ? 3 :
                       project.transitions.empty() ? 1 : 2;
   output << "AVKIT_PROJECT " << version << '\n';
@@ -157,6 +171,24 @@ void Project::Save(const File& destination) const {
                    << ' ' << std::quoted(anchor->axis_point.value_or(""));
           }
         }
+        if (version >= 9) {
+          output << ' ' << sticker.spec.depth_meters.has_value();
+          if (sticker.spec.depth_meters) output << ' ' << *sticker.spec.depth_meters;
+        }
+        if (version >= 10) {
+          const auto playback = sticker.spec.playback;
+          output << ' ' << (!playback ? '-' : *playback == AnimationPlayback::Loop ? 'l' : 'h');
+        }
+        if (version >= 11) {
+          const auto& replacements = sticker.spec.replacements;
+          output << ' ' << replacements.texts.size();
+          for (const auto& text : replacements.texts)
+            output << ' ' << std::quoted(text.slot) << ' ' << std::quoted(text.text);
+          output << ' ' << replacements.images.size();
+          for (const auto& image : replacements.images)
+            output << ' ' << std::quoted(image.slot) << ' ' << std::quoted(image.image.pack) << ' '
+                   << std::quoted(image.image.revision) << ' ' << std::quoted(image.image.key);
+        }
         output << '\n';
       }
     }
@@ -168,7 +200,14 @@ void Project::Save(const File& destination) const {
       output << "transition " << transition.id.value << ' ' << transition.from.value << ' ' << transition.to.value << ' ';
       Put(output, spec.range);
       output << ' ' << std::quoted(spec.mask.pack) << ' ' << std::quoted(spec.mask.revision) << ' '
-             << std::quoted(spec.mask.key) << ' ' << spec.feather << ' ' << spec.inverted << ' ' << spec.feather_keys.size() << '\n';
+             << std::quoted(spec.mask.key) << ' ' << spec.feather << ' ' << spec.inverted << ' ' << spec.feather_keys.size();
+      if (version >= 12) {
+        output << ' ' << spec.animation.has_value();
+        if (const auto& animation = spec.animation)
+          output << ' ' << std::quoted(animation->pack) << ' ' << std::quoted(animation->revision) << ' '
+                 << std::quoted(animation->key);
+      }
+      output << '\n';
       for (const auto& key : spec.feather_keys) {
         output << "feather ";
         Put(output, key.time);
@@ -196,7 +235,7 @@ Project Project::Open(const File& source) {
   input.imbue(std::locale::classic());
   Tag(input, "AVKIT_PROJECT");
   const auto version = Read<unsigned>(input);
-  if (version < 1 || version > 8) throw std::runtime_error("Unsupported project document version");
+  if (version < 1 || version > 12) throw std::runtime_error("Unsupported project document version");
   ProjectSnapshot project;
   Tag(input, "canvas");
   project.canvas = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
@@ -249,6 +288,20 @@ Project Project::Open(const File& source) {
           auto axis = Text(input);
           sticker.spec.anchor = {part, std::move(point), axis.empty() ? std::nullopt : std::optional{std::move(axis)}};
         }
+        if (version >= 9 && Read<bool>(input)) sticker.spec.depth_meters = Read<float>(input);
+        if (version >= 10) {
+          const auto playback = Read<char>(input);
+          if (playback != '-' && playback != 'h' && playback != 'l')
+            throw std::runtime_error("Invalid sticker animation playback mode");
+          if (playback != '-') sticker.spec.playback = playback == 'l' ? AnimationPlayback::Loop : AnimationPlayback::HoldLast;
+        }
+        if (version >= 11) {
+          auto& replacements = sticker.spec.replacements;
+          for (auto count = Read<std::size_t>(input); count; --count)
+            replacements.texts.push_back({Text(input), Text(input)});
+          for (auto count = Read<std::size_t>(input); count; --count)
+            replacements.images.push_back({Text(input), {Text(input), Text(input), Text(input)}});
+        }
         clip.stickers.push_back(std::move(sticker));
       }
       track.clips.push_back(std::move(clip));
@@ -261,7 +314,10 @@ Project Project::Open(const File& source) {
       Tag(input, "transition");
       TransitionInfo transition{{Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)},
           {ReadRange(input), {Text(input), Text(input), Text(input)}, Read<float>(input), Read<bool>(input), {}}};
-      for (auto keys = Read<std::size_t>(input); keys; --keys) {
+      const auto key_count = Read<std::size_t>(input);
+      if (version >= 12 && Read<bool>(input))
+        transition.spec.animation = ResourceRef{Text(input), Text(input), Text(input)};
+      for (auto keys = key_count; keys; --keys) {
         Tag(input, "feather");
         const auto at = ReadTime(input);
         const auto value = Read<float>(input);

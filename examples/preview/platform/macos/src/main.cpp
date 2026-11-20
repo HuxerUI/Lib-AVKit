@@ -14,10 +14,14 @@
 #if defined(AVKIT_FILE_MEDIA)
 #include "file_preview.h"
 #include "timeline_preview.h"
+#include "timeline_depth_verify.h"
 #include "timeline_mask_verify.h"
 #include "timeline_strip.h"
 #include "timeline_template_mask_verify.h"
 #include "timeline_tracking_verify.h"
+#if defined(AVKIT_PAG_PREVIEW)
+#include "timeline_pag_verify.h"
+#endif
 #endif
 #if defined(AVKIT_CAPTURE_PREVIEW)
 #include "capture_preview.h"
@@ -93,6 +97,10 @@ int main(int argc, const char** argv) {
         avkit_preview::VerifyTimelineMasks(argv[2]);
         return 0;
       }
+      if (command == "--timeline-verify-depth" && argc == 4) {
+        avkit_preview::VerifyTimelineDepth(argv[2], argv[3]);
+        return 0;
+      }
       if (command == "--timeline-verify-template-masks" && argc == 4) {
         avkit_preview::VerifyTimelineTemplateMasks(argv[2], argv[3]);
         return 0;
@@ -101,6 +109,26 @@ int main(int argc, const char** argv) {
         avkit_preview::VerifyTimelineAnimatedTemplateMasks(argv[2], argv[3]);
         return 0;
       }
+#if defined(AVKIT_PAG_PREVIEW)
+      if (command == "--timeline-verify-pag-stickers" && argc == 4) {
+        avkit_preview::VerifyTimelinePagStickers(argv[2], argv[3]);
+        return 0;
+      }
+      if (command == "--timeline-verify-pag-stickers")
+        std::cerr << "Usage: --timeline-verify-pag-stickers PROJECT DIRECTORY\n";
+      if (command == "--timeline-verify-pag-replacements" && argc == 4) {
+        avkit_preview::VerifyTimelinePagReplacements(argv[2], argv[3]);
+        return 0;
+      }
+      if (command == "--timeline-verify-pag-replacements")
+        std::cerr << "Usage: --timeline-verify-pag-replacements PROJECT DIRECTORY\n";
+      if (command == "--timeline-verify-pag-transition" && argc == 4) {
+        avkit_preview::VerifyTimelinePagTransition(argv[2], argv[3]);
+        return 0;
+      }
+      if (command == "--timeline-verify-pag-transition")
+        std::cerr << "Usage: --timeline-verify-pag-transition PROJECT DIRECTORY\n";
+#endif
       if (command == "--timeline-mask-preview" && (argc == 3 || argc == 4)) {
         avkit_preview::ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
                                                 avkit_preview::CreateMockMaskProvider(), true);
@@ -148,6 +176,7 @@ int main(int argc, const char** argv) {
                    "       --timeline-verify-assets FIRST REPLACEMENT DIRECTORY\n"
                    "       --timeline-verify-tracking DIRECTORY\n"
                    "       --timeline-verify-masks DIRECTORY\n"
+                   "       --timeline-verify-depth PROJECT DIRECTORY\n"
                    "       --timeline-verify-template-masks PROJECT DIRECTORY\n"
                    "       --timeline-verify-animated-template-masks PROJECT DIRECTORY\n"
                    "       --timeline-mask-preview PROJECT [SECONDS]\n"

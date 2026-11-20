@@ -94,6 +94,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
                 platform/macos/src/timeline_strip_macos.mm
                 platform/macos/verification/timeline_strip_verify.mm
                 platform/macos/verification/timeline_mask_verify.mm
+                platform/macos/verification/timeline_depth_verify.mm
                 platform/macos/verification/timeline_template_mask_verify.mm
                 platform/macos/verification/timeline_tracking_verify.mm
                 platform/macos/verification/timeline_verify.mm
@@ -104,6 +105,20 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         )
         target_compile_definitions(example_av_kit PRIVATE AVKIT_FILE_MEDIA=1)
         target_link_libraries(example_av_kit PRIVATE AVKit::FFmpeg "-framework CoreImage" "-framework ImageIO")
+        if (TARGET AVKit::PAG)
+            target_sources(example_av_kit PRIVATE platform/macos/verification/timeline_pag_verify.mm)
+            target_compile_definitions(example_av_kit PRIVATE AVKIT_PAG_PREVIEW=1)
+            target_link_libraries(example_av_kit PRIVATE AVKit::PAG)
+            if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
+                set(avkit_pag_framework "${CMAKE_MATCH_1}")
+                get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
+                set_property(TARGET example_av_kit APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
+                add_custom_command(TARGET example_av_kit POST_BUILD
+                        COMMAND /usr/bin/ditto "${avkit_pag_framework}"
+                            "$<TARGET_BUNDLE_DIR:example_av_kit>/Contents/Frameworks/${avkit_pag_framework_name}"
+                        VERBATIM)
+            endif ()
+        endif ()
         if (TARGET AVKit::NCNN)
             target_sources(example_av_kit PRIVATE platform/macos/verification/timeline_ncnn_verify.mm)
             target_compile_definitions(example_av_kit PRIVATE AVKIT_NCNN_PREVIEW=1)

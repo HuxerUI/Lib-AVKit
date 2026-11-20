@@ -90,6 +90,7 @@ MTLPixelFormat MetalFormat(PixelFormat format) {
     case PixelFormat::Rgba8Unorm: return MTLPixelFormatRGBA8Unorm;
     case PixelFormat::Bgra8Unorm: return MTLPixelFormatBGRA8Unorm;
     case PixelFormat::R8Unorm: return MTLPixelFormatR8Unorm;
+    case PixelFormat::R32Float: return MTLPixelFormatR32Float;
   }
   throw std::invalid_argument("Unsupported Metal texture format");
 }
@@ -281,14 +282,15 @@ private:
 
 } // namespace
 
-std::unique_ptr<render::RenderBackend> CreateBgfxBackend(id<MTLDevice> device, render::ImageDesc target) {
+std::unique_ptr<render::RenderBackend> CreateBgfxBackend(id<MTLDevice> device, render::ImageDesc target,
+                                                       std::size_t output_slots) {
   if (device == nil) throw std::invalid_argument("A Metal device is required");
   bgfx::Init init;
   init.type = bgfx::RendererType::Metal;
   init.fallback = false;
   init.platformData.context = (__bridge void*)device;
   init.swapChain.maxFrameLatency = 1;
-  return detail::CreateBgfxBackend(target, init, std::make_unique<MetalTextureBridge>(device));
+  return detail::CreateBgfxBackend(target, init, std::make_unique<MetalTextureBridge>(device), nullptr, output_slots);
 }
 
 render::ColorSurface RetainMetalTexture(id<MTLTexture> texture, render::RowOrigin origin) {

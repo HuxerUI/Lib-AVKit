@@ -1,15 +1,24 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <memory>
 
 #include <CoreVideo/CVPixelBuffer.h>
 
+#include <huxerui/avkit/pag.h>
 #include <huxerui/avkit/render.h>
 #include <huxerui/avkit/timeline.h>
 #include <huxerui/media_codec.h>
 
 namespace avkit_preview {
+
+struct PreviewPagTransitionTiming {
+  huxerui::avkit::PagTransitionTiming pag;
+  std::chrono::nanoseconds prepare_sides{};
+  std::chrono::nanoseconds enqueue_upload{};
+  std::chrono::nanoseconds complete_output{};
+};
 
 class MovieRenderer {
 public:
@@ -22,7 +31,8 @@ public:
   huxerui::avkit::render::ColorSurface Draw(const huxerui::media::VideoFrame& input, bool cue = false);
   huxerui::avkit::render::ColorSurface Draw(CVPixelBufferRef input, huxerui::Rect crop,
       huxerui::media::VideoRotation rotation, huxerui::media::MediaTimestamp time, bool cue = false);
-  huxerui::avkit::render::ColorSurface Draw(const huxerui::avkit::TimelineFrame& frame);
+  huxerui::avkit::render::ColorSurface Draw(const huxerui::avkit::TimelineFrame& frame,
+                                            PreviewPagTransitionTiming* timing = nullptr);
   huxerui::media::VideoFrame EncoderFrame(const huxerui::avkit::render::ColorSurface& output,
       const huxerui::media::VideoEncoderConfig& config, huxerui::media::MediaTimestamp pts,
       std::optional<huxerui::media::MediaTimestamp> duration = {});
@@ -36,6 +46,16 @@ private:
 
 huxerui::media::VideoEncoderConfig PreviewVideoConfig(huxerui::avkit::PixelSize size);
 const huxerui::avkit::ResourceRef& PreviewStickerResource();
+#if defined(AVKIT_PAG_PREVIEW)
+const huxerui::avkit::ResourceRef& PreviewPagStickerResource();
+const huxerui::avkit::ResourceRef& PreviewEditablePagResource();
+const huxerui::avkit::ResourceRef& PreviewPagImageResource();
+const huxerui::avkit::ResourceRef& PreviewPagTransitionResource();
+std::unique_ptr<huxerui::avkit::PagTransition> OpenPreviewPagTransition(huxerui::avkit::PixelSize size);
+std::unique_ptr<huxerui::avkit::PagAnimation> OpenPreviewPagSticker(
+    const huxerui::avkit::ResourceRef& resource = PreviewPagStickerResource(),
+    const huxerui::avkit::StickerReplacements& replacements = {});
+#endif
 const huxerui::avkit::ResourceRef& TrackingStickerResource(huxerui::avkit::analysis::TrackedPart part);
 const huxerui::avkit::ResourceRef& PreviewWipeResource();
 const std::array<huxerui::avkit::ResourceRef, 2>& PreviewStaticMaskResources();

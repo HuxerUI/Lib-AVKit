@@ -87,6 +87,7 @@ MTLPixelFormat MetalFormat(PixelFormat format) {
     case PixelFormat::Rgba8Unorm: return MTLPixelFormatRGBA8Unorm;
     case PixelFormat::Bgra8Unorm: return MTLPixelFormatBGRA8Unorm;
     case PixelFormat::R8Unorm: return MTLPixelFormatR8Unorm;
+    case PixelFormat::R32Float: return MTLPixelFormatR32Float;
   }
   throw std::invalid_argument("Unsupported Metal texture format");
 }

@@ -47,7 +47,8 @@ struct CompositeShaders {
 /// @brief Creates the compositor using the context and texture bridge selected by the platform.
 std::unique_ptr<RenderBackend> CreateBgfxBackend(ImageDesc target, const bgfx::Init& init,
                                                  std::unique_ptr<BgfxTextureBridge> bridge = {},
-                                                 const CompositeShaders* shaders = nullptr);
+                                                 const CompositeShaders* shaders = nullptr,
+                                                 std::size_t output_slots = 2);
 
 /// @brief Configures platform-specific context and texture sharing for the compositor.
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init);

@@ -53,6 +53,13 @@ bool Versioned(const ResourceRef& resource) {
 
 void ValidateTransition(const TransitionSpec& spec) {
   ValidateRange(spec.range);
+  if (spec.animation) {
+    Check(Versioned(*spec.animation) && spec.mask == ResourceRef{},
+          "An animated transition needs a versioned animation resource and no mask");
+    Check(spec.feather == 0.5F && !spec.inverted && spec.feather_keys.empty(),
+          "An animated transition does not support coverage mask parameters");
+    return;
+  }
   Check(Versioned(spec.mask), "A transition needs a versioned mask resource");
   const auto coverage = [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; };
   Check(coverage(spec.feather), "Transition feather must be between zero and one");
@@ -142,7 +149,7 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
           Check(!Before(range.start, timeline.start) && !Before(prior.end, range.end) && !Before(timeline.end, prior.end),
                 "Transition range must fit both adjacent clips in playback order");
           Check(!Before(timeline.start, earlier_end), "A transition cannot overlap a third clip on its track");
-          Check(previous->destination == clip.destination, "Mask transitions require matching clip rectangles");
+          Check(previous->destination == clip.destination, "Transitions require matching clip rectangles");
           transitions.erase(match);
         }
         earlier_end = prior.end;
@@ -175,6 +182,24 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
         const auto& resource = sticker.spec.resource;
         Check(Versioned(resource), "Sticker needs a versioned resource");
         ValidateRect(sticker.spec.destination);
+        if (const auto depth = sticker.spec.depth_meters)
+          Check(std::isfinite(*depth) && *depth > 0, "Sticker depth must be positive and finite");
+        if (const auto playback = sticker.spec.playback)
+          Check(*playback == AnimationPlayback::HoldLast || *playback == AnimationPlayback::Loop,
+                "Sticker needs a valid animation playback mode");
+        const auto& replacements = sticker.spec.replacements;
+        if (!replacements.Empty()) {
+          Check(sticker.spec.playback.has_value(), "Sticker replacements require an animation");
+          std::unordered_set<std::string_view> slots;
+          const auto check_slot = [&](const std::string& slot) {
+            Check(!slot.empty() && slots.insert(slot).second, "Sticker replacement slots must be nonempty and unique");
+          };
+          for (const auto& text : replacements.texts) check_slot(text.slot);
+          for (const auto& image : replacements.images) {
+            check_slot(image.slot);
+            Check(Versioned(image.image), "Sticker image replacement needs a versioned resource");
+          }
+        }
         if (const auto& anchor = sticker.spec.anchor) {
           using enum analysis::TrackedPart;
           Check(anchor->part == Face || anchor->part == LeftHand || anchor->part == RightHand,
@@ -262,16 +287,22 @@ InstanceId ProjectEdit::AddSticker(ClipId clip, StickerSpec spec) {
   return id;
 }
 
-void ProjectEdit::SetStickerLayout(InstanceId instance, Rect destination) {
+StickerSpec& ProjectEdit::Sticker(InstanceId instance) {
   for (auto& track : draft_.tracks) {
     for (auto& clip : track.clips) {
       const auto found = std::ranges::find(clip.stickers, instance, &StickerInstance::id);
-      if (found == clip.stickers.end()) continue;
-      found->spec.destination = destination;
-      return;
+      if (found != clip.stickers.end()) return found->spec;
     }
   }
   throw std::invalid_argument("Unknown sticker instance");
+}
+
+void ProjectEdit::SetStickerLayout(InstanceId instance, Rect destination) {
+  Sticker(instance).destination = destination;
+}
+
+void ProjectEdit::SetStickerReplacements(InstanceId instance, StickerReplacements replacements) {
+  Sticker(instance).replacements = std::move(replacements);
 }
 
 InstanceId ProjectEdit::SetTransition(ClipId from, ClipId to, TransitionSpec spec) {

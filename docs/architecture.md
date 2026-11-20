@@ -377,7 +377,7 @@ Applying a template validates mask versions, resource kinds, channels, and timin
 
 The static clip mask milestone uses `TemplateClip::background` and `BackgroundReplacement::static_mask`. The static resource supplies coverage for the background effect while bound. It uses normalized oriented source coordinates, so cropping and mirroring sample corresponding points in the color input and the mask. An opaque color fills uncovered pixels. A transparent color reveals lower tracks. Template planning validates the versioned reference and commits the binding with the clip. `ProjectEdit::SetBackgroundMaskResource` changes the reference for one clip, preserving the clip ID, crop, mirror, and inversion. Static bindings were introduced in `.avkit` version 7. The reader still accepts versions 1–6. [Project API](../include/huxerui/avkit/project.h)
 
-`TimelineFrame::static_masks` lists unique static resource references for the requested frame. The compositor supplies data textures in analysis, static, clip animation, then transition slot order. The macOS preview resolves the static references to bundled 8-bit grayscale PNGs, checks the resource and its format, and caches the decoded GPU surface by versioned reference. Preview and export use the same mapping and resource cache. [Timeline API](../include/huxerui/avkit/timeline.h)
+`TimelineFrame::static_masks` lists unique static resource references for the requested frame. The compositor supplies analysis masks, depth maps, static masks, clip animations, and transition masks in slot order. The macOS preview resolves the static references to bundled 8-bit grayscale PNGs, checks the resource and its format, and caches the decoded GPU surface by versioned reference. Preview and export use the same mapping and resource cache. [Timeline API](../include/huxerui/avkit/timeline.h)
 
 `BackgroundReplacement::animated_mask` binds a versioned mask sequence and a per-clip `MaskPlayback` policy through the same template background. A clip uses one packaged coverage source. Projects with sequence bindings use `.avkit` version 8. The compositor resolves `TimelineFrame::animated_masks` against the sequence's ordered PNGs and positive frame interval. It caches the resolved coverage by resource version and frame index. `AnimatedMaskSample` divides the clip-local project time by the exact interval and rounds down. The hold policy stops at the last frame and the loop policy wraps at the sequence duration. Seeking and descending project-time sampling evaluate the requested time directly. Changing a clip's source direction changes which video frame is sampled at that project time. [Timeline API](../include/huxerui/avkit/timeline.h)
 
@@ -804,15 +804,27 @@ The first release locks one primary subject per source that meets the effect req
 | Integration | Input, sampling, and ownership |
 | --- | --- |
 | Enterprise `PAGMovie` | Create a `PAGMovie` from a local video path, set the source range, speed, and volume, and replace the placeholder with a `PAGImage`. The official examples cover Android and iOS. Check capabilities for the target platforms and selected version before using this interface. [Official PAG video replacement documentation](https://pag.io/docs/zh-CN/replace-video.html) |
-| Per-frame replacement in the community edition | AVKit gets user video frames through Lib-Media or a software codec provider, converts them to readable RGBA or a verified platform texture, constructs a `PAGImage`, and fills the slot with `PAGFile::replaceImage` or `PAGImageLayer::setImage`. Sample both inputs at the same project time, using each clip's range, speed, and direction to find its source frame. Core sets `PAGPlayer` progress and calls `flush`, then passes the result to bgfx for compositing. [libpag C++ API](https://github.com/Tencent/libpag/blob/v4.5.102/include/pag/pag.h) · [PAG team's per-frame replacement guidance](https://github.com/Tencent/libpag/discussions/1233) |
+| Per-frame replacement in the community edition | AVKit gets user video frames through Lib-Media or a software codec provider and composes each clip to a GPU texture. The PAG adapter imports the two textures with `PAGImage::FromTexture` and replaces the authored slots with `PAGFile::replaceImage`. Both source frames are sampled from the same project time. The adapter sets `PAGPlayer` progress and flushes into a GPU target. bgfx consumes the completed texture for final compositing. [libpag C++ API](https://github.com/Tencent/libpag/blob/v4.5.102/include/pag/pag.h) · [PAG team's per-frame replacement guidance](https://github.com/Tencent/libpag/discussions/1233) |
 
 The manifest maps asset slot IDs to layers in the pinned PAG version. Bind layers separately when they need different videos or source times. `getVideoRanges` can help check required asset intervals, and the project retains the final clips and time mappings. In the overlap, the transition instance feeds the outgoing and incoming clips to two placeholders. PAG renders the layout, masks, and animations retained from After Effects. Full-sequence graphics can use several placeholders the same way, with the existing one-click assembly planner arranging clips, music, and output.
 
-The first release uses bgfx two-input compositing for general transitions. Transitions that need extra decoration can overlay PAG. For assets that mask or displace both video inputs inside PAG, first verify correctness with per-frame replacement in the community edition. A pixel buffer path is suitable for offline verification. For live use, validate two-stream decoding, platform texture sharing, synchronization, and output cost on the target devices. Project planning and hardware and software codecs use the existing AVKit paths.
+General transitions use bgfx two-input compositing. Transitions that mask or displace both video inputs inside PAG use a GPU adapter for the target platform. Validate two-stream decoding, texture sharing, synchronization, and output cost on each supported target. Project planning and hardware and software codecs use the existing AVKit paths.
+
+The PAG transition uses `TransitionSpec::animation` to bind a versioned resource for the old and new clip on one track. The overlap, clip placements, and source directions stay editable through the project. Documents with authored transitions use version 12. The timeline owns audio and source clocks and emits `TransitionAnimationSample` with two clip subcomposition indices and local overlap time. The macOS compositor renders those two passes and calls `PagTransition` with the completed Metal textures. The adapter rebinds both images on every sample before setting authored progress. bgfx samples the returned premultiplied BGRA8 Metal texture in the transition's existing layer order. [Timeline API](../include/huxerui/avkit/timeline.h) · [AVKit PAG API](../include/huxerui/avkit/pag.h)
+
+The macOS libpag v4.5.102 framework uses OpenGL for external textures. AVKit issues two Metal blits to IOSurface-backed inputs, waits for completion, and imports the OpenGL views with `PAGImage::FromTexture`. PAG renders into the OpenGL view of an output IOSurface. After OpenGL completes, bgfx samples the Metal view of that same output. The bridge transfers no frame pixels through CPU memory. Leased outputs retain their storage and remain immutable. The adapter reports an error when GPU sharing is unavailable. Hardware and software codec selection stays independent of the PAG handoff. [libpag surface factory](https://github.com/Tencent/libpag/blob/v4.5.102/src/rendering/PAGSurfaceFactory.cpp) · [macOS GPU adapter](../platform/macos/src/pag_transition.mm)
 
 ### Render plan integration
 
 Static textures use `AssetImage`. The PAG adapter takes a resource version, local `MediaTimestamp`, replacement content, and target pixel dimensions. It passes the rasterized result as a leased `ColorSurface` to `SurfaceInput`, and `FrameImage` brings it into the render plan. Preview and export own separate mutable playback instances. Cache reusable raster output by resource, sample time, size, and replacement content. Enable direct GPU handoff on combinations with verified graphics devices, formats, synchronization, and leases. Measure PAG rendering, readback, and bgfx upload separately on the CPU-accessible output path. [PAGDecoder and PAGSurface](https://github.com/Tencent/libpag/blob/main/include/pag/pag.h) · [PAG GPU types](https://github.com/Tencent/libpag/blob/main/include/pag/gpu.h)
+
+The animated sticker implementation binds a versioned `ResourceRef` and an `AnimationPlayback` mode in `StickerSpec`. A `TimelineFrame` carries an `AnimatedStickerSample` with the visible instance ID, replacement values, and elapsed time on its owning clip's project clock. Reversing the video source leaves that clock unchanged. The compositor resolves the sample to a leased color surface and uses the existing Flecs layer and source-over draw. [Project API](../include/huxerui/avkit/project.h) · [Timeline API](../include/huxerui/avkit/timeline.h)
+
+`StickerReplacements` stores named text values and versioned image references per instance. Omitting a slot uses its authored content. An explicit empty text value clears that layer. Templates can supply initial values through `TemplateClip::stickers`. `ProjectEdit::SetStickerReplacements` replaces the instance's values in a regular undoable edit. The project rejects duplicate slot names and unversioned images. The resolver checks slot names, types, and availability against the pinned animation resource. The document uses version 11 when it contains replacement values and version 10 for animations with authored values only. Older documents still open. [Project API](../include/huxerui/avkit/project.h)
+
+The pack's slot mapping associates stable names with the editable text and image indices of a specific PAG revision. The preview supplies that mapping for its bundled fixture. Only resolved indices, encoded image bytes, and packaged fonts enter `AVKit::PAG`. Construct a new `PagAnimation` when an instance changes its resource or replacement values, even if project time is unchanged. Each active instance in the preview keeps its own decoder. Export uses a separate compositor. A shared `PagFont` keeps the packaged font available to each composition that uses it. [AVKit PAG API](../include/huxerui/avkit/pag.h) · [libpag C++ API](https://github.com/Tencent/libpag/blob/v4.5.102/include/pag/pag.h)
+
+`PagAnimation` applies its resolved replacements before creating a decoder. It samples the asset's native frame rate with hold or loop behavior, returns retained premultiplied RGBA8 rows, and caches its most recently sampled surface. Rendering uses the current eight-bit compositor's sRGB code values.
 
 Before compositing, normalize transparent layers to premultiplied linear-light values using their known channel order, transfer function, and alpha semantics. For premultiplied output with a nonlinear transfer function, recover straight RGB first, then apply the transfer conversion and premultiply in linear light. Set the RGB of fully transparent pixels to zero. Background-dependent blend modes receive the background frame as an additional pass input. Selected `gl-transitions` shaders must match the library's UV origin and straight RGBA contract. Reuse the existing cross-backend build and check both images, semitransparent edges, and sample positions. Project time and the overlap determine transition progress, and each clip samples its frame in its own source time.
 
@@ -1022,7 +1034,7 @@ using DepthSample = AnalysisResult<AnalysisTexture>;
 
 Core matches source video to analysis results by `FrameKey`, then adds the pixel surface to the request. Associate a single-person mask with the frame's `PersonTrackId` through an ROI or instance result. Whole-frame masks sample by frame and have an empty `person` field. `source_to_texture_uv` maps orientation-corrected, pre-mirror source coordinates to logical texture UVs. The processing graph follows the video's mirroring, cropping, warping, and picture-in-picture path to compute the same source sampling point. It uses `valid_uv` to check model ROIs or padding. Treat pixels outside that region as missing, constrain filtering to valid pixels, and let the backend handle row origin.
 
-The first release stores foreground mask coverage in `R8Unorm`. For classification output, the adapter extracts foreground coverage. Matting output uses the matte. When detection finds no foreground, return zero coverage. Depth uses `R16Float` or `R32Float` to store optical-axis `Z` in meters, registered to the video camera. Zero denotes an invalid sample. The sensor adapter handles synchronization and calibration. Virtual object projection and depth comparison use the same camera coordinates. Use nearest-neighbor depth sampling by default. Rasterization uses `Depth32Float` for depth attachments.
+The first release stores foreground mask coverage in `R8Unorm`. For classification output, the adapter extracts foreground coverage. Matting output uses the matte. When detection finds no foreground, return zero coverage. The depth occlusion milestone uses `R32Float` to store optical-axis `Z` in meters, registered to the video camera. Zero, negative, and nonfinite values denote invalid samples. The sensor adapter handles synchronization and calibration. Virtual object projection and depth comparison use the same camera coordinates. Depth uses nearest-neighbor sampling. The planned 3D rasterizer uses `Depth32Float` for depth attachments.
 
 Live effects wait for the corresponding frame result and bridge preparation within their budget. On timeout, apply the effect's declared fallback, such as restoring the original image for background replacement or hiding a virtual layer whose occlusion is unknown. Preview and recording share that choice with the composited frame. Offline processing waits for required frame results and GPU dependencies. A skipped or failed required result produces an analysis error.
 
@@ -1031,6 +1043,10 @@ The timeline background replacement milestone enables an optional solid backgrou
 An `ImportVideoFrame` callback returns an `ImportedVideoFrame` with a color surface and `source_to_texture_uv`. The transform maps normalized, oriented visible source coordinates before clip mirroring to logical texture UVs. Use the identity for a texture that contains the full oriented source, and describe the source placement explicitly for a texture with padding or cropping. The renderer handles each surface's stored row origin. When the callback is omitted, the compositor fits each decoded input to the project canvas using `ImageFit::Contain`. [Timeline API](../include/huxerui/avkit/timeline.h)
 
 The portrait mask capability currently accepts stateless single-frame providers. Each clip owns its analysis session. It passes `BackgroundReplacement::model_id` to the provider when opening the session. An empty selection uses the provider default. Installing a new project revision retires the previous selection and its results. An explicit skipped completion keeps the cropped and mirrored source for this optional effect in preview and export. A valid all-zero texture displays the replacement color. The timeline submits every visible clip's mask request before collecting results. Clocked preview starts a 12 ms deadline at each submission and restores the original for the affected clip on timeout. A completion received within its deadline stays available until collection. Export waits for each current result and reports provider errors. A completion must match the job ID, clip, generation, and source PTS.
+
+`StickerSpec::depth_meters` gives a flat sticker a positive, constant camera-space Z. Projects containing it use `.avkit` version 9. `AnalysisCapability::DepthMap` and `AnalysisSession::SubmitDepth` return a `DepthCompletion` with the same identity and cancellation rules as portrait masks. The timeline uses one stateless depth session per affected clip and shares its depth map across that clip's stickers. A matching skipped result hides the depth-bound stickers in preview and export. Preview also hides them on timeout, and export waits for a matching result. A missing capability or provider error is reported to the caller. [Analysis API](../include/huxerui/avkit/analysis.h) · [Project API](../include/huxerui/avkit/project.h)
+
+Flecs includes `render::DepthOcclusion` on each visible depth-bound sticker in the compiled plan. Its target-to-depth UV map follows the owning video's crop, mirror, and canvas placement. A sticker pixel is visible when its depth is at or in front of a valid scene sample inside the clip and depth regions. Invalid samples suppress that sticker pixel. The same color and depth slots are used in preview and export. bgfx validates the data slot format and rejects `R32Float` inputs on devices without sampleable 2D float textures. [Render API](../include/huxerui/avkit/render.h)
 
 ### Shader programs and resource packs
 
@@ -1058,7 +1074,7 @@ Sticker atlases and subtitle glyphs ──────────────�
                                                                               RGB(A) output
 ```
 
-The default working space uses linear BT.709 RGB with premultiplied alpha. Negotiate the working format by configuration and capabilities. Select `RGBA16F` for higher precision and use `RGBA8` within its supported precision range. Interpret matrix, transfer function, range, and chroma location from source metadata, then apply the visible crop and orientation. Explicit asset interpretation settings fill missing color metadata. The output adapter sets transfer, range, and alpha semantics for the destination. Enable P010 and HDR working spaces and outputs only when input, format capabilities, and output all pass negotiation.
+The planned high-precision working space uses linear BT.709 RGB with premultiplied alpha. Negotiate the working format by configuration and capabilities. Select `RGBA16F` for higher precision and use `RGBA8` within its supported precision range. Interpret matrix, transfer function, range, and chroma location from source metadata, then apply the visible crop and orientation. Explicit asset interpretation settings fill missing color metadata. The output adapter sets transfer, range, and alpha semantics for the destination. Enable P010 and HDR working spaces and outputs only when input, format capabilities, and output all pass negotiation.
 
 ### External video frames
 
@@ -1067,6 +1083,8 @@ The file decode path accepts Lib-Media's `media::VideoFrame` and uses its `Video
 `ColorSurface` uses `pixels` to carry storage and synchronization for an RGB(A) surface. An empty synchronization object means the producer guarantees readability. Rendering, texture publication, and encoding each retain a reference through their final read. Adapt composite output for publication to an SDK `ExternalTexture`, or construct a `media::VideoFrame` with the encoding layout and PTS. Serialize producer publication and encoder snapshot acquisition to associate them with the target frame.
 
 Validate platform adapters on the paths below and measure GPU copies, CPU uploads, and readbacks separately. `ImportBgfxVideoFrame` imports a hardware-decoded frame through Lib-Media's `MakeExternalTexture` and the platform texture bridge. The platform bridge acquires the concrete SDK texture and keeps it alive through GPU use. If the texture cannot be shared, the import returns `Unsupported`. `TextureTransferPolicy::AllowCpuTransfer` accepts software-decoded SDR I420 or NV12 planes and uploads fitted pixels directly.
+
+The current eight-bit SDR compositor uses sRGB code values in its color textures. The CPU import expands the signaled YUV range and applies the signaled matrix before converting display-referred BT.709 RGB to sRGB. It uses the normalized BT.1886 display curve with gamma 2.4, and the CPU encoder transfer uses its inverse. This matches the Apple Metal bridge's BT.709 export and keeps the MP4's BT.709 metadata. CPU input with unspecified transfer retains the existing code-value behavior. [ITU-T H.274 colour description](https://www.itu.int/epublications/publication/itu-t-h-274-v3-2023-09-versatile-supplemental-enhancement-information-messages-for-coded-video-bitstreams)
 
 File preview prepares each video picture before admitting it to playback. File export retries an input when its compositor reports `PlatformVideoImportError`. `MovieReader::RetryVideoFrame` replaces only the video cursor with the configured software provider and decodes the same source presentation timestamp and duration. Playback retains prepared surfaces until their timestamps are presented or dropped. Later seeks keep the software video provider. Timeline preview and export use an input importer to apply the same retry to the affected clip. Other clips, audio, and the open encoder keep their existing sessions.
 
@@ -1637,3 +1655,66 @@ work="$PWD/build/animated-template-mask-check"
 open -n "$app" --args --timeline-preview "$work/animated-masks.avkit"
 "$preview" --timeline-export "$work/animated-masks.avkit" "$work/export.mp4" --software-only
 ```
+
+### Depth occlusion verification
+
+Pass the three-video-track DanceTrack project saved by animated template mask verification. The verifier first reads back a known offscreen scene with near and far ECS layers, padded depth rows, bottom-left origin, and invalid samples. It also tests known YUV codes and the CPU RGB round trip with limited and full range and with both matrix choices. It then adds two depth-bound instances of the same sticker to the main clip and the first inset and reopens the saved project. A mock provider returns asymmetric metric depth with independent samples for the two clips, including when they use the same source PTS. The verifier compares GPU pixels with a source-space reference and checks skipped and late depth, both seek directions, descending samples, clocked preview, and export with all video source directions reversed. Both MP4s use the default limited-range BT.709 settings. Reimport verifies the color metadata, mean and worst-frame RGB error, exact PTS, and PCM continuity.
+
+```sh
+project="$PWD/build/animated-template-mask-check/animated-masks.avkit"
+work="$PWD/build/depth-occlusion-check"
+"$preview" --timeline-verify-depth "$project" "$work"
+```
+
+### PAG sticker verification
+
+Enable `AVKIT_ENABLE_PAG` and provide the C++ headers and target library from the same libpag release. The verified SDK is v4.5.102. On macOS, use the library executable inside the selected `libpag.framework`. The preview build embeds that framework. On Android, link the ABI-specific `libpag.so` and package the matching AAR so its Java initialization and `libffavc.so` are available in the application process. [libpag v4.5.102](https://github.com/Tencent/libpag/releases/tag/v4.5.102)
+
+```sh
+cmake -S examples/preview -B build/preview -DAVKIT_ENABLE_FILE_MEDIA=ON \
+  -DAVKIT_ENABLE_PAG=ON -DAVKIT_PAG_INCLUDE_DIR="/path/to/libpag/include" \
+  -DAVKIT_PAG_LIBRARY="/path/to/libpag.framework/libpag"
+cmake --build build/preview --target example_av_kit
+app="$PWD/build/preview/example_av_kit.app"
+preview="$app/Contents/MacOS/example_av_kit"
+project="$PWD/build/animated-template-mask-check/animated-masks.avkit"
+work="$PWD/build/pag-sticker-check"
+"$preview" --timeline-verify-pag-stickers "$project" "$work"
+open -n "$app" --args --timeline-preview "$work/pag-stickers.avkit"
+"$preview" --timeline-export "$work/pag-stickers.avkit" "$work/export.mp4" --software-only
+```
+
+The verifier uses libpag's bundled `like.pag` sample, a 244 × 244 animation with 28 frames at 24 fps. It checks premultiplied source-over, retained surfaces, and the exact hold and loop boundaries before using the DanceTrack project. The main clip holds the final frame. The inset starts on project frame 12 and loops to the first frame at project frame 40. The verifier compares exact composition pixels on both seek directions and with all video sources reversed. It checks continuous PCM and exact PTS after reimporting both exports. [Upstream fixture](https://github.com/Tencent/libpag/blob/v4.5.102/assets/like.pag) · [Bundled license](../examples/preview/resources/raw/stickers/libpag-license.txt)
+
+```sh
+work="$PWD/build/pag-replacement-check"
+"$preview" --timeline-verify-pag-replacements "$project" "$work"
+open -n "$app" --args --timeline-preview "$work/pag-replacements.avkit"
+```
+
+The replacement verifier attaches the same editable PAG asset to the main clip and the first inset. It changes the inset's `title` and `icon` slots independently at the same project frame and checks that pixels outside the inset stay identical. It checks empty text, undo, redo, restoration of authored values, and reopening. Both source directions use exact-time reference pictures for clocked preview, ascending and descending sampling, both seek directions, and pre-encode export. Reimport verifies video PTS and continuous PCM. [Upstream fixture](https://github.com/Tencent/libpag/blob/v4.5.102/assets/wstask_prizebaoji.pag)
+
+The fixture font `preview_sans.ttf` is a renamed Noto Sans SC Semibold subset covering the fixture's text and printable ASCII. Use the same font bytes on each target when comparing raster output. [Font source](https://github.com/google/fonts/tree/main/ofl/notosanssc) · [Bundled font license](../examples/preview/resources/raw/stickers/preview_sans_ofl.txt)
+
+### PAG video transition verification
+
+Use the DanceTrack project from animated template mask verification. The verifier assembles two trims over a 12-frame overlap at 24 fps with one trim in reverse. The included `crossfade.pag` fixture has two canvas-sized image slots and a 12-frame authored opacity curve over the outgoing image. The verifier checks the decoded PTS for both slots, compares each transition frame against a pixel blend, and substitutes each input independently at the same transition time. It also checks reopening, the overlap endpoints, both seek directions, clocked playback, reverse sampling, and MP4 export and reimport with both source direction assignments.
+
+```sh
+work="$PWD/build/pag-transition-check"
+"$preview" --timeline-verify-pag-transition "$project" "$work"
+open -n "$app" --args --timeline-preview "$work/pag-transition.avkit"
+"$preview" --timeline-export "$work/pag-transition.avkit" "$work/export.mp4" --software-only
+```
+
+The verifier holds one PAG output across a subsequent sample to check immutability, then releases it and checks IOSurface reuse. It records side composition, Metal input blits and wait, PAG binding and flush, GPU completion, and the final bgfx pass at 320 × 180 and 1920 × 1080. For the video-only transition it checks that the final pass enqueues zero CPU texture uploads. The timeline-and-composition total includes video decoding and import. The verifier repeats the 1080p measurement with automatic codec selection and reports how many imported frames use platform storage. The benchmark excludes audio playback and encoding.
+
+The macOS preview compositor has three output slots when PAG is built so it can render both transition sides while a caller retains the previous final frame. The verifier exercises that case as well as reuse of the PAG output IOSurfaces.
+
+The Apple M1 Pro rerun produced the following P95 times in milliseconds over 60 overlap samples for each configuration. The 1080p automatic run imported all 120 video inputs as platform frames. The full timeline timing includes repeated seeks to the start of the overlap.
+
+| Canvas and decode inputs | Metal input blits and wait | PAG GPU completion wait | Final bgfx CPU upload enqueue | Composition | Timeline and composition |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 320 × 180, software | 0.89 | 1.18 | 0 | 4.63 | 29.51 |
+| 1920 × 1080, software | 1.92 | 2.33 | 0 | 14.06 | 107.81 |
+| 1920 × 1080, platform | 1.53 | 0.79 | 0 | 6.04 | 108.38 |

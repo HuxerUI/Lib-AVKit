@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "texture_bridge.h"
+#include "timing.h"
 #include "support/geometry.h"
 #include "avkit_fs_composite.h"
 #include "avkit_fs_masked_blend.h"
@@ -52,6 +53,7 @@ bgfx::TextureFormat::Enum BgfxFormat(PixelFormat format) {
     case PixelFormat::Rgba8Unorm: return bgfx::TextureFormat::RGBA8;
     case PixelFormat::Bgra8Unorm: return bgfx::TextureFormat::BGRA8;
     case PixelFormat::R8Unorm: return bgfx::TextureFormat::R8;
+    case PixelFormat::R32Float: return bgfx::TextureFormat::R32F;
   }
   throw std::invalid_argument("Unsupported bgfx texture format");
 }
@@ -135,8 +137,9 @@ struct Job {
 
 class BgfxBackend final : public RenderBackend {
 public:
-  BgfxBackend(ImageDesc image, const bgfx::Init& init, std::unique_ptr<detail::BgfxTextureBridge> bridge)
-      : image_(image), bridge_(std::move(bridge)), context_(init) {}
+  BgfxBackend(ImageDesc image, const bgfx::Init& init, std::unique_ptr<detail::BgfxTextureBridge> bridge,
+              std::size_t output_slots)
+      : image_(image), bridge_(std::move(bridge)), targets_(output_slots), context_(init) {}
 
   void Initialize(const detail::CompositeShaders& shaders) {
     if (!FitsDevice(image_.size)) {
@@ -163,18 +166,21 @@ public:
     sampler_ = bgfx::createUniform("s_source", bgfx::UniformType::Sampler);
     incoming_sampler_ = bgfx::createUniform("s_incoming", bgfx::UniformType::Sampler);
     mask_sampler_ = bgfx::createUniform("s_mask", bgfx::UniformType::Sampler);
+    depth_sampler_ = bgfx::createUniform("s_depth", bgfx::UniformType::Sampler);
     input_flips_ = bgfx::createUniform("u_input_flips", bgfx::UniformType::Vec4);
     input_alpha_ = bgfx::createUniform("u_input_alpha", bgfx::UniformType::Vec4);
     mask_parameters_ = bgfx::createUniform("u_mask_parameters", bgfx::UniformType::Vec4);
     mask_region_ = bgfx::createUniform("u_mask_region", bgfx::UniformType::Vec4);
     sampling_ = bgfx::createUniform("u_sampling", bgfx::UniformType::Vec4, 6);
+    occlusion_ = bgfx::createUniform("u_occlusion", bgfx::UniformType::Vec4, 5);
     destination_ = bgfx::createUniform("u_destination", bgfx::UniformType::Vec4);
     off_diagonal_ = bgfx::createUniform("u_off_diagonal", bgfx::UniformType::Vec4);
     top_left_ = CreateQuad();
     if (!bgfx::isValid(program_) || !bgfx::isValid(masked_program_) || !bgfx::isValid(sampler_) ||
         !bgfx::isValid(incoming_sampler_) || !bgfx::isValid(mask_sampler_) || !bgfx::isValid(input_flips_) ||
         !bgfx::isValid(input_alpha_) || !bgfx::isValid(mask_parameters_) || !bgfx::isValid(mask_region_) || !bgfx::isValid(destination_) ||
-        !bgfx::isValid(off_diagonal_) || !bgfx::isValid(top_left_) || !bgfx::isValid(sampling_)) {
+        !bgfx::isValid(off_diagonal_) || !bgfx::isValid(top_left_) || !bgfx::isValid(sampling_) ||
+        !bgfx::isValid(depth_sampler_) || !bgfx::isValid(occlusion_)) {
       throw std::runtime_error("Could not create the composite program or quad");
     }
 
@@ -207,11 +213,13 @@ public:
     Destroy(sampler_);
     Destroy(incoming_sampler_);
     Destroy(mask_sampler_);
+    Destroy(depth_sampler_);
     Destroy(input_flips_);
     Destroy(input_alpha_);
     Destroy(mask_parameters_);
     Destroy(mask_region_);
     Destroy(sampling_);
+    Destroy(occlusion_);
     Destroy(destination_);
     Destroy(off_diagonal_);
     Destroy(masked_program_);
@@ -231,8 +239,13 @@ public:
       }
     }
     for (const auto& input : request.data_inputs) {
-      if (input.image.format != PixelFormat::R8Unorm || !ValidInput(input))
-        return SubmitResult::Failure({RenderErrorCode::InvalidFrame, "Expected an R8Unorm coverage surface"});
+      const auto format = input.image.format;
+      if (format != PixelFormat::R8Unorm && format != PixelFormat::R32Float)
+        return SubmitResult::Failure({RenderErrorCode::InvalidFrame, "Expected a coverage or metric depth surface"});
+      if (format == PixelFormat::R32Float && !(bgfx::getCaps()->formats[BgfxFormat(format)] & BGFX_CAPS_FORMAT_TEXTURE_2D))
+        return SubmitResult::Failure({RenderErrorCode::Unsupported, "The renderer cannot sample an R32Float texture"});
+      if (!ValidInput(input))
+        return SubmitResult::Failure({RenderErrorCode::InvalidFrame, "Invalid data surface or texture device"});
     }
     for (const auto& target : targets_) {
       if (target.storage.use_count() == 1) {
@@ -244,9 +257,11 @@ public:
     return SubmitResult::Success(std::nullopt);
   }
 
-  void Pump() override {
+  void Pump() override { Pump(nullptr); }
+
+  void Pump(std::chrono::nanoseconds* upload_time) {
     if (!job_ || job_->ready) return;
-    job_->failed = !Encode(*job_);
+    job_->failed = !Encode(*job_, upload_time);
     if (job_->failed || bridge_) {
       bgfx::frame(BGFX_FRAME_FLUSH);
       if (bridge_) bridge_->WaitForCompletion();
@@ -368,7 +383,13 @@ private:
         request.data_inputs.size() > limits.maxTextures - reserved_textures - request.inputs.size()) return false;
 
     auto remaining_draws = std::size_t(limits.maxDrawCalls);
-    const auto masks = request.data_inputs.size();
+    const auto is_data = [&](std::uint32_t slot, PixelFormat format) {
+      return slot < request.data_inputs.size() && request.data_inputs[slot].image.format == format;
+    };
+    const auto finite_rect = [](const Rect& rect) {
+      return !rect.IsEmpty() && std::isfinite(rect.x) && std::isfinite(rect.y) &&
+             std::isfinite(rect.width) && std::isfinite(rect.height);
+    };
     const auto validate = [&](std::span<const Draw> draws, std::size_t colors, bool final_pass) {
       const auto count = std::max<std::size_t>(1, draws.size());
       if (count > remaining_draws) return false;
@@ -384,19 +405,24 @@ private:
           if (sampling.background) {
             const auto& background = *sampling.background;
             const auto& color = background.color;
-            if (background.mask_slot >= masks || !avkit::detail::IsFinite(background.draw_to_mask_uv) ||
+            if (!is_data(background.mask_slot, PixelFormat::R8Unorm) || !avkit::detail::IsFinite(background.draw_to_mask_uv) ||
                 !avkit::detail::IsUnitRect(background.valid_uv) ||
                 !std::ranges::all_of(std::array{color.red, color.green, color.blue, color.alpha},
                                      [](float value) { return value >= 0 && value <= 1; })) return false;
           }
         }
+        if (draw.depth_occlusion) {
+          const auto& depth = *draw.depth_occlusion;
+          if (draw.masked_blend || draw.blend != Blend::PremultipliedOver ||
+              !is_data(depth.depth_slot, PixelFormat::R32Float) || !avkit::detail::IsFinite(depth.target_to_depth_uv) ||
+              !avkit::detail::IsUnitRect(depth.valid_uv) || !finite_rect(depth.target_region) ||
+              !(depth.layer_depth_meters > 0 && std::isfinite(depth.layer_depth_meters))) return false;
+        }
         if (!draw.masked_blend) return true;
         const auto& mask = *draw.masked_blend;
         const auto& region = mask.mask_region;
-        return final_pass && mask.incoming_slot < colors && mask.mask_slot < masks &&
-               std::isfinite(mask.feather) && mask.feather >= 0 && mask.feather <= 1 && !region.IsEmpty() &&
-               std::isfinite(region.x) && std::isfinite(region.y) &&
-               std::isfinite(region.width) && std::isfinite(region.height);
+        return final_pass && mask.incoming_slot < colors && is_data(mask.mask_slot, PixelFormat::R8Unorm) &&
+               std::isfinite(mask.feather) && mask.feather >= 0 && mask.feather <= 1 && finite_rect(region);
       });
     };
     for (const auto& pass : plan.subcompositions) {
@@ -420,8 +446,10 @@ private:
     return bridge_ && bridge_->GetTexture(input) != 0;
   }
 
-  bgfx::TextureHandle ImportInput(const ImageSurface& input) const {
+  bgfx::TextureHandle ImportInput(const ImageSurface& input, std::chrono::nanoseconds* upload_time) const {
     if (const auto pixels = GetImagePixels(input)) {
+      using Clock = std::chrono::steady_clock;
+      const auto start = upload_time ? Clock::now() : Clock::time_point{};
       const auto row_bytes = RowBytes(input.image);
       const auto size = std::uint64_t(row_bytes) * input.image.size.height;
       if (size > std::numeric_limits<std::uint32_t>::max()) return BGFX_INVALID_HANDLE;
@@ -430,7 +458,9 @@ private:
       for (std::size_t row = 0; row < input.image.size.height; ++row) {
         std::memcpy(memory->data + row * row_bytes, bytes.data() + row * pixels->row_bytes, row_bytes);
       }
-      return CreateTexture(input.image, BGFX_TEXTURE_NONE, memory);
+      const auto texture = CreateTexture(input.image, BGFX_TEXTURE_NONE, memory);
+      if (upload_time) *upload_time += Clock::now() - start;
+      return texture;
     }
     return CreateTexture(input.image, BGFX_TEXTURE_NONE, nullptr, bridge_->GetTexture(input));
   }
@@ -451,7 +481,7 @@ private:
     return true;
   }
 
-  bool Encode(const Job& job) {
+  bool Encode(const Job& job, std::chrono::nanoseconds* upload_time) {
     const auto& plan = *job.request.plan;
     if (!EnsureSubcompositionTargets(plan.subcompositions.size())) return false;
     std::vector<bgfx::TextureHandle> handles;
@@ -463,7 +493,7 @@ private:
         handles.push_back(target->texture);
         return true;
       }
-      const auto handle = ImportInput(input);
+      const auto handle = ImportInput(input, upload_time);
       if (!bgfx::isValid(handle)) {
         for (auto texture : imported) Destroy(texture);
         return false;
@@ -556,6 +586,23 @@ private:
         bgfx::setUniform(input_flips_, flips.data());
         bgfx::setUniform(sampling_, uniforms.data(), uniforms.size());
         bgfx::setTexture(2, mask_sampler_, coverage, sampling.background ? kCoverageSamplerFlags : UINT32_MAX);
+        std::array<std::array<float, 4>, 5> depth_uniforms{};
+        auto depth_texture = color(draw.input_slot);
+        if (draw.depth_occlusion) {
+          const auto& depth = *draw.depth_occlusion;
+          const auto& uv = depth.target_to_depth_uv;
+          const auto& input = request.data_inputs[depth.depth_slot];
+          depth_uniforms[0] = {uv.m11, uv.m21, uv.translate_x, 1.0F / input.image.size.width};
+          depth_uniforms[1] = {uv.m12, uv.m22, uv.translate_y, 1.0F / input.image.size.height};
+          const auto& valid = depth.valid_uv;
+          const auto& target_region = depth.target_region;
+          depth_uniforms[2] = {valid.x, valid.y, valid.width, valid.height};
+          depth_uniforms[3] = {target_region.x, target_region.y, target_region.width, target_region.height};
+          depth_uniforms[4] = {depth.layer_depth_meters, flip(input.origin), 0, 0};
+          depth_texture = handles[external_colors + depth.depth_slot];
+        }
+        bgfx::setUniform(occlusion_, depth_uniforms.data(), depth_uniforms.size());
+        bgfx::setTexture(3, depth_sampler_, depth_texture, kSamplerFlags);
       }
       bgfx::setVertexBuffer(0, top_left_);
       std::uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_PT_TRISTRIP;
@@ -570,7 +617,7 @@ private:
   ImageDesc image_;
   std::unique_ptr<detail::BgfxTextureBridge> bridge_;
   bgfx::TextureHandle completion_ = BGFX_INVALID_HANDLE;
-  std::array<Target, 2> targets_{};
+  std::vector<Target> targets_;
   std::vector<Target> subcomposition_targets_;
   std::optional<Job> job_;
   std::uint64_t next_ticket_{1};
@@ -579,11 +626,13 @@ private:
   bgfx::UniformHandle sampler_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle incoming_sampler_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_sampler_ = BGFX_INVALID_HANDLE;
+  bgfx::UniformHandle depth_sampler_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle input_flips_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle input_alpha_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_parameters_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_region_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle sampling_ = BGFX_INVALID_HANDLE;
+  bgfx::UniformHandle occlusion_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle destination_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle off_diagonal_ = BGFX_INVALID_HANDLE;
   bgfx::VertexBufferHandle top_left_ = BGFX_INVALID_HANDLE;
@@ -593,11 +642,18 @@ private:
 
 } // namespace
 
+std::chrono::nanoseconds detail::PumpBgfxWithUploadTiming(RenderBackend& backend) {
+  std::chrono::nanoseconds upload_time{};
+  dynamic_cast<BgfxBackend&>(backend).Pump(&upload_time);
+  return upload_time;
+}
+
 std::unique_ptr<RenderBackend> detail::CreateBgfxBackend(ImageDesc target, const bgfx::Init& init,
                                                         std::unique_ptr<BgfxTextureBridge> bridge,
-                                                        const CompositeShaders* shaders) {
+                                                        const CompositeShaders* shaders, std::size_t output_slots) {
   if (!IsColor(target.format)) throw std::invalid_argument("The composite target must be RGBA8 or BGRA8");
-  auto backend = std::make_unique<BgfxBackend>(target, init, std::move(bridge));
+  if (output_slots == 0) throw std::invalid_argument("The compositor needs at least one output slot");
+  auto backend = std::make_unique<BgfxBackend>(target, init, std::move(bridge), output_slots);
   backend->Initialize(shaders ? *shaders : kCompositeShaders);
   return backend;
 }

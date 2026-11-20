@@ -33,6 +33,7 @@ enum class PixelFormat {
   Rgba8Unorm, ///< Color with red, green, blue, and alpha in byte order.
   Bgra8Unorm, ///< Color with blue, green, red, and alpha in byte order.
   R8Unorm,    ///< Single-channel normalized data such as mask coverage.
+  R32Float,   ///< Single-channel, 32-bit floating-point data such as metric depth.
 };
 
 /// @brief Origin of the first stored row. Layout coordinates use a top-left origin.
@@ -120,6 +121,16 @@ struct SourceSampling {
   bool operator==(const SourceSampling&) const = default;
 };
 
+/// @brief Tests a virtual layer against the camera depth registered to its source clip.
+struct DepthOcclusion {
+  std::uint32_t depth_slot;
+  Transform2D target_to_depth_uv; ///< Maps normalized target coordinates to logical depth UVs.
+  Rect valid_uv{0, 0, 1, 1};
+  Rect target_region{0, 0, 1, 1}; ///< Target area covered by the video that supplied depth.
+  float layer_depth_meters; ///< Positive optical-axis depth. Invalid scene samples hide the layer.
+  bool operator==(const DepthOcclusion&) const = default;
+};
+
 /// @brief One draw in a compositing pass.
 struct Draw {
   /// Color slot. Final draws can also address subcomposition outputs after the external color inputs.
@@ -131,6 +142,7 @@ struct Draw {
   /// Optional affine map applied to the rectangle in the same normalized coordinates.
   std::optional<Transform2D> transform;
   std::optional<SourceSampling> source_sampling;
+  std::optional<DepthOcclusion> depth_occlusion; ///< Applies to source-over draws.
   bool operator==(const Draw&) const = default;
 };
 

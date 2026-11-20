@@ -22,8 +22,18 @@ namespace huxerui::avkit {
 /// @brief Inspects a supported MP4 or MOV and returns its importable source tracks and ranges.
 AssetReference InspectTimelineMovie(const File& file);
 
-/// @brief Decoded picture, versioned resource, or prepared color surface bound to an input slot.
-using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::ColorSurface>;
+/// @brief Animated sticker instance sampled at a clip-local project time.
+struct AnimatedStickerSample {
+  ResourceRef resource;
+  media::MediaTimestamp elapsed;
+  AnimationPlayback playback;
+  InstanceId instance;
+  StickerReplacements replacements;
+  bool operator==(const AnimatedStickerSample&) const = default;
+};
+
+/// @brief Decoded picture, sticker resource sample, or prepared color surface bound to an input slot.
+using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::ColorSurface, AnimatedStickerSample>;
 
 /// @brief Prepares a decoded input on the compositor sequence.
 /// Throw PlatformVideoImportError when a platform video texture cannot be shared with the compositor.
@@ -38,6 +48,15 @@ struct TransitionMaskSample {
   /// @return Zero-based mask frame index.
   std::uint32_t FrameIndex(std::uint32_t frame_count) const;
   bool operator==(const TransitionMaskSample&) const = default;
+};
+
+/// @brief Two completed clip subcompositions to supply to an authored transition at the same project time.
+/// The compositor resolves the animation in place of the final draw's outgoing subcomposition slot.
+struct TransitionAnimationSample {
+  ResourceRef resource;
+  InstanceId instance;
+  media::MediaTimestamp offset, duration;
+  std::uint32_t outgoing_pass, incoming_pass; ///< Indices in RenderPlan::subcompositions.
 };
 
 /// @brief Coverage sequence sampled at an elapsed time on the owning clip's project clock.
@@ -56,10 +75,12 @@ struct TimelineFrame {
   std::shared_ptr<const render::RenderPlan> plan;
   std::vector<TimelineInput> inputs; ///< External color slots referenced by the render plan.
   std::vector<TransitionMaskSample> masks; ///< Animated transition masks resolved by the compositor.
-  /// Data slots contain analysis, static, clip animation, and transition masks in that order.
+  /// Data slots contain analysis masks, depth maps, static masks, clip animations, and transition masks in order.
   std::vector<render::ImageSurface> analysis_masks;
   std::vector<ResourceRef> static_masks; ///< Unique static mask resources in slot order.
   std::vector<AnimatedMaskSample> animated_masks; ///< Clip-local mask samples in slot order.
+  std::vector<render::ImageSurface> depth_maps; ///< Metric depth textures in slot order.
+  std::vector<TransitionAnimationSample> transition_animations;
 };
 
 /// @brief Samples one immutable revision on a worker sequence.
@@ -84,12 +105,12 @@ public:
   /// @param import Optionally prepares each visible video input. A rejected platform frame is retried from its
   /// exact source PTS on the software provider for that clip. When omitted, the compositor must fit decoded
   /// inputs to the project canvas with ImageFit::Contain. The plan uses the corresponding UV mapping.
-  /// @param mask_wait Per-job preview budget measured from submission. All visible mask jobs are submitted
-  /// before waiting. A timeout uses that clip's original image. Omit for offline sampling.
+  /// @param analysis_wait Per-job mask or depth budget measured from submission. All visible jobs are submitted
+  /// before waiting. A timeout keeps unmasked video or hides depth-bound stickers on the affected clip. Omit for offline sampling.
   /// @return Immutable plan and retained inputs. Required analysis is sampled at its exact source PTS.
   TimelineFrame SampleVideo(media::MediaTimestamp at, render::PixelFormat output = render::PixelFormat::Bgra8Unorm,
                             std::stop_token stop = {}, const ImportVideoFrame& import = {},
-                            std::optional<std::chrono::milliseconds> mask_wait = {});
+                            std::optional<std::chrono::milliseconds> analysis_wait = {});
   /// @brief Requests up to two video entries strictly inside the lookahead, ordered by entry time.
   /// Selects reverse clips and trimmed forward clips that enter outside a transition while another picture remains visible.
   /// Call on the sampling sequence. Providers must support concurrent Probe and Open for independent sessions.

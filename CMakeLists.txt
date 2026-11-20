@@ -43,6 +43,7 @@ if (AVKIT_ENABLE_FILE_MEDIA)
 endif ()
 
 option(AVKIT_ENABLE_NCNN "Build the ncnn CPU vision analysis provider" OFF)
+option(AVKIT_ENABLE_PAG "Build the libpag animation adapter" OFF)
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
@@ -89,4 +90,8 @@ endif ()
 
 if (AVKIT_ENABLE_NCNN)
     include(cmake/AVKitNCNN.cmake)
+endif ()
+
+if (AVKIT_ENABLE_PAG)
+    include(cmake/AVKitPAG.cmake)
 endif ()

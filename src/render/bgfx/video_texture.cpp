@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <array>
 #include <cmath>
 #include <span>
 #include <stdexcept>
@@ -47,12 +48,29 @@ struct Yuv {
   float y, u, v;
 };
 
+// BT.1886 display transfer for normalized SDR black and white, matching the platform BT.709 output.
+constexpr double kBt709DisplayGamma = 2.4;
+constexpr std::size_t kTransferSteps = 4096;
+
+const std::array<std::byte, kTransferSteps + 1>& Bt709ToSrgb() {
+  static const auto table = [] {
+    std::array<std::byte, kTransferSteps + 1> samples{};
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+      const auto linear = std::pow(double(i) / kTransferSteps, kBt709DisplayGamma);
+      const auto srgb = linear <= 0.0031308 ? 12.92 * linear : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+      samples[i] = std::byte(std::lround(srgb * 255));
+    }
+    return samples;
+  }();
+  return table;
+}
+
 float EncodeTransfer(std::byte sample, media::ColorTransfer transfer) {
   const float value = std::to_integer<unsigned>(sample) / 255.0F;
   if (transfer == media::ColorTransfer::SRGB || transfer == media::ColorTransfer::Unknown) return value;
   const float linear = value <= 0.04045F ? value / 12.92F : std::pow((value + 0.055F) / 1.055F, 2.4F);
   if (transfer == media::ColorTransfer::Linear) return linear;
-  return linear < 0.018F ? linear * 4.5F : 1.099F * std::pow(linear, 0.45F) - 0.099F;
+  return static_cast<float>(std::pow(linear, 1.0 / kBt709DisplayGamma));
 }
 
 detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSurface& surface,
@@ -203,7 +221,12 @@ detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::Vi
   const bool full = format.range == ColorRange::Full;
   const double kr = format.matrix == ColorMatrix::BT709 ? 0.2126 : 0.299;
   const double kb = format.matrix == ColorMatrix::BT709 ? 0.0722 : 0.114;
-  const auto byte = [](double value) { return std::byte(std::lround(std::clamp(value, 0., 1.) * 255)); };
+  const auto* transfer = format.transfer == ColorTransfer::BT709 ? &Bt709ToSrgb() : nullptr;
+  const auto byte = [transfer](double value) {
+    value = std::clamp(value, 0., 1.);
+    if (!transfer) return std::byte(std::lround(value * 255));
+    return (*transfer)[static_cast<std::size_t>(value * kTransferSteps + 0.5)];
+  };
 
   const auto stride = std::size_t(options.width) * 4;
   auto bytes = std::make_shared<Bytes>(stride * options.height);

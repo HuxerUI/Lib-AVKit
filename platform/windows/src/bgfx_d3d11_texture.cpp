@@ -103,6 +103,7 @@ private:
       case PixelFormat::Bgra8Unorm: return DXGI_FORMAT_B8G8R8A8_UNORM;
       case PixelFormat::Rgba8Unorm: return DXGI_FORMAT_R8G8B8A8_UNORM;
       case PixelFormat::R8Unorm: return DXGI_FORMAT_R8_UNORM;
+      case PixelFormat::R32Float: return DXGI_FORMAT_R32_FLOAT;
     }
     return DXGI_FORMAT_UNKNOWN;
   }
