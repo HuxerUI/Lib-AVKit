@@ -11,7 +11,7 @@
 #include <huxerui/macos/external_texture.h>
 #endif
 
-namespace huxerui::avkit { struct ProjectSnapshot; }
+namespace huxerui::avkit { struct MovieCodecProviders; struct ProjectSnapshot; }
 namespace huxerui::avkit::analysis { class AnalysisProvider; }
 
 namespace avkit_preview {
@@ -29,11 +29,13 @@ void ExportTimelinePreview(std::string_view project, std::string_view destinatio
 void VerifyTimelinePreview(std::string_view first, std::string_view second, std::string_view directory);
 void VerifyTimelineCodecs(std::string_view project, std::string_view directory);
 void VerifyTimelineTransition(std::string_view first, std::string_view second, std::string_view directory);
+huxerui::avkit::MovieCodecProviders TimelineProviders();
 
 #if defined(__OBJC__)
 class MovieRenderer;
 inline constexpr std::uint32_t kTimelinePreviewRate = 24;
 using TimelineSeek = std::function<std::optional<huxerui::media::MediaTimestamp>(huxerui::media::MediaTimestamp)>;
+enum class TimelinePreviewMode { Interactive, Once };
 
 struct TimelinePlaybackStats {
   std::size_t clocked_frames{};
@@ -42,14 +44,13 @@ struct TimelinePlaybackStats {
   std::uint64_t audio_underruns{};
 };
 
-huxerui::avkit::MovieCodecProviders TimelineProviders();
 void RenderTimelineSample(huxerui::avkit::TimelineSession& session, MovieRenderer& renderer,
                           huxerui::media::MediaTimestamp at, huxerui::macos::MetalTexture& mailbox,
                           std::stop_token stop = {});
 TimelinePlaybackStats PlayTimeline(huxerui::avkit::TimelineSession& session, huxerui::avkit::TimeRange range,
                                    MovieRenderer& renderer, huxerui::macos::MetalTexture& mailbox,
                                    huxerui::media::MediaTimestamp at, bool muted, const TimelineSeek& seek,
-                                   std::stop_token stop);
+                                   std::stop_token stop, TimelinePreviewMode mode = TimelinePreviewMode::Interactive);
 void ExportComposedTimeline(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, const huxerui::File& file,
                             const huxerui::avkit::MovieCodecProviders& providers, MovieRenderer& renderer,
                             huxerui::avkit::CodecPolicy policy, huxerui::avkit::OnCodecFallback on_fallback = {},

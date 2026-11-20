@@ -29,6 +29,7 @@ public:
   std::shared_ptr<const huxerui::camera::FrameObserver> Observer() const;
   std::shared_ptr<huxerui::ExternalTexture> Texture() const;
   LiveCaptureStatus Status() const;
+  void Close();
 
   void Start(huxerui::File file, huxerui::audio::AudioReader reader, huxerui::media::AudioFormat format);
   void SetRobotVoice(bool enabled);

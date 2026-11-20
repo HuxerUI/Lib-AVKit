@@ -39,10 +39,12 @@ cmake -S . -B build/core
 cmake --build build/core --target avkit_core
 ```
 
-Build the macOS preview with the file workflow. Point `PKG_CONFIG_PATH` at the target-compatible FFmpeg installation described in the [file workflow](docs/architecture.md#macos-file-media-milestone).
+The macOS workbench builds recording, file editing, export, PAG, and ncnn together. Place Lib-Camera next to Lib-AVKit or set `AVKIT_LIB_CAMERA_SOURCE_DIR`. Lib-Camera also requires Lib-AudioCapture. Point `PKG_CONFIG_PATH` at the target-compatible FFmpeg installation described in the [file workflow](docs/architecture.md#macos-file-media-milestone), and supply matching libpag headers and the macOS library.
 
 ```sh
-cmake -S examples/preview -B build/preview -DAVKIT_ENABLE_FILE_MEDIA=ON
+cmake -S examples/preview -B build/preview \
+  -DAVKIT_PAG_INCLUDE_DIR="/path/to/libpag/include" \
+  -DAVKIT_PAG_LIBRARY="/path/to/libpag.framework/libpag"
 cmake --build build/preview --target example_av_kit
 
 preview="$PWD/build/preview/example_av_kit.app/Contents/MacOS/example_av_kit"
@@ -54,8 +56,8 @@ All supported platforms build the bgfx compositor. Cross builds compile the pinn
 
 The [video texture API](include/huxerui/avkit/video_texture.h) accepts HuxerUI capture textures, Lib-Media platform decoder textures, and FFmpeg-decoded CPU planes. File preview and export retry a rejected decoder texture in FFmpeg at the same source PTS. Timeline rendering applies the same retry to the affected clip when supplied with an input importer. File and timeline export can restart with a CPU encoder when platform encoder transfer fails.
 
-`AVKIT_ENABLE_FILE_MEDIA` enables the file module and defaults to off. With file media enabled, `AVKIT_ENABLE_FFMPEG=OFF` builds the module with the Lib-Media adapter. The macOS camera and microphone example can be enabled separately with `AVKIT_ENABLE_CAPTURE_PREVIEW`. It uses Lib-Camera and Lib-AudioCapture alongside the bgfx and FFmpeg targets.
+For library builds, `AVKIT_ENABLE_FILE_MEDIA` adds the file module. With file media enabled, `AVKIT_ENABLE_FFMPEG=OFF` builds the module with the Lib-Media adapter.
 
-Set `AVKIT_ENABLE_NCNN=ON` to build `AVKit::NCNN`. The provider accepts verified [YuNet](models/yunet/2023mar) and [MediaPipe body and hand](models/mediapipe/body-hand) model packs through the [C++ factories](include/huxerui/avkit/ncnn.h). See the [tracking verification](docs/architecture.md#ncnn-body-and-hand-provider) for the macOS preview, seek, and export commands.
+For library builds, set `AVKIT_ENABLE_NCNN=ON` to add `AVKit::NCNN`. The provider accepts verified [YuNet](models/yunet/2023mar) and [MediaPipe body and hand](models/mediapipe/body-hand) model packs through the [C++ factories](include/huxerui/avkit/ncnn.h). See the [tracking verification](docs/architecture.md#ncnn-body-and-hand-provider) for the macOS preview, seek, and export commands.
 
 Portrait background replacement uses [MediaPipe Selfie Segmentation](models/mediapipe/selfie-segmentation) by default. Clips can select the optional [PP-HumanSegV2-Lite](models/paddle/pp-humansegv2-lite) pack independently. [Model selection and verification](docs/architecture.md#ncnn-portrait-segmentation)

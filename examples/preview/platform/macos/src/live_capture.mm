@@ -431,7 +431,10 @@ struct LiveCapture::Impl {
     state->changed.notify_one();
   })), worker([this](std::stop_token stop) { Render(stop); }) {}
 
-  ~Impl() {
+  ~Impl() { Close(); }
+
+  void Close() {
+    if (!worker.joinable()) return;
     worker.request_stop();
     inbox->changed.notify_all();
     worker.join();
@@ -509,6 +512,7 @@ struct LiveCapture::Impl {
 
 LiveCapture::LiveCapture() : impl_(std::make_unique<Impl>()) {}
 LiveCapture::~LiveCapture() = default;
+void LiveCapture::Close() { impl_->Close(); }
 
 std::shared_ptr<const camera::FrameObserver> LiveCapture::Observer() const { return impl_->observer; }
 std::shared_ptr<ExternalTexture> LiveCapture::Texture() const { return impl_->mailbox; }

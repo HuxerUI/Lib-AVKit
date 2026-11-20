@@ -61,12 +61,8 @@ const std::array kClipMaskFrames{&app::raw::masks_static_window_png, &app::raw::
                                  &app::raw::masks_sequence_corner_png};
 constexpr std::array kTrackingParts{analysis::TrackedPart::Face, analysis::TrackedPart::LeftHand,
                                     analysis::TrackedPart::RightHand};
-#if defined(AVKIT_PAG_PREVIEW)
 // Both clip outputs can remain leased while the caller retains the previous composite.
 constexpr std::size_t kMovieOutputSlots = 3;
-#else
-constexpr std::size_t kMovieOutputSlots = 2;
-#endif
 
 Resources OpenPreviewResources() {
   auto* directory = [NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"HuxerUI" isDirectory:YES];
@@ -74,13 +70,11 @@ Resources OpenPreviewResources() {
   return Resources::OpenPackage(File(directory.fileSystemRepresentation));
 }
 
-#if defined(AVKIT_PAG_PREVIEW)
 BufferReference ReadPreviewResource(const RawResource& asset) {
   auto resources = OpenPreviewResources();
   auto bytes = std::make_shared<Bytes>(resources.GetRawResource(asset).ReadBytes());
   return BufferReference(*bytes, bytes);
 }
-#endif
 
 } // namespace
 
@@ -126,9 +120,7 @@ struct MovieRenderer::Impl {
   ColorSurface Draw(const TimelineFrame& frame, PreviewPagTransitionTiming* timing) {
     @autoreleasepool {
       if (timing) *timing = {};
-#if defined(AVKIT_PAG_PREVIEW)
       ++pag_frame_;
-#endif
       std::vector<ColorSurface> inputs;
       inputs.reserve(frame.inputs.size());
       for (const auto& input : frame.inputs) {
@@ -137,18 +129,12 @@ struct MovieRenderer::Impl {
         } else if (const auto* surface = std::get_if<ColorSurface>(&input)) {
           inputs.push_back(*surface);
         } else if (const auto* animated = std::get_if<AnimatedStickerSample>(&input)) {
-#if defined(AVKIT_PAG_PREVIEW)
           inputs.push_back(SamplePagSticker(*animated));
-#else
-          throw std::runtime_error("The preview cannot resolve animated sticker: " + animated->resource.key);
-#endif
         } else {
           inputs.push_back(Sticker(std::get<ResourceRef>(input)));
         }
       }
-#if defined(AVKIT_PAG_PREVIEW)
       std::erase_if(pag_stickers_, [&](const auto& entry) { return entry.second.last_frame != pag_frame_; });
-#endif
       auto data = frame.analysis_masks;
       data.reserve(data.size() + frame.depth_maps.size() + frame.static_masks.size() + frame.animated_masks.size() + frame.masks.size());
       data.insert(data.end(), frame.depth_maps.begin(), frame.depth_maps.end());
@@ -156,18 +142,13 @@ struct MovieRenderer::Impl {
       for (const auto& sample : frame.animated_masks) data.push_back(AnimatedMaskTexture(sample));
       for (const auto& sample : frame.masks) data.push_back(TransitionMaskTexture(sample));
       if (!frame.transition_animations.empty()) {
-#if defined(AVKIT_PAG_PREVIEW)
         return DrawPagTransitions(frame, std::move(inputs), data, timing);
-#else
-        throw std::runtime_error("The preview cannot resolve an animated transition without PAG");
-#endif
       }
       return Render({frame.plan, std::move(inputs), std::move(data)});
     }
   }
 
 private:
-#if defined(AVKIT_PAG_PREVIEW)
   using Clock = std::chrono::steady_clock;
 
   static std::vector<ColorSurface> CompactColorInputs(RenderPlan& plan, std::span<const ColorSurface> inputs) {
@@ -270,7 +251,6 @@ private:
     cached->second.last_frame = pag_frame_;
     return cached->second.animation->Sample(sample.elapsed, sample.playback);
   }
-#endif
 
   const ColorSurface& Sticker(const ResourceRef& resource) {
     if (resource == PreviewStickerResource()) return sticker_;
@@ -456,11 +436,9 @@ private:
   std::array<std::optional<ImageSurface>, kPreviewWipeFrameCount> wipe_frames_;
   std::array<std::optional<ImageSurface>, 2> static_masks_;
   std::optional<std::array<ImageSurface, kClipMaskFrames.size()>> animated_masks_;
-#if defined(AVKIT_PAG_PREVIEW)
   std::unordered_map<std::uint64_t, CachedPagSticker> pag_stickers_;
   std::unordered_map<std::uint64_t, std::unique_ptr<PagTransition>> pag_transitions_;
   std::uint64_t pag_frame_{};
-#endif
 };
 
 MovieRenderer::MovieRenderer(PixelSize size) : impl_(std::make_unique<Impl>(size)) {}
@@ -507,7 +485,6 @@ const ResourceRef& PreviewStickerResource() {
   return resource;
 }
 
-#if defined(AVKIT_PAG_PREVIEW)
 const ResourceRef& PreviewPagStickerResource() {
   static const ResourceRef resource{"avkit.preview", "1", "pag-like"};
   return resource;
@@ -557,7 +534,6 @@ std::unique_ptr<PagAnimation> OpenPreviewPagSticker(const ResourceRef& resource,
   }
   return std::make_unique<PagAnimation>(encoded, texts, images);
 }
-#endif
 
 const ResourceRef& TrackingStickerResource(analysis::TrackedPart part) {
   static const std::array<ResourceRef, kTrackingParts.size()> resources{{

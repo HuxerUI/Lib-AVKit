@@ -121,7 +121,7 @@ void RenderTimelineSample(TimelineSession& session, MovieRenderer& renderer, Med
 
 TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, MovieRenderer& renderer,
                                    MetalTexture& mailbox, MediaTimestamp at, bool muted, const TimelineSeek& seek,
-                                   std::stop_token stop) {
+                                   std::stop_token stop, TimelinePreviewMode mode) {
   auto pcm = session.PcmFormat();
   auto end = ToGrid(range.end, pcm.sample_rate);
   auto next = ToGrid(at, pcm.sample_rate);
@@ -250,13 +250,14 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
           progressed = true;
         }
       }
+      if (mode == TimelinePreviewMode::Once && state.state == PlaybackState::Ended) break;
       if (progressed || state.state == PlaybackState::Ended) last_progress = std::chrono::steady_clock::now();
       else if (std::chrono::steady_clock::now() - last_progress > 15s) throw std::runtime_error("Timeline playback stalled");
       if (!progressed) std::this_thread::sleep_for(2ms);
     }
   }
   stats.audio_underruns = retired_underruns + playback.Snapshot().audio_underruns;
-  mailbox.Finish();
+  if (mode == TimelinePreviewMode::Interactive) mailbox.Finish();
   return stats;
 }
 

@@ -53,6 +53,8 @@ private:
 inline constexpr std::uint32_t kStripClock = 192;
 StripViewport VisibleStrip(const huxerui::avkit::ProjectSnapshot& project, std::int64_t left, unsigned zoom);
 huxerui::ImageAsset EncodeStripThumbnail(const huxerui::media::VideoFrame& frame, huxerui::avkit::PixelSize size);
+void PaintTimelineStrip(huxerui::PaintContext& paint, huxerui::Size size,
+                        const huxerui::avkit::ProjectSnapshot& project, const StripResult& strip);
 
 struct StripPreviewOptions {
   huxerui::avkit::Project project;

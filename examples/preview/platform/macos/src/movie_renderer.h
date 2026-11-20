@@ -46,7 +46,6 @@ private:
 
 huxerui::media::VideoEncoderConfig PreviewVideoConfig(huxerui::avkit::PixelSize size);
 const huxerui::avkit::ResourceRef& PreviewStickerResource();
-#if defined(AVKIT_PAG_PREVIEW)
 const huxerui::avkit::ResourceRef& PreviewPagStickerResource();
 const huxerui::avkit::ResourceRef& PreviewEditablePagResource();
 const huxerui::avkit::ResourceRef& PreviewPagImageResource();
@@ -55,7 +54,6 @@ std::unique_ptr<huxerui::avkit::PagTransition> OpenPreviewPagTransition(huxerui:
 std::unique_ptr<huxerui::avkit::PagAnimation> OpenPreviewPagSticker(
     const huxerui::avkit::ResourceRef& resource = PreviewPagStickerResource(),
     const huxerui::avkit::StickerReplacements& replacements = {});
-#endif
 const huxerui::avkit::ResourceRef& TrackingStickerResource(huxerui::avkit::analysis::TrackedPart part);
 const huxerui::avkit::ResourceRef& PreviewWipeResource();
 const std::array<huxerui::avkit::ResourceRef, 2>& PreviewStaticMaskResources();

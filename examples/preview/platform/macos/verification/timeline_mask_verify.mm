@@ -6,14 +6,12 @@
 #include "timeline_preview.h"
 #include "verification/tracking_fixture.h"
 
-#if defined(AVKIT_NCNN_PREVIEW)
 #include "timeline_tracking_verify.h"
 #include "verification/codec_verification.h"
 
 #include <future>
 #include <map>
 #include <huxerui/avkit/ncnn.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -415,7 +413,6 @@ void VerifyTimelineMasks(std::string_view directory) {
   }
 }
 
-#if defined(AVKIT_NCNN_PREVIEW)
 namespace {
 
 constexpr int kRealFrames = 41, kMainStart = 2, kInsetStart = 8;
@@ -879,6 +876,5 @@ void VerifyTimelineNcnnMasks(std::string_view source, std::string_view model_dir
               << "Reimport: exact PTS, " << pcm << " PCM samples, worst mean channel error " << worst << " / 255\n";
   }
 }
-#endif
 
 } // namespace avkit_preview

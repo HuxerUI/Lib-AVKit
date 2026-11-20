@@ -1357,12 +1357,10 @@ The file preview and export both execute the two-layer BGRA8 bgfx plan. On macOS
 
 Build the optional file target with a current Lib-Media source checkout next to Lib-AVKit, or set `AVKIT_LIB_MEDIA_SOURCE_DIR`. Point `PKG_CONFIG_PATH` at an FFmpeg build with `libavcodec` 60 or later, `libavutil` 58 or later, and `libswresample`. The build must enable H.264 and AAC decoders, the AAC encoder, and the `libx264` encoder. The verification build uses FFmpeg 8.1.3 and the GPL `libx264` option. The build and OS compatibility of that dependency are part of the application's distribution configuration. Set `AVKIT_ENABLE_FFMPEG=OFF` for a Lib-Media-only library build. [FFmpeg release archives](https://ffmpeg.org/download.html)
 
-Run the commands from the repository root and use a fresh path for each MP4 destination.
+Build the macOS workbench with the [dependencies in the README](../README.md#build). Run the commands from the repository root and use a fresh path for each MP4 destination.
 
 ```sh
-export PKG_CONFIG_PATH="/path/to/ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-cmake -S examples/preview -B build/file-media -G Ninja -DCMAKE_BUILD_TYPE=Debug -DAVKIT_ENABLE_FILE_MEDIA=ON
-cmake --build build/file-media --target example_av_kit
+mkdir -p build/file-media
 
 ffmpeg -f lavfi -i "color=c=blue:s=320x180:r=24:d=2.5,drawbox=x=16:y=12:w=94:h=66:color=red:t=fill:enable='between(t,1,1.25)'" \
   -f lavfi -i 'aevalsrc=if(between(t\,1\,1.25)\,0.5*sin(2*PI*440*t)\,0):s=48000:d=2.5' \
@@ -1371,7 +1369,7 @@ ffmpeg -f lavfi -i "color=c=blue:s=320x180:r=24:d=2.5,drawbox=x=16:y=12:w=94:h=6
   -color_primaries bt709 -color_trc bt709 -colorspace bt709 -c:a aac -ar 48000 -b:a 96k \
   -shortest build/file-media/fixture.mp4
 
-preview=build/file-media/example_av_kit.app/Contents/MacOS/example_av_kit
+preview=build/preview/example_av_kit.app/Contents/MacOS/example_av_kit
 MTL_DEBUG_LAYER=1 "$preview" --media-verify build/file-media/fixture.mp4 build/file-media/verified.mp4
 "$preview" --media-export build/file-media/fixture.mp4 build/file-media/export.mp4
 "$preview" --media-preview build/file-media/fixture.mp4 1.025
@@ -1387,14 +1385,11 @@ For an AVKit recording, attach one AudioCapture reader and require `CoreMediaHos
 
 `WriteLiveMovie` uses the same `CodecProvider` negotiation, MP4 interleaving, AAC trim, and temporary destination as file export. The live writer can select a software provider before consuming capture. A failure during single-file live encoding reports an interruption and discards the temporary destination. [File media API](../include/huxerui/avkit/file_movie.h)
 
-Configure the preview with the FFmpeg dependencies from the file milestone. This example also requires the Lib-Camera checkout containing `FrameObservation` and its Lib-AudioCapture dependency. Run from the repository root and use fresh output directories.
+Use the [macOS workbench build](../README.md#build) and a Lib-Camera checkout containing `FrameObservation`. Run from the repository root and use fresh output directories.
 
 ```sh
-cmake -S examples/preview -B build/capture-preview -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DAVKIT_ENABLE_FILE_MEDIA=ON -DAVKIT_ENABLE_FFMPEG=ON -DAVKIT_ENABLE_CAPTURE_PREVIEW=ON
-cmake --build build/capture-preview --target example_av_kit
-
-app="$PWD/build/capture-preview/example_av_kit.app"
+mkdir -p build/capture-preview
+app="$PWD/build/preview/example_av_kit.app"
 open -W -n "$app" --stdout "$PWD/build/capture-preview/camera.log" \
   --stderr "$PWD/build/capture-preview/camera.log" --args --verify-camera "$PWD/build/capture-preview/camera"
 open -W -n "$app" --stdout "$PWD/build/capture-preview/live.log" \
@@ -1537,7 +1532,7 @@ The verifier generates two crossing figures in a 24 fps H.264/AAC fixture. A for
 
 The first valid picture fixes the reference for the session. An empty or ambiguous reference leaves the session without a subject. Later samples need one eligible face and a close match to the eye-aligned luma patch from the reference. Each comparison uses that same reference, so requesting a target in a different playback order gives the same result for the same clip trim and input format. This selection heuristic is for a single subject. It can hide the sticker when the subject changes pose or lighting significantly. Run model inference and completion on the session's worker sequence. Cancellation skips the result before or after inference.
 
-Build the macOS preview with `-DCMAKE_BUILD_TYPE=Release -DAVKIT_ENABLE_FILE_MEDIA=ON -DAVKIT_ENABLE_NCNN=ON` and use a fresh output directory.
+Use a Release build of the [macOS workbench](../README.md#build) and a fresh output directory.
 
 ```sh
 app="$PWD/build/preview/example_av_kit.app"
@@ -1668,13 +1663,9 @@ work="$PWD/build/depth-occlusion-check"
 
 ### PAG sticker verification
 
-Enable `AVKIT_ENABLE_PAG` and provide the C++ headers and target library from the same libpag release. The verified SDK is v4.5.102. On macOS, use the library executable inside the selected `libpag.framework`. The preview build embeds that framework. On Android, link the ABI-specific `libpag.so` and package the matching AAR so its Java initialization and `libffavc.so` are available in the application process. [libpag v4.5.102](https://github.com/Tencent/libpag/releases/tag/v4.5.102)
+Provide the C++ headers and target library from the same libpag release. The verified SDK is v4.5.102. On macOS, use the library executable inside the selected `libpag.framework`. The workbench embeds that framework. For Android library builds, enable `AVKIT_ENABLE_PAG`, link the ABI-specific `libpag.so`, and package the matching AAR so its Java initialization and `libffavc.so` are available in the application process. [libpag v4.5.102](https://github.com/Tencent/libpag/releases/tag/v4.5.102)
 
 ```sh
-cmake -S examples/preview -B build/preview -DAVKIT_ENABLE_FILE_MEDIA=ON \
-  -DAVKIT_ENABLE_PAG=ON -DAVKIT_PAG_INCLUDE_DIR="/path/to/libpag/include" \
-  -DAVKIT_PAG_LIBRARY="/path/to/libpag.framework/libpag"
-cmake --build build/preview --target example_av_kit
 app="$PWD/build/preview/example_av_kit.app"
 preview="$app/Contents/MacOS/example_av_kit"
 project="$PWD/build/animated-template-mask-check/animated-masks.avkit"

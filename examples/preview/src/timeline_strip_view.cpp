@@ -24,7 +24,9 @@ struct StripPosition {
 
 constexpr float kTrackHeight = 52.0F;
 
-void PaintStrip(PaintContext& paint, Size size, const ProjectSnapshot& project, const StripResult& strip) {
+} // namespace
+
+void PaintTimelineStrip(PaintContext& paint, Size size, const ProjectSnapshot& project, const StripResult& strip) {
   const auto begin = Seconds(strip.viewport.range.start), end = Seconds(strip.viewport.range.end);
   const auto x = [&](MediaTimestamp at) { return float(std::clamp((Seconds(at) - begin) / (end - begin), 0.0, 1.0) * size.width); };
   const auto row = [&](TrackId track) {
@@ -48,8 +50,6 @@ void PaintStrip(PaintContext& paint, Size size, const ProjectSnapshot& project, 
     }
   }
 }
-
-} // namespace
 
 [[huxerui::composable]] View TimelineStripPreview(std::shared_ptr<ExternalTexture> picture) {
   const auto options = TimelineStripOptions();
@@ -102,7 +102,7 @@ void PaintStrip(PaintContext& paint, Size size, const ProjectSnapshot& project, 
   return Column {
     Image(picture).Fit(ImageFit::Contain).With(Grow()),
     Canvas([project, current, ready](PaintContext& paint, Size size) {
-      if (ready) PaintStrip(paint, size, *project, *current);
+      if (ready) PaintTimelineStrip(paint, size, *project, *current);
       else paint.DrawRect({0, 0, size.width, size.height}, Color::Rgb(27, 34, 43));
     }).On<ViewEvents::ScrollInput>([scroll](const ScrollInputEvent& event) {
       const auto delta = event.delta_x == 0 ? event.delta_y : event.delta_x;

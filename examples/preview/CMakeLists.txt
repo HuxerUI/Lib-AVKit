@@ -19,12 +19,17 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
-set(APP_SOURCE_FILES src/app.cpp)
+set(APP_SOURCE_FILES
+        src/app.cpp
+        src/workbench.cpp
+        src/workbench_editor.cpp
+        src/workbench_project.cpp
+)
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     if (WIN32)
         list(APPEND APP_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/main.cpp")
     elseif (APPLE AND NOT IOS)
-        list(APPEND APP_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/src/main.cpp")
+        list(APPEND APP_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/main.cpp")
     elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND APP_SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/main.cpp")
     endif ()
@@ -46,88 +51,90 @@ huxerui_add_app(example_av_kit
 
 huxerui_configure_project_app(example_av_kit)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(AVKIT_ENABLE_FILE_MEDIA ON)
+    set(AVKIT_ENABLE_FFMPEG ON)
+    set(AVKIT_ENABLE_PAG ON)
+    set(AVKIT_ENABLE_NCNN ON)
+endif ()
+
 huxerui_use_library(example_av_kit
         TARGET HuxerUI::AVKit
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    option(AVKIT_ENABLE_CAPTURE_PREVIEW "Build the macOS camera and microphone example" OFF)
-    if (AVKIT_ENABLE_CAPTURE_PREVIEW)
-        set(AVKIT_LIB_CAMERA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../Lib-Camera"
-                CACHE PATH "Lib-Camera source checkout")
-        huxerui_use_library(example_av_kit TARGET HuxerUI::Camera PATH "${AVKIT_LIB_CAMERA_SOURCE_DIR}")
-        if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-            if (NOT TARGET AVKit::FFmpeg)
-                message(FATAL_ERROR "The capture example requires the FFmpeg adapter")
-            endif ()
-            target_compile_definitions(example_av_kit PRIVATE AVKIT_CAPTURE_PREVIEW=1)
-        endif ()
-    endif ()
+    set(AVKIT_LIB_CAMERA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../Lib-Camera"
+            CACHE PATH "Lib-Camera source checkout")
+    huxerui_use_library(example_av_kit TARGET HuxerUI::Camera PATH "${AVKIT_LIB_CAMERA_SOURCE_DIR}")
 endif ()
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
 
+target_include_directories(example_av_kit PRIVATE src)
+
+if (IOS)
+    # Include the existing resource-free static targets in the HuxerUI iOS app archive.
+    get_target_property(avkit_core_target AVKit::Core ALIASED_TARGET)
+    get_target_property(avkit_flecs_target flecs::flecs_static ALIASED_TARGET)
+    set_property(TARGET ${avkit_core_target} ${avkit_flecs_target} PROPERTY HUXERUI_LIBRARY TRUE)
+    huxerui_use_library(example_av_kit TARGET AVKit::Core)
+    huxerui_use_library(example_av_kit TARGET flecs::flecs_static)
+endif ()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJCXX)
-    target_sources(example_av_kit PRIVATE src/sticker_scene.cpp platform/macos/src/metal_preview.mm)
+    target_sources(example_av_kit PRIVATE
+            src/capture.cpp
+            src/sticker_scene.cpp
+            src/timeline_strip.cpp
+            src/timeline_strip_view.cpp
+            src/verification/tracking_fixture.cpp
+            platform/macos/src/file_preview.mm
+            platform/macos/src/live_capture.mm
+            platform/macos/src/media_commands.cpp
+            platform/macos/src/metal_preview.mm
+            platform/macos/src/movie_renderer.mm
+            platform/macos/src/timeline_preview.mm
+            platform/macos/src/timeline_strip_macos.mm
+            platform/macos/src/workbench_media.cpp
+            platform/macos/src/workbench_player.mm
+            platform/macos/verification/timeline_depth_verify.mm
+            platform/macos/verification/timeline_mask_verify.mm
+            platform/macos/verification/timeline_ncnn_verify.mm
+            platform/macos/verification/timeline_pag_verify.mm
+            platform/macos/verification/timeline_strip_verify.mm
+            platform/macos/verification/timeline_template_mask_verify.mm
+            platform/macos/verification/timeline_tracking_verify.mm
+            platform/macos/verification/timeline_verify.mm
+    )
     set_target_properties(example_av_kit PROPERTIES
             OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF
     )
     target_include_directories(example_av_kit PRIVATE
-            src
             platform/macos/src
+            platform/macos/verification
             "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/macos/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
     )
-    target_compile_definitions(example_av_kit PRIVATE AVKIT_MACOS_PREVIEW=1)
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    if (TARGET AVKit::FFmpeg)
-        target_sources(example_av_kit PRIVATE
-                src/timeline_strip.cpp
-                src/timeline_strip_view.cpp
-                src/verification/tracking_fixture.cpp
-                platform/macos/src/file_preview.mm
-                platform/macos/src/movie_renderer.mm
-                platform/macos/src/timeline_preview.mm
-                platform/macos/src/timeline_strip_macos.mm
-                platform/macos/verification/timeline_strip_verify.mm
-                platform/macos/verification/timeline_mask_verify.mm
-                platform/macos/verification/timeline_depth_verify.mm
-                platform/macos/verification/timeline_template_mask_verify.mm
-                platform/macos/verification/timeline_tracking_verify.mm
-                platform/macos/verification/timeline_verify.mm
-        )
-        target_include_directories(example_av_kit PRIVATE
-                platform/macos/verification
-                "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
-        )
-        target_compile_definitions(example_av_kit PRIVATE AVKIT_FILE_MEDIA=1)
-        target_link_libraries(example_av_kit PRIVATE AVKit::FFmpeg "-framework CoreImage" "-framework ImageIO")
-        if (TARGET AVKit::PAG)
-            target_sources(example_av_kit PRIVATE platform/macos/verification/timeline_pag_verify.mm)
-            target_compile_definitions(example_av_kit PRIVATE AVKIT_PAG_PREVIEW=1)
-            target_link_libraries(example_av_kit PRIVATE AVKit::PAG)
-            if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
-                set(avkit_pag_framework "${CMAKE_MATCH_1}")
-                get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
-                set_property(TARGET example_av_kit APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
-                add_custom_command(TARGET example_av_kit POST_BUILD
-                        COMMAND /usr/bin/ditto "${avkit_pag_framework}"
-                            "$<TARGET_BUNDLE_DIR:example_av_kit>/Contents/Frameworks/${avkit_pag_framework_name}"
-                        VERBATIM)
-            endif ()
-        endif ()
-        if (TARGET AVKit::NCNN)
-            target_sources(example_av_kit PRIVATE platform/macos/verification/timeline_ncnn_verify.mm)
-            target_compile_definitions(example_av_kit PRIVATE AVKIT_NCNN_PREVIEW=1)
-            target_link_libraries(example_av_kit PRIVATE AVKit::NCNN)
-        endif ()
-        if (AVKIT_ENABLE_CAPTURE_PREVIEW)
-            target_sources(example_av_kit PRIVATE src/capture.cpp platform/macos/src/live_capture.mm)
-        endif ()
+    target_link_libraries(example_av_kit PRIVATE
+            AVKit::FFmpeg AVKit::PAG AVKit::NCNN "-framework CoreImage" "-framework ImageIO")
+    if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
+        set(avkit_pag_framework "${CMAKE_MATCH_1}")
+        get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
+        set_property(TARGET example_av_kit APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
+        add_custom_command(TARGET example_av_kit POST_BUILD
+                COMMAND /usr/bin/ditto "${avkit_pag_framework}"
+                    "$<TARGET_BUNDLE_DIR:example_av_kit>/Contents/Frameworks/${avkit_pag_framework_name}"
+                VERBATIM)
     endif ()
 else ()
-    target_sources(example_av_kit PRIVATE src/bgfx_preview.cpp)
+    target_sources(example_av_kit PRIVATE
+            src/bgfx_preview.cpp
+            src/capture_unavailable.cpp
+            src/workbench_media_unavailable.cpp
+    )
 endif ()
