@@ -133,7 +133,28 @@ struct TransitionInfo {
   bool operator==(const TransitionInfo&) const = default;
 };
 
-/// @brief Portrait coverage over a solid background.
+/// @brief A versioned static coverage mask in oriented, pre-mirror source space.
+struct StaticMask {
+  ResourceRef resource;
+  bool inverted{};
+  bool operator==(const StaticMask&) const = default;
+};
+
+/// @brief Playback at the end of a clip mask sequence.
+enum class MaskPlayback {
+  HoldLast, ///< Retains the last frame for the rest of the clip.
+  Loop,     ///< Restarts at the exact sequence duration.
+};
+
+/// @brief A versioned coverage sequence sampled from the clip's project-time start.
+struct AnimatedMask {
+  ResourceRef resource;
+  MaskPlayback playback{MaskPlayback::HoldLast};
+  bool inverted{};
+  bool operator==(const AnimatedMask&) const = default;
+};
+
+/// @brief Clip coverage over a solid or transparent background.
 struct BackgroundReplacement {
   Color color;
   /// The rectangle fills the clip destination. Coordinates refer to the oriented, pre-mirror source.
@@ -141,6 +162,10 @@ struct BackgroundReplacement {
   bool mirrored{};
   /// Stable portrait model ID. An empty value selects the provider's default.
   std::string model_id;
+  /// Selects packaged coverage in place of portrait analysis while bound.
+  /// Bind at most one packaged mask.
+  std::optional<StaticMask> static_mask;
+  std::optional<AnimatedMask> animated_mask;
   bool operator==(const BackgroundReplacement&) const = default;
 };
 
@@ -193,8 +218,10 @@ public:
   void SetClip(ClipId clip, ClipPlacement placement);
   /// @brief Sets normalized canvas bounds for a clip.
   void SetLayout(ClipId clip, Rect destination);
-  /// @brief Sets or removes a visual clip's background replacement and model selection.
+  /// @brief Sets or removes a visual clip's background and its coverage source.
   void SetBackground(ClipId clip, std::optional<BackgroundReplacement> background);
+  /// @brief Rebinds an existing packaged mask on this clip while preserving its playback and inversion.
+  void SetBackgroundMaskResource(ClipId clip, ResourceRef resource);
   /// @brief Attaches an independently editable sticker to a visual clip.
   InstanceId AddSticker(ClipId clip, StickerSpec spec);
   /// @brief Sets an instance's bounds in its clip or anchor coordinates.

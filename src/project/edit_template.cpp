@@ -55,8 +55,9 @@ EditTemplatePlan PlanEditTemplate(const Project& project, const EditTemplateReci
         if (source == asset.source.tracks.end()) throw std::invalid_argument("Incompatible template slot: " + clip.slot);
         const TimeRange range{detail::Add(source->presentation.start, clip.source.start),
                               detail::Add(source->presentation.start, clip.source.end)};
-        const auto id = edit.InsertClip(track_id, {{asset.id, source->id, range}, clip.timeline});
+        const auto id = edit.InsertClip(track_id, {{asset.id, source->id, range, clip.reverse}, clip.timeline});
         edit.SetLayout(id, clip.destination);
+        if (clip.background) edit.SetBackground(id, clip.background);
         for (const auto& sticker : clip.stickers) edit.AddSticker(id, sticker);
       }
     }

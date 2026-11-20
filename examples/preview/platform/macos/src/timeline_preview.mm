@@ -26,6 +26,8 @@ using namespace huxerui::media;
 using huxerui::macos::MetalTexture;
 
 constexpr auto kPreviewPcmCapacity = 250ms;
+constexpr auto kVideoPrerollLookahead = 400ms;
+constexpr auto kMaxPcmClockLead = 150ms;
 constexpr double kMaxPreviewLagMs = 100;
 
 template<class T, class E> T Require(Result<T, E> result) {
@@ -38,6 +40,55 @@ MediaTimestamp ToGrid(MediaTimestamp value, std::uint32_t rate) {
   if (!converted) throw std::invalid_argument("Timeline preview has an invalid playback time");
   return *converted;
 }
+
+double VideoLagMs(MediaTimestamp clock, MediaTimestamp video) {
+  return 1000.0 * (clock.ticks - ToGrid(video, clock.timescale).ticks) / clock.timescale;
+}
+
+class PreviewAudioClock {
+public:
+  explicit PreviewAudioClock(MediaTimestamp start) : start_(start) {}
+
+  void Reset(MediaTimestamp at) {
+    start_ = at;
+    anchor_.reset();
+  }
+
+  std::optional<MediaTimestamp> Read(const PlaybackSnapshot& state) {
+    if (!state.position) return {};
+    const auto confirmed = *state.position;
+    if (state.state != PlaybackState::Playing || state.audio_buffered_duration.ticks <= 0) {
+      Reset(confirmed);
+      return confirmed;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!anchor_) {
+      if (confirmed == start_) return confirmed;
+      anchor_ = Anchor{confirmed.ticks, now};
+    }
+    // Device completions can arrive in batches. Pace video between them within the accepted PCM.
+    const auto lead = std::min<std::int64_t>(state.audio_buffered_duration.ticks,
+                                            kMaxPcmClockLead.count() * confirmed.timescale / 1000);
+    const auto elapsed = std::chrono::duration<double>(now - anchor_->wall).count();
+    const auto advance = std::min(elapsed * confirmed.timescale, double(confirmed.ticks + lead - anchor_->ticks));
+    const auto estimate = anchor_->ticks + static_cast<std::int64_t>(advance);
+    if (estimate < confirmed.ticks) {
+      anchor_ = Anchor{confirmed.ticks, now};
+      return confirmed;
+    }
+    return MediaTimestamp{estimate, confirmed.timescale};
+  }
+
+private:
+  struct Anchor {
+    std::int64_t ticks;
+    std::chrono::steady_clock::time_point wall;
+  };
+
+  MediaTimestamp start_;
+  std::optional<Anchor> anchor_;
+};
 
 struct PreviewOptions {
   std::shared_ptr<const ProjectSnapshot> project;
@@ -84,8 +135,20 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
   };
   auto playback = open_playback(pcm);
   auto epoch = playback.Epoch();
-  RenderTimelineSample(session, renderer, at, mailbox, stop);
   auto presented = at;
+  PreviewAudioClock audio_clock(next);
+  const auto samples_for = [&](std::chrono::milliseconds duration) {
+    return (duration.count() * pcm.sample_rate + 999) / 1000;
+  };
+  const auto preroll_end = [&](MediaTimestamp anchor) {
+    return MediaTimestamp{anchor.ticks + std::min<std::int64_t>(samples_for(kVideoPrerollLookahead), end.ticks - anchor.ticks),
+                          pcm.sample_rate};
+  };
+  const auto preroll = [&](MediaTimestamp clock) {
+    const auto until = preroll_end(ToGrid(clock, pcm.sample_rate));
+    if (presented.Compare(until) == -1) session.PrerollVideoEntries({presented, until}, stop);
+  };
+  RenderTimelineSample(session, renderer, at, mailbox, stop);
   std::optional<AudioFrame> sound;
   bool sealed = false;
   bool play_requested = false;
@@ -95,11 +158,11 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
   std::uint64_t retired_underruns = 0;
 
   const auto refill = [&](MediaTimestamp buffered) {
-    const std::int64_t capacity = (kPreviewPcmCapacity.count() * pcm.sample_rate + 999) / 1000;
+    const auto queue_capacity = samples_for(kPreviewPcmCapacity);
     const auto remaining = end.ticks - next.ticks;
-    const auto count = std::min(remaining, capacity - buffered.ticks);
+    const auto count = std::min(remaining, queue_capacity - buffered.ticks);
     // Fill the available window before video can hold the producer through another decode or render.
-    if (!sound && remaining > 0 && count >= std::min<std::int64_t>({1024, capacity, remaining}))
+    if (!sound && remaining > 0 && count >= std::min<std::int64_t>({1024, queue_capacity, remaining}))
       sound = session.SampleAudio(next, static_cast<std::uint32_t>(count));
     bool submitted = false;
     if (sound && Require(playback.TrySubmitAudio(epoch, *sound)) == SubmitStatus::Accepted) {
@@ -114,6 +177,7 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
     if (submitted && !play_requested) {
       Require(playback.Play());
       play_requested = true;
+      preroll(presented);
     }
     return submitted || sealed;
   };
@@ -141,12 +205,13 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
           } else {
             epoch = Require(playback.Reset());
           }
-          session.Seek(*requested);
+          session.Seek(*requested, preroll_end(anchor));
           sound.reset();
           sealed = false;
           play_requested = false;
           position.reset();
           next = anchor;
+          audio_clock.Reset(anchor);
           RenderTimelineSample(session, renderer, *requested, mailbox, stop);
           presented = *requested;
           last_progress = std::chrono::steady_clock::now();
@@ -158,22 +223,29 @@ TimelinePlaybackStats PlayTimeline(TimelineSession& session, TimeRange range, Mo
           state = playback.Snapshot();
         }
       }
-      if (state.position && (state.state == PlaybackState::Playing || state.state == PlaybackState::Ended)) {
-        auto draw_at = ToGrid(*state.position, kTimelinePreviewRate);
-        if (draw_at.Compare(*state.position) == 1 || draw_at.Compare(range.end) >= 0) --draw_at.ticks;
+      const auto clock = audio_clock.Read(state);
+      if (clock && (state.state == PlaybackState::Playing || state.state == PlaybackState::Ended)) {
+        auto draw_at = ToGrid(*clock, kTimelinePreviewRate);
+        if (draw_at.Compare(*clock) == 1 || draw_at.Compare(range.end) >= 0) --draw_at.ticks;
+        if (progressed || draw_at.Compare(presented) == 1) preroll(*clock);
         if (draw_at.Compare(presented) == 1 && draw_at.Compare(range.end) == -1) {
+          auto following = ToGrid(presented, kTimelinePreviewRate);
+          if (following.Compare(presented) != 1) ++following.ticks;
+          // Keep the next due frame when it still has time to render after a clock update.
+          if (following.Compare(draw_at) == -1 &&
+              VideoLagMs(*clock, following) < kMaxPreviewLagMs - 1000.0 / kTimelinePreviewRate) draw_at = following;
           const auto surface = DrawTimelineSample(session, renderer, draw_at, stop);
-          const auto clock = playback.Snapshot().position.value_or(*state.position);
-          const auto frame_on_pcm_clock = ToGrid(draw_at, clock.timescale);
-          const auto lag = 1000.0 * (clock.ticks - frame_on_pcm_clock.ticks) / clock.timescale;
-          if (lag < kMaxPreviewLagMs) {
+          const auto after = playback.Snapshot();
+          const auto current = audio_clock.Read(after).value_or(*clock);
+          const auto lag = VideoLagMs(current, draw_at);
+          if (lag >= kMaxPreviewLagMs) {
+            // Keep the last publication until a current frame can catch up with the PCM clock.
+            ++stats.late_video_frames;
+          } else if (lag >= 0 || after.state == PlaybackState::Playing) {
             PublishPreviewSurface(mailbox, surface);
             stats.maximum_video_lag_ms = std::max(stats.maximum_video_lag_ms, lag);
             ++stats.clocked_frames;
             presented = draw_at;
-          } else {
-            // Keep the last publication until a current frame can catch up with the PCM clock.
-            ++stats.late_video_frames;
           }
           progressed = true;
         }

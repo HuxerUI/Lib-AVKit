@@ -48,6 +48,13 @@ bool Recoverable(const CodecError& error) {
          error.code == CodecErrorCode::PlatformFailure;
 }
 
+VideoFrame CheckVideoReplacement(std::optional<VideoFrame> replacement, const VideoFrame& rejected) {
+  if (!replacement || replacement->Storage() != VideoStorage::Cpu || replacement->pts != rejected.pts ||
+      replacement->duration != rejected.duration)
+    throw std::runtime_error("Software decode did not reproduce the rejected frame's exact presentation interval");
+  return std::move(*replacement);
+}
+
 struct CodecFailure {
   CodecOperation operation;
   bool software;
@@ -137,6 +144,7 @@ public:
   ~Pump() { selection_.session->Close(); }
   bool Software() const { return selection_.software; }
   const std::string& Provider() const { return selection_.provider; }
+  bool AllowsSequenceHandoff() const noexcept { return selection_.session->Negotiated().allow_sequence_handoff; }
   Output Pull(std::stop_token stop = {}) {
     auto& session = *selection_.session;
     const std::stop_callback wake(stop, [&] { selection_.signal->Wake(); });
@@ -398,15 +406,11 @@ struct MovieReader::Impl {
     target = at;
     last_video.reset();
     OpenVideo(at, true);
-    auto replacement = ReadVideo(stop);
-    if (!replacement || replacement->Storage() != VideoStorage::Cpu ||
-        replacement->pts != at || replacement->duration != rejected.duration) {
-      throw std::runtime_error("Software decode did not reproduce the rejected frame's exact presentation interval");
-    }
+    auto replacement = CheckVideoReplacement(ReadVideo(stop), rejected);
     software_video_after_import = true;
     if (report) report({CodecOperation::VideoDecode, from, video->Provider(),
                         {CodecErrorCode::Unsupported, cause.what(), {}}, at});
-    return std::move(*replacement);
+    return replacement;
   }
 
   std::optional<AudioFrame> ReadAudio(std::stop_token stop) {
@@ -500,6 +504,10 @@ void MovieReader::Seek(MediaTimestamp at) {
 std::optional<VideoFrame> MovieReader::ReadVideo(std::stop_token stop) {
   return ReadVideoInternal(stop, std::nullopt);
 }
+bool MovieReader::AllowsVideoSequenceHandoff() const noexcept {
+  return impl_->selected == TrackKind::Video && impl_->video && impl_->video->AllowsSequenceHandoff();
+}
+void MovieReader::SetCodecFallbackHandler(OnCodecFallback report) { impl_->report = std::move(report); }
 std::optional<VideoFrame> MovieReader::ReadVideoInternal(std::stop_token stop, std::optional<MediaTimestamp> cpu_preroll) {
   try { return impl_->ReadVideo(stop, cpu_preroll); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
@@ -508,6 +516,17 @@ VideoFrame MovieReader::RetryVideoFrame(const VideoFrame& rejected, const Platfo
                                        std::stop_token stop) {
   try { return impl_->RetryVideoFrame(rejected, cause, stop); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
+}
+VideoFrame MovieReader::RetryDetachedVideoFrame(const MovieAsset& movie, const MovieCodecProviders& providers,
+                                               const VideoFrame& rejected, const PlatformVideoImportError& cause,
+                                               const OnCodecFallback& report, std::stop_token stop) {
+  CheckCancelled(stop);
+  if (!providers.platform || !providers.software || rejected.Storage() != VideoStorage::Platform) throw cause;
+  MovieReader reader(movie, providers, TrackKind::Video, rejected.pts, CodecPolicy::SoftwareOnly);
+  auto replacement = CheckVideoReplacement(reader.ReadVideo(stop), rejected);
+  if (report) report({CodecOperation::VideoDecode, std::string(providers.platform->Name()),
+                      std::string(providers.software->Name()), {CodecErrorCode::Unsupported, cause.what(), {}}, rejected.pts});
+  return replacement;
 }
 std::optional<AudioFrame> MovieReader::ReadAudio(std::stop_token stop) {
   try { return impl_->ReadAudio(stop); }

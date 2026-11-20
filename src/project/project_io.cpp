@@ -83,7 +83,10 @@ void Project::Save(const File& destination) const {
   });
   const bool backgrounds = any_clip([](const auto& clip) { return clip.background.has_value(); });
   const bool selected_models = any_clip([](const auto& clip) { return clip.background && !clip.background->model_id.empty(); });
-  const int version = selected_models ? 6 : backgrounds ? 5 : tracked ? 4 : versioned_assets || reversed ? 3 :
+  const bool static_masks = any_clip([](const auto& clip) { return clip.background && clip.background->static_mask; });
+  const bool animated_masks = any_clip([](const auto& clip) { return clip.background && clip.background->animated_mask; });
+  const int version = animated_masks ? 8 : static_masks ? 7 : selected_models ? 6 : backgrounds ? 5 :
+                      tracked ? 4 : versioned_assets || reversed ? 3 :
                       project.transitions.empty() ? 1 : 2;
   output << "AVKIT_PROJECT " << version << '\n';
   output << "canvas " << project.canvas.width << ' ' << project.canvas.height << '\n';
@@ -121,6 +124,23 @@ void Project::Save(const File& destination) const {
           Put(output, effect.source_crop);
           output << ' ' << effect.mirrored;
           if (version >= 6) output << ' ' << std::quoted(effect.model_id);
+          if (version >= 7) {
+            output << ' ' << effect.static_mask.has_value();
+            if (effect.static_mask) {
+              const auto& mask = *effect.static_mask;
+              output << ' ' << std::quoted(mask.resource.pack) << ' ' << std::quoted(mask.resource.revision) << ' '
+                     << std::quoted(mask.resource.key) << ' ' << mask.inverted;
+            }
+          }
+          if (version >= 8) {
+            output << ' ' << effect.animated_mask.has_value();
+            if (effect.animated_mask) {
+              const auto& mask = *effect.animated_mask;
+              output << ' ' << std::quoted(mask.resource.pack) << ' ' << std::quoted(mask.resource.revision) << ' '
+                     << std::quoted(mask.resource.key) << ' ' << (mask.playback == MaskPlayback::Loop ? 'l' : 'h')
+                     << ' ' << mask.inverted;
+            }
+          }
         }
       }
       output << '\n';
@@ -176,7 +196,7 @@ Project Project::Open(const File& source) {
   input.imbue(std::locale::classic());
   Tag(input, "AVKIT_PROJECT");
   const auto version = Read<unsigned>(input);
-  if (version < 1 || version > 6) throw std::runtime_error("Unsupported project document version");
+  if (version < 1 || version > 8) throw std::runtime_error("Unsupported project document version");
   ProjectSnapshot project;
   Tag(input, "canvas");
   project.canvas = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
@@ -210,6 +230,15 @@ Project Project::Open(const File& source) {
         const Color color{Read<float>(input), Read<float>(input), Read<float>(input), Read<float>(input)};
         clip.background = BackgroundReplacement{color, ReadRect(input), Read<bool>(input),
                                                  version >= 6 ? Text(input) : std::string{}};
+        if (version >= 7 && Read<bool>(input))
+          clip.background->static_mask = StaticMask{{Text(input), Text(input), Text(input)}, Read<bool>(input)};
+        if (version >= 8 && Read<bool>(input)) {
+          ResourceRef mask{Text(input), Text(input), Text(input)};
+          const auto playback = Read<char>(input);
+          if (playback != 'h' && playback != 'l') throw std::runtime_error("Invalid animated mask playback mode");
+          clip.background->animated_mask = AnimatedMask{std::move(mask), playback == 'l' ? MaskPlayback::Loop : MaskPlayback::HoldLast,
+                                                         Read<bool>(input)};
+        }
       }
       for (auto stickers = sticker_count; stickers; --stickers) {
         Tag(input, "sticker");

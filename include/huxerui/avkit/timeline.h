@@ -40,14 +40,26 @@ struct TransitionMaskSample {
   bool operator==(const TransitionMaskSample&) const = default;
 };
 
+/// @brief Coverage sequence sampled at an elapsed time on the owning clip's project clock.
+struct AnimatedMaskSample {
+  ResourceRef resource;
+  media::MediaTimestamp offset;
+  MaskPlayback playback{MaskPlayback::HoldLast};
+  /// @brief Selects the frame using the loaded resource's positive frame interval and count.
+  std::uint32_t FrameIndex(media::MediaTimestamp frame_interval, std::uint32_t frame_count) const;
+  bool operator==(const AnimatedMaskSample&) const = default;
+};
+
 /// @brief Compositor input for one exact project time.
 struct TimelineFrame {
   media::MediaTimestamp pts;
   std::shared_ptr<const render::RenderPlan> plan;
   std::vector<TimelineInput> inputs; ///< External color slots referenced by the render plan.
-  std::vector<TransitionMaskSample> masks; ///< Data slots resolved by the compositor.
-  /// Analysis masks occupy the first data slots, followed by the transition masks.
+  std::vector<TransitionMaskSample> masks; ///< Animated transition masks resolved by the compositor.
+  /// Data slots contain analysis, static, clip animation, and transition masks in that order.
   std::vector<render::ImageSurface> analysis_masks;
+  std::vector<ResourceRef> static_masks; ///< Unique static mask resources in slot order.
+  std::vector<AnimatedMaskSample> animated_masks; ///< Clip-local mask samples in slot order.
 };
 
 /// @brief Samples one immutable revision on a worker sequence.
@@ -55,7 +67,7 @@ struct TimelineFrame {
 class TimelineSession {
 public:
   /// @brief Prepares project metadata and retains the selected providers.
-  /// @param analysis Required for active clips with tracking anchors or portrait background replacement.
+  /// @param analysis Required for tracking anchors and backgrounds that use portrait analysis.
   TimelineSession(std::shared_ptr<const ProjectSnapshot> project, MovieCodecProviders providers,
                   CodecPolicy policy = CodecPolicy::Auto, OnCodecFallback on_fallback = {},
                   std::shared_ptr<analysis::AnalysisProvider> analysis = {});
@@ -78,6 +90,15 @@ public:
   TimelineFrame SampleVideo(media::MediaTimestamp at, render::PixelFormat output = render::PixelFormat::Bgra8Unorm,
                             std::stop_token stop = {}, const ImportVideoFrame& import = {},
                             std::optional<std::chrono::milliseconds> mask_wait = {});
+  /// @brief Requests up to two video entries strictly inside the lookahead, ordered by entry time.
+  /// Selects reverse clips and trimmed forward clips that enter outside a transition while another picture remains visible.
+  /// Call on the sampling sequence. Providers must support concurrent Probe and Open for independent sessions.
+  /// Forward cursors must negotiate sequence handoff. Browser workers use the software provider.
+  /// Returns without waiting for decode. Sampling decodes on demand if preparation is unavailable.
+  /// @param lookahead In-range playback start and exclusive end on the project clock.
+  /// @param stop Cancels the pending decode or discards its uncollected result.
+  /// @return True if at least one entry was selected and every selected entry is cached.
+  bool PrerollVideoEntries(TimeRange lookahead, std::stop_token stop = {});
   /// @brief Returns the PCM format shared by the timeline's selected audio clips.
   media::AudioFormat PcmFormat() const;
   /// @brief Mixes an interval on the project PCM sample grid, filling gaps with silence.
@@ -85,8 +106,10 @@ public:
   /// @param samples Positive number of sample frames.
   media::AudioFrame SampleAudio(media::MediaTimestamp start, std::uint32_t samples);
   /// @brief Starts a new sampling epoch at an in-range project time.
-  /// Retires audio and analysis state. A reverse clip can reuse its own cached CPU pictures at the target.
-  void Seek(media::MediaTimestamp at);
+  /// Retires audio and analysis state. Keeps reusable video at the target.
+  /// @param preroll_end Optional exclusive end of the new lookahead on the project clock. Keeps up to two prepared
+  /// future entries, including live forward cursors, strictly between at and this end.
+  void Seek(media::MediaTimestamp at, std::optional<media::MediaTimestamp> preroll_end = {});
   /// @brief Retires all sampling cursors and analysis state.
   void Reset();
 

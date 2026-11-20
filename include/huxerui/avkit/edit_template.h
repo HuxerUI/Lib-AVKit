@@ -14,13 +14,15 @@
 
 namespace huxerui::avkit {
 
-/// @brief Clip layout and sticker instances assembled from a named input slot.
+/// @brief Clip layout and effects assembled from a named input slot.
 struct TemplateClip {
   std::string slot;
   TimeRange source; ///< Trim offsets from the selected track's presentation start.
   TimeRange timeline; ///< Destination interval on the project clock.
   Rect destination{0, 0, 1, 1};
   std::vector<StickerSpec> stickers;
+  std::optional<BackgroundReplacement> background;
+  bool reverse{};
 };
 
 /// @brief Template track and its clip definitions in assembly order.

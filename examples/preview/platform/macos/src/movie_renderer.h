@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <memory>
 
 #include <CoreVideo/CVPixelBuffer.h>
@@ -37,6 +38,8 @@ huxerui::media::VideoEncoderConfig PreviewVideoConfig(huxerui::avkit::PixelSize 
 const huxerui::avkit::ResourceRef& PreviewStickerResource();
 const huxerui::avkit::ResourceRef& TrackingStickerResource(huxerui::avkit::analysis::TrackedPart part);
 const huxerui::avkit::ResourceRef& PreviewWipeResource();
+const std::array<huxerui::avkit::ResourceRef, 2>& PreviewStaticMaskResources();
+const huxerui::avkit::ResourceRef& PreviewAnimatedMaskResource();
 inline constexpr std::uint32_t kPreviewWipeFrameCount = 8;
 
 } // namespace avkit_preview

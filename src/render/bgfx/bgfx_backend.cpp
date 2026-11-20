@@ -541,6 +541,7 @@ private:
         if (sampling.background) {
           const auto& background = *sampling.background;
           uniforms[0][3] = 1;
+          uniforms[1][3] = background.inverted ? 1.0F : 0.0F;
           put(2, background.draw_to_mask_uv);
           const auto& mask = request.data_inputs[background.mask_slot];
           uniforms[2][3] = 0.5F / mask.image.size.width;

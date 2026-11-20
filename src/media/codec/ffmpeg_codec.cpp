@@ -121,7 +121,7 @@ bool MatchesAacLc(std::span<const std::byte> data, const AudioFormat& pcm) {
 }
 
 CodecNegotiation Negotiation(const VideoDecoderConfig& config) {
-  return {CodecImplementation::Software, VideoFrameContract{config.output_storage, config.output}};
+  return {CodecImplementation::Software, VideoFrameContract{config.output_storage, config.output}, true};
 }
 CodecNegotiation Negotiation(const VideoEncoderConfig& config) {
   return {CodecImplementation::Software, VideoFrameContract{config.input_storage, config.input.pixel_format}};

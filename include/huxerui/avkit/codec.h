@@ -3,8 +3,8 @@
 /// @file
 /// @brief Codec provider negotiation, session lifecycle, and Lib-Media and FFmpeg factories.
 ///
-/// Session calls are serialized on a caller-owned codec sequence. Providers use Lib-Media packet,
-/// frame, and output-event types so a caller can switch implementations at a recovery boundary.
+/// Session calls are serialized on a caller-owned codec sequence. A negotiated handoff permits a new owning
+/// sequence after the previous caller stops. Providers use Lib-Media packet, frame, and output-event types.
 
 #include <memory>
 #include <optional>
@@ -34,6 +34,7 @@ struct VideoFrameContract {
 struct CodecNegotiation {
   CodecImplementation implementation;
   std::optional<VideoFrameContract> video;
+  bool allow_sequence_handoff{}; ///< The open session can be handed to a different sequence between calls.
 };
 
 /// @brief One encoder or decoder session on the caller's codec sequence.

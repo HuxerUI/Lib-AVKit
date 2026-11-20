@@ -9,6 +9,11 @@ target_include_directories(avkit_media PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 target_link_libraries(avkit_media PUBLIC AVKit::Core)
 set_target_properties(avkit_media PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
 
+if (NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+    target_link_libraries(avkit_media PRIVATE Threads::Threads)
+endif ()
+
 if (AVKIT_ENABLE_FFMPEG)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(AVKIT_FFMPEG REQUIRED IMPORTED_TARGET

@@ -94,6 +94,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
                 platform/macos/src/timeline_strip_macos.mm
                 platform/macos/verification/timeline_strip_verify.mm
                 platform/macos/verification/timeline_mask_verify.mm
+                platform/macos/verification/timeline_template_mask_verify.mm
                 platform/macos/verification/timeline_tracking_verify.mm
                 platform/macos/verification/timeline_verify.mm
         )

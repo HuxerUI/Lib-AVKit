@@ -52,6 +52,9 @@ const std::array kWipeFrames{
     &app::raw::masks_wipe_0_png, &app::raw::masks_wipe_1_png, &app::raw::masks_wipe_2_png, &app::raw::masks_wipe_3_png,
     &app::raw::masks_wipe_4_png, &app::raw::masks_wipe_5_png, &app::raw::masks_wipe_6_png, &app::raw::masks_wipe_7_png};
 static_assert(kWipeFrames.size() == kPreviewWipeFrameCount);
+constexpr MediaTimestamp kClipMaskFrameInterval{5, 48};
+const std::array kClipMaskFrames{&app::raw::masks_static_window_png, &app::raw::masks_static_offset_png,
+                                 &app::raw::masks_sequence_corner_png};
 constexpr std::array kTrackingParts{analysis::TrackedPart::Face, analysis::TrackedPart::LeftHand,
                                     analysis::TrackedPart::RightHand};
 
@@ -110,8 +113,10 @@ struct MovieRenderer::Impl {
         }
       }
       auto masks = frame.analysis_masks;
-      masks.reserve(masks.size() + frame.masks.size());
-      for (const auto& sample : frame.masks) masks.push_back(Mask(sample));
+      masks.reserve(masks.size() + frame.static_masks.size() + frame.animated_masks.size() + frame.masks.size());
+      for (const auto& resource : frame.static_masks) masks.push_back(StaticMaskTexture(resource));
+      for (const auto& sample : frame.animated_masks) masks.push_back(AnimatedMaskTexture(sample));
+      for (const auto& sample : frame.masks) masks.push_back(TransitionMaskTexture(sample));
       return Render({frame.plan, std::move(inputs), std::move(masks)});
     }
   }
@@ -129,20 +134,57 @@ private:
     throw std::runtime_error("The preview sticker resource is unavailable");
   }
 
-  const ImageSurface& Mask(const TransitionMaskSample& sample) {
+  const ImageSurface& TransitionMaskTexture(const TransitionMaskSample& sample) {
     Check(sample.resource == PreviewWipeResource(), "The preview mask resource is unavailable");
     const auto index = sample.FrameIndex(kPreviewWipeFrameCount);
     auto& cached = wipe_frames_[index];
-    if (cached) return *cached;
+    if (!cached) {
+      auto surface = LoadMask(*kWipeFrames[index]);
+      const auto size = surface.image.size;
+      if (wipe_size_) Check(*wipe_size_ == size, "Mask sequence frame sizes differ");
+      cached = std::move(surface);
+      wipe_size_ = size;
+    }
+    return *cached;
+  }
+
+  const ImageSurface& StaticMaskTexture(const ResourceRef& resource) {
+    const auto& resources = PreviewStaticMaskResources();
+    const auto found = std::ranges::find(resources, resource);
+    if (found == resources.end()) throw std::runtime_error("The static mask resource is unavailable: " + resource.key);
+    const auto index = static_cast<std::size_t>(found - resources.begin());
+    const std::array assets{&app::raw::masks_static_window_png, &app::raw::masks_static_offset_png};
+    auto& cached = static_masks_[index];
+    if (!cached) cached = LoadMask(*assets[index]);
+    return *cached;
+  }
+
+  const ImageSurface& AnimatedMaskTexture(const AnimatedMaskSample& sample) {
+    Check(sample.resource == PreviewAnimatedMaskResource(), "The clip mask sequence is unavailable");
+    const auto index = sample.FrameIndex(kClipMaskFrameInterval, kClipMaskFrames.size());
+    if (!animated_masks_) {
+      std::array<ImageSurface, kClipMaskFrames.size()> frames;
+      for (std::size_t i = 0; i < frames.size(); ++i) {
+        frames[i] = LoadMask(*kClipMaskFrames[i]);
+        Check(frames[i].image.size == frames.front().image.size, "Clip mask sequence frame sizes differ");
+      }
+      animated_masks_ = std::move(frames);
+    }
+    return (*animated_masks_)[index];
+  }
+
+  ImageSurface LoadMask(const RawResource& asset) {
     if (!resources_) {
       auto* directory = [NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"HuxerUI" isDirectory:YES];
       Check(directory != nil, "Cannot locate the preview resource package");
       resources_.emplace(Resources::OpenPackage(File(directory.fileSystemRepresentation)));
     }
-    const auto bytes = resources_->GetRawResource(*kWipeFrames[index]).ReadBytes();
+    const auto bytes = resources_->GetRawResource(asset).ReadBytes();
     const Owned<CFDataRef> encoded(CFDataCreateWithBytesNoCopy(nullptr, reinterpret_cast<const UInt8*>(bytes.data()),
                                                               bytes.size(), kCFAllocatorNull));
     const Owned<CGImageSourceRef> source(encoded ? CGImageSourceCreateWithData(encoded.get(), nullptr) : nullptr);
+    const auto type = source ? CGImageSourceGetType(source.get()) : nullptr;
+    Check(type && CFEqual(type, CFSTR("public.png")), "Expected a PNG mask resource");
     const Owned<CGImageRef> image(source ? CGImageSourceCreateImageAtIndex(source.get(), 0, nullptr) : nullptr);
     Check(image && CGImageGetBitsPerComponent(image.get()) == 8 && CGImageGetBitsPerPixel(image.get()) == 8 &&
           CGImageGetAlphaInfo(image.get()) == kCGImageAlphaNone && CGImageGetColorSpace(image.get()) &&
@@ -153,8 +195,6 @@ private:
     const Owned<CFDataRef> coverage(CGDataProviderCopyData(CGImageGetDataProvider(image.get())));
     Check(coverage && width && height && stride >= width && CFDataGetLength(coverage.get()) / stride >= height,
           "Mask has no complete grayscale payload");
-    const PixelSize mask_size{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
-    if (wipe_size_) Check(*wipe_size_ == mask_size, "Mask sequence frame sizes differ");
     auto* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
                                                                    width:width height:height mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead;
@@ -163,9 +203,7 @@ private:
     Check(texture != nil, "Cannot allocate a Metal mask texture");
     [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:CFDataGetBytePtr(coverage.get())
                bytesPerRow:stride];
-    cached = metal::RetainMetalDataTexture(texture);
-    wipe_size_ = mask_size;
-    return *cached;
+    return metal::RetainMetalDataTexture(texture);
   }
 
   ImportedPicture Import(CVPixelBufferRef image, huxerui::Rect crop, VideoRotation rotation) {
@@ -266,6 +304,8 @@ private:
   std::optional<Resources> resources_;
   std::optional<PixelSize> wipe_size_;
   std::array<std::optional<ImageSurface>, kPreviewWipeFrameCount> wipe_frames_;
+  std::array<std::optional<ImageSurface>, 2> static_masks_;
+  std::optional<std::array<ImageSurface, kClipMaskFrames.size()>> animated_masks_;
 };
 
 MovieRenderer::MovieRenderer(PixelSize size) : impl_(std::make_unique<Impl>(size)) {}
@@ -320,6 +360,18 @@ const ResourceRef& TrackingStickerResource(analysis::TrackedPart part) {
 
 const ResourceRef& PreviewWipeResource() {
   static const ResourceRef resource{"avkit.preview", "1", "wipe"};
+  return resource;
+}
+
+const std::array<ResourceRef, 2>& PreviewStaticMaskResources() {
+  static const std::array<ResourceRef, 2> resources{{
+      {"avkit.preview", "1", "static-window"}, {"avkit.preview", "1", "static-offset"},
+  }};
+  return resources;
+}
+
+const ResourceRef& PreviewAnimatedMaskResource() {
+  static const ResourceRef resource{"avkit.preview", "1", "clip-mask-sequence"};
   return resource;
 }
 

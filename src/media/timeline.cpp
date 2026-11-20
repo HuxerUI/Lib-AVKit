@@ -2,13 +2,17 @@
 #include <huxerui/avkit_ecs.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include "analysis/source_mask.h"
 #include "analysis/tracking.h"
@@ -28,6 +32,8 @@ using detail::CheckCancelled;
 using detail::Difference;
 using detail::ExactTicks;
 
+constexpr std::size_t kVideoPrerollLimit = 2;
+
 TimeRange RangeOf(const MediaPresentationRange& range) { return {range.start, range.end}; }
 
 bool Contains(TimeRange range, MediaTimestamp time) {
@@ -39,7 +45,7 @@ MediaTimestamp SourceTime(const ClipPlacement& clip, MediaTimestamp time) {
   return clip.source.reverse ? Difference(clip.source.range.end, offset) : Add(clip.source.range.start, offset);
 }
 
-struct ReverseVideoCache {
+struct VideoFrameCache {
   struct Entry {
     VideoFrame picture;
     std::size_t bytes;
@@ -91,19 +97,65 @@ struct VideoCursor {
   }
 
   VideoFrame* CachedReverse(MediaTimestamp source) {
-    const auto entry = std::ranges::find_if(reverse.entries, [&](const ReverseVideoCache::Entry& entry) {
+    if (!CoversReverse(source)) return nullptr;
+    const auto entry = std::ranges::find_if(reverse.entries, [&](const VideoFrameCache::Entry& entry) {
       const auto& picture = entry.picture;
       return Before(picture.pts, source) && !Before(Add(picture.pts, *picture.duration), source);
     });
     return entry == reverse.entries.end() ? nullptr : &entry->picture;
   }
 
+  bool HasReverseCpuFrame(MediaTimestamp source) {
+    const auto* frame = CachedReverse(source);
+    return frame && frame->Storage() == VideoStorage::Cpu;
+  }
+
+  VideoFrame* CachedForward(MediaTimestamp source) {
+    if (!forward) return nullptr;
+    const auto found = std::ranges::find_if(forward->entries, [&](const VideoFrameCache::Entry& entry) {
+      return Contains({entry.picture.pts, Add(entry.picture.pts, *entry.picture.duration)}, source);
+    });
+    return found == forward->entries.end() ? nullptr : &found->picture;
+  }
+
+  bool CanSeekForward(MediaTimestamp source) {
+    return CachedForward(source) || (forward && reader && last && !Before(source, *last) &&
+                                     !Before({1, 1}, Difference(source, *last)));
+  }
+
+  void ReadForward(std::stop_token stop) {
+    frame = reader->ReadVideo(stop);
+    if (forward && frame) forward->Append(*frame);
+  }
+
   std::unique_ptr<MovieReader> reader;
   std::optional<VideoFrame> frame;
   std::optional<MediaTimestamp> last;
   std::optional<TimeRange> reverse_window;
-  ReverseVideoCache reverse;
+  VideoFrameCache reverse;
+  std::optional<VideoFrameCache> forward;
 };
+
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+
+struct VideoPrerollJob {
+  struct Result {
+    VideoCursor cursor;
+    std::vector<CodecFallback> fallbacks;
+  };
+
+  const MovieAsset* movie;
+  MediaTimestamp trim;
+  MediaTimestamp source;
+  MediaTimestamp entry;
+  CodecPolicy policy;
+  bool reverse;
+  std::stop_token caller;
+  std::stop_source cancel;
+  std::optional<Result> result;
+};
+
+#endif
 
 struct AudioCursor {
   std::unique_ptr<MovieReader> reader;
@@ -133,6 +185,13 @@ struct VideoClip {
   std::unique_ptr<detail::SourceMask> mask;
 };
 
+struct VideoPrerollSlot {
+  VideoClip* clip{};
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+  std::shared_ptr<VideoPrerollJob> job;
+#endif
+};
+
 struct TransitionLayer {
   const TransitionInfo* transition;
   VideoClip* from;
@@ -150,9 +209,21 @@ struct AudioClip {
   std::vector<std::int16_t> reverse_pcm;
 };
 
+MediaTimestamp PictureStart(const VideoClip& clip) {
+  return clip.incoming ? clip.incoming->spec.range.start : clip.clip->placement.timeline.start;
+}
+
+MediaTimestamp EntrySource(const VideoClip& clip) {
+  return SourceTime(clip.clip->placement, PictureStart(clip));
+}
+
+VideoFrame* CachedEntry(VideoClip& clip) {
+  const auto source = EntrySource(clip);
+  return clip.clip->placement.source.reverse ? clip.cursor.CachedReverse(source) : clip.cursor.CachedForward(source);
+}
+
 bool NeedsPicture(const VideoClip& clip, MediaTimestamp at) {
-  return Contains(clip.clip->placement.timeline, at) &&
-         (!clip.incoming || !Before(at, clip.incoming->spec.range.start)) &&
+  return !Before(at, PictureStart(clip)) && Before(at, clip.clip->placement.timeline.end) &&
          (!clip.outgoing || Before(at, clip.outgoing->spec.range.end));
 }
 
@@ -222,6 +293,18 @@ std::uint32_t TransitionMaskSample::FrameIndex(std::uint32_t frame_count) const 
   return first;
 }
 
+std::uint32_t AnimatedMaskSample::FrameIndex(MediaTimestamp frame_interval, std::uint32_t frame_count) const {
+  if (!frame_count || !offset.timescale || !frame_interval.timescale || offset.ticks < 0 || frame_interval.ticks <= 0 ||
+      (playback != MaskPlayback::HoldLast && playback != MaskPlayback::Loop))
+    throw std::invalid_argument("Invalid clip mask sequence sample");
+  const auto common = std::lcm<std::uint64_t>(offset.timescale, frame_interval.timescale);
+  if (common > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("Incompatible mask sequence clocks");
+  const auto scale = static_cast<std::uint32_t>(common);
+  const auto index = ExactTicks(offset, scale) / ExactTicks(frame_interval, scale);
+  return static_cast<std::uint32_t>(playback == MaskPlayback::Loop ? index % frame_count :
+                                    std::min(index, std::int64_t(frame_count - 1)));
+}
+
 AssetReference InspectTimelineMovie(const File& file) {
   const auto movie = ImportMovie(file);
   return {movie.file, {{movie.video.id, TrackKind::Video, RangeOf(movie.video_range)},
@@ -253,6 +336,12 @@ struct TimelineSession::Impl {
     for (const auto& transition : project->transitions) AddTransition(transition);
   }
 
+  ~Impl() {
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+    for (auto& worker : preroll_workers) worker.request_stop();
+#endif
+  }
+
   const MovieAsset& Movie(AssetId id) {
     const auto found = movies.find(id.value);
     if (found != movies.end()) return found->second;
@@ -270,8 +359,10 @@ struct TimelineSession::Impl {
   }
 
   void AddVideo(const ClipInfo& clip, const MovieAsset& movie) {
-    auto& node = pictures.emplace_back(VideoClip{&clip, &movie, AddLayer(clip.destination, render::Blend::Replace)});
-    if (clip.background)
+    const bool packaged_mask = clip.background && (clip.background->static_mask || clip.background->animated_mask);
+    const auto blend = packaged_mask ? render::Blend::PremultipliedOver : render::Blend::Replace;
+    auto& node = pictures.emplace_back(VideoClip{&clip, &movie, AddLayer(clip.destination, blend)});
+    if (clip.background && !packaged_mask)
       node.mask = std::make_unique<detail::SourceMask>(analysis_provider, clip.id.value, clip.background->model_id);
     std::vector<analysis::TrackedPart> parts;
     for (const auto& instance : clip.stickers) {
@@ -326,39 +417,199 @@ struct TimelineSession::Impl {
     const auto source = SourceTime(clip.clip->placement, at);
     if (clip.clip->placement.source.reverse) return ReversePicture(clip, source, stop);
     auto& cursor = clip.cursor;
+    if (auto* cached = cursor.CachedForward(source)) return cached;
     if (!cursor.reader || (cursor.last && Before(source, *cursor.last))) {
       cursor = {};
       cursor.reader = Open(*clip.movie, TrackKind::Video, source, clip.software_video);
-      cursor.frame = cursor.reader->ReadVideo(stop);
+      cursor.ReadForward(stop);
     }
     cursor.last = source;
     while (cursor.frame && !Before(source, Add(cursor.frame->pts, *cursor.frame->duration)))
-      cursor.frame = cursor.reader->ReadVideo(stop);
+      cursor.ReadForward(stop);
     return cursor.frame && !Before(source, cursor.frame->pts) ? &*cursor.frame : nullptr;
+  }
+
+  VideoCursor ReadReverseWindow(const MovieAsset& movie, MediaTimestamp trim, MediaTimestamp source,
+                                CodecPolicy video_policy, const OnCodecFallback& on_fallback, std::stop_token stop) {
+    VideoCursor cursor;
+    const auto earliest = Difference(source, {1, 4});
+    auto begin = std::max(trim, earliest, Before);
+    cursor.reader = std::make_unique<MovieReader>(movie, providers, TrackKind::Video, begin, video_policy, on_fallback);
+    bool evicted = false;
+    while (auto picture = cursor.reader->ReadVideoInternal(stop, trim)) {
+      if (!Before(picture->pts, source)) break;
+      const auto end = Add(picture->pts, *picture->duration);
+      if (cursor.reverse.Append(std::move(*picture))) evicted = true;
+      if (!Before(end, source)) break;
+    }
+    if (!cursor.reverse.entries.empty()) {
+      const auto first = cursor.reverse.entries.front().picture.pts;
+      begin = std::max(trim, evicted ? first : std::min(begin, first, Before), Before);
+    }
+    cursor.reverse_window = TimeRange{begin, source};
+    return cursor;
   }
 
   VideoFrame* ReversePicture(VideoClip& clip, MediaTimestamp source, std::stop_token stop) {
     auto& cursor = clip.cursor;
     if (!cursor.CoversReverse(source)) {
       cursor = {};
-      const auto trim = clip.clip->placement.source.range.start;
-      const auto earliest = Difference(source, {1, 4});
-      auto begin = Before(earliest, trim) ? trim : earliest;
-      cursor.reader = Open(*clip.movie, TrackKind::Video, begin, clip.software_video);
-      bool evicted = false;
-      while (auto picture = cursor.reader->ReadVideoInternal(stop, trim)) {
-        if (!Before(picture->pts, source)) break;
-        const auto end = Add(picture->pts, *picture->duration);
-        if (cursor.reverse.Append(std::move(*picture))) evicted = true;
-        if (!Before(end, source)) break;
-      }
-      if (!cursor.reverse.entries.empty()) {
-        const auto first = cursor.reverse.entries.front().picture.pts;
-        begin = std::max(trim, evicted ? first : std::min(begin, first, Before), Before);
-      }
-      cursor.reverse_window = TimeRange{begin, source};
+      cursor = ReadReverseWindow(*clip.movie, clip.clip->placement.source.range.start, source,
+                                 clip.software_video ? CodecPolicy::SoftwareOnly : policy, report, stop);
     }
     return cursor.CachedReverse(source);
+  }
+
+  std::array<VideoClip*, kVideoPrerollLimit> NextVideoEntries(TimeRange lookahead, const auto& eligible) {
+    std::array<VideoClip*, kVideoPrerollLimit> entries{};
+    for (auto& clip : pictures) {
+      const auto start = PictureStart(clip);
+      if (!Before(lookahead.start, start) || !Before(start, lookahead.end) || !eligible(clip)) continue;
+      const auto position = std::ranges::find_if(entries, [&](const auto* entry) {
+        return !entry || Before(start, PictureStart(*entry));
+      });
+      if (position == entries.end()) continue;
+      std::move_backward(position, entries.end() - 1, entries.end());
+      *position = &clip;
+    }
+    return entries;
+  }
+
+  bool CanPrerollEntry(const VideoClip& clip) {
+    if (clip.clip->placement.source.reverse) return true;
+    if (clip.incoming || !Before(clip.movie->video_range.start, EntrySource(clip))) return false;
+    const auto at = PictureStart(clip);
+    return std::ranges::any_of(pictures, [&](const VideoClip& other) {
+      return Before(PictureStart(other), at) && NeedsPicture(other, at);
+    });
+  }
+
+  auto FindPreroll(const VideoClip* clip) {
+    return std::ranges::find(prerolls, clip, &VideoPrerollSlot::clip);
+  }
+
+  void CancelPreroll(VideoPrerollSlot& slot) {
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+    if (const auto job = std::exchange(slot.job, {})) {
+      job->cancel.request_stop();
+      const std::lock_guard lock(preroll_mutex);
+      std::erase(queued_preroll, job);
+    }
+#endif
+    slot.clip = nullptr;
+  }
+
+  void CollectPreroll() {
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+    for (auto& slot : prerolls) {
+      if (!slot.job) continue;
+      std::optional<VideoPrerollJob::Result> result;
+      {
+        std::lock_guard lock(preroll_mutex);
+        result = std::exchange(slot.job->result, std::nullopt);
+      }
+      if (!result || slot.job->caller.stop_requested()) continue;
+      if (result->cursor.reader) result->cursor.reader->SetCodecFallbackHandler(report);
+      slot.clip->cursor = std::move(result->cursor);
+      if (report) for (const auto& fallback : result->fallbacks) report(fallback);
+    }
+#endif
+  }
+
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+  void DecodePreroll(VideoPrerollJob& job, std::stop_token stop) {
+    std::stop_callback cancel_worker(stop, [&] { job.cancel.request_stop(); });
+    std::stop_callback cancel_caller(job.caller, [&] { job.cancel.request_stop(); });
+    const auto token = job.cancel.get_token();
+    VideoPrerollJob::Result result;
+    try {
+      CheckCancelled(token);
+      const auto collect_fallback = [&](const auto& fallback) { result.fallbacks.push_back(fallback); };
+      auto& cursor = result.cursor;
+      if (job.reverse) {
+        cursor = ReadReverseWindow(*job.movie, job.trim, job.source, job.policy, collect_fallback, token);
+        cursor.reader.reset();
+        if (!cursor.CachedReverse(job.source)) return;
+      } else {
+        cursor.reader = std::make_unique<MovieReader>(*job.movie, providers, TrackKind::Video, job.source,
+                                                       job.policy, collect_fallback);
+        if (!cursor.reader->AllowsVideoSequenceHandoff()) return;
+        cursor.forward.emplace();
+        cursor.ReadForward(token);
+        cursor.last = job.source;
+        if (!cursor.CachedForward(job.source) || !cursor.reader->AllowsVideoSequenceHandoff()) return;
+        cursor.reader->SetCodecFallbackHandler({});
+      }
+    } catch (const std::exception&) {
+      // A missed speculative decode is retried by ordinary sampling when the clip becomes visible.
+      return;
+    }
+    std::lock_guard lock(preroll_mutex);
+    if (!token.stop_requested()) job.result.emplace(std::move(result));
+  }
+
+  void RunPreroll(std::stop_token stop) {
+    std::unique_lock lock(preroll_mutex);
+    while (preroll_ready.wait(lock, stop, [&] { return !queued_preroll.empty(); }) && !stop.stop_requested()) {
+      auto job = std::move(queued_preroll.front());
+      queued_preroll.pop_front();
+      lock.unlock();
+      DecodePreroll(*job, stop);
+      job.reset();
+      lock.lock();
+    }
+  }
+#endif
+
+  void QueuePreroll(VideoPrerollSlot& slot, std::stop_token stop) {
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+    if (slot.job && !slot.job->caller.stop_requested()) return;
+    auto& clip = *slot.clip;
+#if defined(__EMSCRIPTEN__)
+    // Browser video frame handles belong to the JavaScript worker that produced them.
+    if (!providers.software) return;
+    const auto video_policy = CodecPolicy::SoftwareOnly;
+#else
+    const auto video_policy = clip.software_video ? CodecPolicy::SoftwareOnly : policy;
+#endif
+    if (slot.job) CancelPreroll(slot);
+    slot.clip = &clip;
+    auto& worker = preroll_workers[&slot - prerolls.data()];
+    if (!worker.joinable()) worker = std::jthread([this](auto token) { RunPreroll(token); });
+    slot.job = std::make_shared<VideoPrerollJob>(VideoPrerollJob{clip.movie, clip.clip->placement.source.range.start,
+        EntrySource(clip), PictureStart(clip), video_policy, clip.clip->placement.source.reverse, stop});
+    {
+      std::lock_guard lock(preroll_mutex);
+      const auto position = std::ranges::upper_bound(queued_preroll, slot.job->entry, Before,
+          [](const auto& job) { return job->entry; });
+      queued_preroll.insert(position, slot.job);
+    }
+    preroll_ready.notify_one();
+#endif
+  }
+
+  bool PrerollVideoEntries(TimeRange lookahead, std::stop_token stop) {
+    CheckCancelled(stop);
+    if (!Contains(range, lookahead.start) || !Before(lookahead.start, lookahead.end) || Before(range.end, lookahead.end))
+      throw std::out_of_range("Video preroll interval is outside the project interval");
+    CollectPreroll();
+    const auto entries = NextVideoEntries(lookahead, [&](const VideoClip& clip) { return CanPrerollEntry(clip); });
+    for (auto& slot : prerolls) {
+      if (!slot.clip || std::ranges::find(entries, slot.clip) != entries.end()) continue;
+      if (!NeedsPicture(*slot.clip, lookahead.start)) slot.clip->cursor = {};
+      CancelPreroll(slot);
+    }
+    bool ready = entries.front() != nullptr;
+    for (auto* clip : entries) {
+      if (!clip) break;
+      auto slot = FindPreroll(clip);
+      if (slot == prerolls.end()) slot = FindPreroll(nullptr);
+      slot->clip = clip;
+      if (CachedEntry(*clip)) continue;
+      ready = false;
+      QueuePreroll(*slot, stop);
+    }
+    return ready;
   }
 
   render::ImportedVideoFrame PreparePicture(VideoClip& clip, VideoFrame*& picture, const ImportVideoFrame& import,
@@ -366,7 +617,8 @@ struct TimelineSession::Impl {
     try {
       return import(*picture);
     } catch (const PlatformVideoImportError& error) {
-      auto replacement = clip.cursor.reader->RetryVideoFrame(*picture, error, stop);
+      auto replacement = clip.cursor.reader ? clip.cursor.reader->RetryVideoFrame(*picture, error, stop)
+          : MovieReader::RetryDetachedVideoFrame(*clip.movie, providers, *picture, error, report, stop);
       clip.software_video = true;
       if (clip.clip->placement.source.reverse) {
         auto& cursor = clip.cursor;
@@ -375,7 +627,14 @@ struct TimelineSession::Impl {
         cursor.reverse.Append(std::move(replacement));
         picture = &cursor.reverse.entries.front().picture;
       } else {
-        *picture = std::move(replacement);
+        auto& cursor = clip.cursor;
+        if (cursor.forward) {
+          *cursor.forward = {};
+          cursor.forward->Append(replacement);
+        }
+        cursor.last = replacement.pts;
+        cursor.frame = std::move(replacement);
+        picture = &*cursor.frame;
       }
     }
     return import(*picture);
@@ -414,8 +673,12 @@ struct TimelineSession::Impl {
     CheckCancelled(stop);
     if (!Contains(range, at)) throw std::out_of_range("Sample time is outside the project interval");
     TimelineFrame frame{at, {}, {}};
+    CollectPreroll();
+    for (auto& slot : prerolls) {
+      if (slot.clip && !Before(at, PictureStart(*slot.clip))) CancelPreroll(slot);
+    }
     for (auto& clip : pictures) {
-      if ((clip.cursor.reader || clip.cursor.reverse_window) && !NeedsPicture(clip, at)) {
+      if ((clip.cursor.reader || clip.cursor.reverse_window) && !NeedsPicture(clip, at) && FindPreroll(&clip) == prerolls.end()) {
         clip.cursor = {};
         if (clip.tracking) clip.tracking->Reset();
         if (clip.mask) clip.mask->Reset();
@@ -465,14 +728,14 @@ struct TimelineSession::Impl {
         frame.inputs.emplace_back(std::move(prepared.surface));
       } else {
         frame.inputs.emplace_back(*image);
-        if (clip.mask || clip.tracking) {
+        if (clip.clip->background || clip.tracking) {
           const VideoTextureOptions options{project->canvas.width, project->canvas.height, ImageFit::Contain};
           content = detail::FitVideoTexture(image->format, options).SourceToTextureUv(options);
         }
       }
       const analysis::PersonSample* primary = nullptr;
       auto source_to_clip = content;
-      if (clip.mask) {
+      if (clip.clip->background) {
         const auto& effect = *clip.clip->background;
         const auto draw_to_source = DrawToSource(effect);
         source_to_clip = {1 / draw_to_source.m11, 0, 0, 1 / draw_to_source.m22,
@@ -523,13 +786,35 @@ struct TimelineSession::Impl {
         if (found == frame.inputs.end()) frame.inputs.emplace_back(sticker.spec->resource);
       }
     }
-    for (auto& item : masks) item.request = item.clip.mask->Submit(item.image, stop, mask_wait);
     for (auto& item : masks) {
+      if (item.clip.mask) item.request = item.clip.mask->Submit(item.image, stop, mask_wait);
+    }
+    for (auto& item : masks) {
+      if (!item.clip.mask) continue;
       if (auto mask = item.clip.mask->Collect(std::move(item.request))) {
         item.sampling.background = render::BackgroundMask{static_cast<std::uint32_t>(frame.analysis_masks.size()),
             detail::Compose(mask->source_to_texture_uv, item.draw_to_source), mask->valid_uv,
             item.clip.clip->background->color};
         frame.analysis_masks.push_back(std::move(mask->surface));
+      }
+    }
+    const auto bind_packaged = [](MaskSample& item, auto& samples, const auto& sample, std::size_t first, bool inverted) {
+      const auto found = std::ranges::find(samples, sample);
+      const auto slot = static_cast<std::uint32_t>(first + (found - samples.begin()));
+      if (found == samples.end()) samples.push_back(sample);
+      item.sampling.background = render::BackgroundMask{slot, item.draw_to_source, {0, 0, 1, 1},
+                                                        item.clip.clip->background->color, inverted};
+    };
+    for (auto& item : masks) {
+      if (const auto& mask = item.clip.clip->background->static_mask)
+        bind_packaged(item, frame.static_masks, mask->resource, frame.analysis_masks.size(), mask->inverted);
+    }
+    const auto first_animation = frame.analysis_masks.size() + frame.static_masks.size();
+    for (auto& item : masks) {
+      if (const auto& mask = item.clip.clip->background->animated_mask) {
+        const auto offset = Difference(at, item.clip.clip->placement.timeline.start);
+        const AnimatedMaskSample sample{mask->resource, offset, mask->playback};
+        bind_packaged(item, frame.animated_masks, sample, first_animation, mask->inverted);
       }
       item.clip.layer.set<render::SourceSampling>(std::move(item.sampling));
     }
@@ -538,7 +823,7 @@ struct TimelineSession::Impl {
       if (!node.visible) continue;
       if (!node.from->visible || !node.to->visible) throw std::runtime_error("Transition requires both source pictures");
       const auto offset = Difference(at, spec.range.start);
-      const auto mask_slot = static_cast<std::uint32_t>(frame.analysis_masks.size() + frame.masks.size());
+      const auto mask_slot = static_cast<std::uint32_t>(first_animation + frame.animated_masks.size() + frame.masks.size());
       frame.masks.push_back({spec.mask, offset, Difference(spec.range.end, spec.range.start)});
       const auto first = static_cast<std::uint32_t>(frame.inputs.size());
       node.layer.get_mut<CompositeLayer>().input_slot = first + *node.from->subcomposition;
@@ -646,14 +931,24 @@ struct TimelineSession::Impl {
     return {pcm, {start, pcm.sample_rate}, count, {BufferReference(std::as_bytes(std::span(*samples)), samples)}};
   }
 
-  void Reset(std::optional<MediaTimestamp> seek) {
+  void Reset(std::optional<MediaTimestamp> seek, std::optional<MediaTimestamp> preroll_end = {}) {
+    if (seek) CollectPreroll();
+    for (auto& slot : prerolls) CancelPreroll(slot);
+    if (seek && preroll_end) {
+      const auto entries = NextVideoEntries({*seek, *preroll_end}, [](VideoClip& clip) { return CachedEntry(clip) != nullptr; });
+      for (std::size_t i = 0; i < entries.size(); ++i) prerolls[i].clip = entries[i];
+    }
     for (auto& clip : pictures) {
-      const VideoFrame* cached = nullptr;
-      if (seek && clip.clip->placement.source.reverse && NeedsPicture(clip, *seek)) {
+      if (FindPreroll(&clip) != prerolls.end()) {
+        if (clip.cursor.HasReverseCpuFrame(EntrySource(clip))) clip.cursor.reader.reset();
+      } else if (seek && NeedsPicture(clip, *seek)) {
         const auto source = SourceTime(clip.clip->placement, *seek);
-        if (clip.cursor.CoversReverse(source)) cached = clip.cursor.CachedReverse(source);
+        const auto reuse = clip.clip->placement.source.reverse ? clip.cursor.HasReverseCpuFrame(source)
+                                                               : clip.cursor.CanSeekForward(source);
+        if (!reuse) clip.cursor = {};
+      } else {
+        clip.cursor = {};
       }
-      if (!cached || cached->Storage() != VideoStorage::Cpu) clip.cursor = {};
       if (clip.tracking) clip.tracking->Reset();
       if (clip.mask) clip.mask->Reset();
     }
@@ -673,9 +968,16 @@ struct TimelineSession::Impl {
   SceneEvaluator scene;
   std::map<std::uint64_t, MovieAsset> movies;
   std::vector<VideoClip> pictures;
+  std::array<VideoPrerollSlot, kVideoPrerollLimit> prerolls;
   std::vector<TransitionLayer> transitions;
   std::vector<AudioClip> sounds;
   std::int32_t next_order{};
+#if !defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)
+  std::deque<std::shared_ptr<VideoPrerollJob>> queued_preroll;
+  std::mutex preroll_mutex;
+  std::condition_variable_any preroll_ready;
+  std::array<std::jthread, kVideoPrerollLimit> preroll_workers;
+#endif
 };
 
 TimelineSession::TimelineSession(std::shared_ptr<const ProjectSnapshot> project, MovieCodecProviders providers,
@@ -701,15 +1003,21 @@ TimelineFrame TimelineSession::SampleVideo(MediaTimestamp at, render::PixelForma
   }
 }
 
+bool TimelineSession::PrerollVideoEntries(TimeRange lookahead, std::stop_token stop) {
+  return impl_->PrerollVideoEntries(lookahead, stop);
+}
+
 AudioFormat TimelineSession::PcmFormat() const { return impl_->pcm; }
 
 AudioFrame TimelineSession::SampleAudio(MediaTimestamp start, std::uint32_t samples) {
   return impl_->SampleAudio(start, samples);
 }
 
-void TimelineSession::Seek(MediaTimestamp at) {
+void TimelineSession::Seek(MediaTimestamp at, std::optional<MediaTimestamp> preroll_end) {
   if (!Contains(impl_->range, at)) throw std::out_of_range("Seek time is outside the project interval");
-  impl_->Reset(at);
+  if (preroll_end && (!Before(at, *preroll_end) || Before(impl_->range.end, *preroll_end)))
+    throw std::out_of_range("Seek lookahead end is outside the remaining project interval");
+  impl_->Reset(at, preroll_end);
 }
 
 void TimelineSession::Reset() { impl_->Reset(std::nullopt); }

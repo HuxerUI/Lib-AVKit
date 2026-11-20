@@ -10,7 +10,11 @@ namespace {
 using namespace media;
 
 CodecNegotiation Negotiation(const VideoDecoderConfig& config) {
-  return {CodecImplementation::Unknown, VideoFrameContract{config.output_storage, config.output}};
+  auto negotiation = CodecNegotiation{CodecImplementation::Unknown, VideoFrameContract{config.output_storage, config.output}};
+#if !defined(__EMSCRIPTEN__)
+  negotiation.allow_sequence_handoff = true;
+#endif
+  return negotiation;
 }
 
 CodecNegotiation Negotiation(const VideoEncoderConfig& config) {

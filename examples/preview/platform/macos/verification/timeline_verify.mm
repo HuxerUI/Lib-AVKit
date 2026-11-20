@@ -660,7 +660,7 @@ void VerifyTimelineCodecs(std::string_view path, std::string_view directory_path
       std::cout << "Clocked frames: " << stats.clocked_frames << ", maximum video lag " << stats.maximum_video_lag_ms
                 << " ms, audio underruns " << stats.audio_underruns << '\n';
 
-      usage = {};
+      usage.Reset();
       events.clear();
       ExportComposedTimeline(project, inject_fault ? fallback : baseline, Observe(providers, usage, inject_fault),
                              renderer, CodecPolicy::Auto, report);

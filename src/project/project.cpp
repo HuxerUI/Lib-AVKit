@@ -162,6 +162,13 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
               "Background replacement requires a visual clip and a normalized source crop");
         for (const auto channel : {effect.color.red, effect.color.green, effect.color.blue, effect.color.alpha})
           Check(channel >= 0 && channel <= 1, "Background color channels must be in [0, 1]");
+        if (effect.static_mask) Check(Versioned(effect.static_mask->resource), "Static mask needs a versioned resource");
+        if (effect.animated_mask) {
+          const auto& mask = *effect.animated_mask;
+          Check(!effect.static_mask, "A clip background accepts one packaged mask");
+          Check(Versioned(mask.resource) && (mask.playback == MaskPlayback::HoldLast || mask.playback == MaskPlayback::Loop),
+                "Animated mask needs a versioned resource and a valid playback mode");
+        }
       }
       for (const auto& sticker : clip.stickers) {
         unique_id(sticker.id);
@@ -239,6 +246,13 @@ void ProjectEdit::SetLayout(ClipId clip, Rect destination) { Clip(clip).destinat
 
 void ProjectEdit::SetBackground(ClipId clip, std::optional<BackgroundReplacement> background) {
   Clip(clip).background = std::move(background);
+}
+
+void ProjectEdit::SetBackgroundMaskResource(ClipId clip, ResourceRef resource) {
+  auto& background = Clip(clip).background;
+  Check(background && (background->static_mask || background->animated_mask), "The clip has no packaged mask binding");
+  if (background->static_mask) background->static_mask->resource = std::move(resource);
+  else background->animated_mask->resource = std::move(resource);
 }
 
 InstanceId ProjectEdit::AddSticker(ClipId clip, StickerSpec spec) {

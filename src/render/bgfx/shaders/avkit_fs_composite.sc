@@ -31,6 +31,7 @@ void main() {
             maskUv = clamp(maskUv, first * texel + halfTexel, end * texel - halfTexel);
             maskUv.y = mix(maskUv.y, 1.0 - maskUv.y, u_input_flips.z);
             coverage = texture2D(s_mask, maskUv).r;
+            coverage = mix(coverage, 1.0 - coverage, u_sampling[1].w);
         }
         foreground *= coverage;
         foreground += u_sampling[5] * (1.0 - foreground.a);

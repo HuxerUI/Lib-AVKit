@@ -109,6 +109,7 @@ struct BackgroundMask {
   Transform2D draw_to_mask_uv;
   Rect valid_uv{0, 0, 1, 1};
   Color color;
+  bool inverted{}; ///< Inverts coverage inside valid_uv.
   bool operator==(const BackgroundMask&) const = default;
 };
 

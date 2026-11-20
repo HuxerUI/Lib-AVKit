@@ -375,6 +375,12 @@ Pack both static and animated masks as `ResourceKind::Mask`. Effects and transit
 
 Applying a template validates mask versions, resource kinds, channels, and timing. The render plan binds the sampled pack mask as an `AssetImage` from the asset registry and caches it by pinned resource version and frame index. A template can also declare a portrait segmentation dependency. Core retrieves that analysis mask by source frame. A circular window effect can multiply a circular mask resource by portrait coverage. Both inputs use the same sampler binding mechanism. [Data textures](#data-textures)
 
+The static clip mask milestone uses `TemplateClip::background` and `BackgroundReplacement::static_mask`. The static resource supplies coverage for the background effect while bound. It uses normalized oriented source coordinates, so cropping and mirroring sample corresponding points in the color input and the mask. An opaque color fills uncovered pixels. A transparent color reveals lower tracks. Template planning validates the versioned reference and commits the binding with the clip. `ProjectEdit::SetBackgroundMaskResource` changes the reference for one clip, preserving the clip ID, crop, mirror, and inversion. Static bindings were introduced in `.avkit` version 7. The reader still accepts versions 1–6. [Project API](../include/huxerui/avkit/project.h)
+
+`TimelineFrame::static_masks` lists unique static resource references for the requested frame. The compositor supplies data textures in analysis, static, clip animation, then transition slot order. The macOS preview resolves the static references to bundled 8-bit grayscale PNGs, checks the resource and its format, and caches the decoded GPU surface by versioned reference. Preview and export use the same mapping and resource cache. [Timeline API](../include/huxerui/avkit/timeline.h)
+
+`BackgroundReplacement::animated_mask` binds a versioned mask sequence and a per-clip `MaskPlayback` policy through the same template background. A clip uses one packaged coverage source. Projects with sequence bindings use `.avkit` version 8. The compositor resolves `TimelineFrame::animated_masks` against the sequence's ordered PNGs and positive frame interval. It caches the resolved coverage by resource version and frame index. `AnimatedMaskSample` divides the clip-local project time by the exact interval and rounds down. The hold policy stops at the last frame and the loop policy wraps at the sequence duration. Seeking and descending project-time sampling evaluate the requested time directly. Changing a clip's source direction changes which video frame is sampled at that project time. [Timeline API](../include/huxerui/avkit/timeline.h)
+
 ## Thumbnails and waveforms
 
 Core resolves assets and tracks from the project snapshot and samples in source-track presentation time. The timeline maps visible intervals to source time using each clip's trim, speed, and direction, then draws the results over the corresponding project intervals. Playback has its own `TimelineSession`. Asset jobs use separate cursors and share codec resources through a bounded background queue. Playback has priority over background sampling.
@@ -1255,7 +1261,7 @@ Lib-Media platform adapters already include some software paths, such as GStream
 
 | Interface | Contract |
 | --- | --- |
-| `CodecProvider` | Pass a Lib-Media configuration to the typed `Probe` and `Open` overloads. Probe checks a concrete configuration on the codec worker sequence. Open confirms video storage and layout through `Negotiated()` and reports `Hardware`, `Software`, or `Unknown`. The first format event provides the session's stream description. |
+| `CodecProvider` | Pass a Lib-Media configuration to the typed `Probe` and `Open` overloads. Entry preparation can probe and open independent decoders concurrently. Open confirms video storage and layout through `Negotiated()` and reports `Hardware`, `Software`, or `Unknown`. The first format event provides the session's stream description. |
 | `VideoDecoderSession` | Submit `media::EncodedPacket` in decode order. Read `media::VideoDecodeOutput` for the frame format, pictures in presentation order, and EOS. Later format events can describe a change. |
 | `VideoEncoderSession` | Submit `media::VideoFrame` and read `media::VideoEncodeOutput`. Configure the mux track from the announced bitstream description before writing access units. |
 | `AudioDecoderSession` and `AudioEncoderSession` | Supply the exact PCM format in the configuration. Reuse `media::AudioFrame`, `AudioDecodeOutput`, and `AudioEncodeOutput`. The encode summary carries input sample count, priming, and tail padding per channel. |
@@ -1400,7 +1406,9 @@ Use `--verify` to check external registration, reparenting, parent deletion, equ
 
 Each timeline cursor opens only its selected video or audio decoder directly at the mapped source time. Sampling retires stale cursors before opening replacements. Audio sampling releases a clip's decoder when it reaches the trim end, including when one PCM block spans a cut.
 
-The macOS timeline preview fills the available capacity of its 250 ms PCM queue before deciding whether to sample another picture. It primes each new playback epoch from the start or seek position before requesting playback. The preview submits and seals the final PCM block together. For audio-clocked video, it checks the current PCM position again after composition and discards pictures that are at least 100 ms late. Once audio drains, the last in-range picture can still be published.
+The macOS timeline preview fills the available capacity of its 250 ms PCM queue before deciding whether to sample another picture. At startup and after a seek, it publishes the requested picture, primes audio, and requests playback. It then schedules up to two upcoming video entries within a rolling 400 ms lookahead. In the loaded DanceTrack regression, the delayed background decode takes up to 323 ms. The lookahead also gives the sampling sequence time to collect the result before entry. The preview submits and seals the final PCM block together.
+
+After the PCM clock first advances, preview uses steady elapsed time to pace pictures between device completion updates. The estimate stays within accepted PCM and at most 150 ms ahead of the confirmed position. It resets on seek or when playback leaves the playing state. A batched update can leave multiple pictures due. The preview tries the next picture if it still has a frame interval to compose before the 100 ms lateness threshold. It rechecks the clock after composition and discards pictures that miss the threshold. Once audio drains, the last in-range picture can still be published.
 
 Build the macOS example as in the file milestone. The verification takes a blue and a red 2.5-second fixture with audio and writes three project documents and their MP4 exports. It uses copies when simulating a missing file. Use a fresh result directory for each run.
 
@@ -1451,7 +1459,9 @@ The verification gives the clips a shared rectangle covering the middle 60% of t
 
 `TrackSource::reverse` reverses a 1× clip. `MapClipToSource` and `MapClipToProject` return ascending time ranges in either direction. Reverse video uses the frame immediately to the left of the mapped time. Reverse audio reads a short source window in increasing presentation time and outputs its sample frames in reverse order with channels intact. Project documents with reverse clips or relink revisions use `.avkit` version 3. [Project API](../include/huxerui/avkit/project.h)
 
-For reverse video, the clip cursor caches CPU pictures already decoded from the seek anchor, including mapped preroll that overlaps the clip trim. A cache miss opens a new window. Each cursor keeps up to 64 CPU pictures within 64 MiB, or one picture if it exceeds the byte budget. Cached CPU planes own their bytes independently of the decoder. Platform pictures retain the existing eight-frame lease limit. `TimelineSession::Seek` starts a new audio and analysis epoch and retains a reverse clip's CPU window if it covers the requested source picture. A full reset or a project revision change releases the window. [Timeline API](../include/huxerui/avkit/timeline.h)
+`TimelineSession::PrerollVideoEntries` selects up to two entries in order of entry time. It prepares reverse clips and trimmed forward clips that enter outside a transition while another clip continues. A worker closes its reverse decoder after filling the window. For a forward entry, the worker decodes through the first visible picture and transfers the cursor after its last call when `CodecNegotiation::allow_sequence_handoff` is set. The sampling sequence then owns subsequent calls and close. Fallback events recorded by the worker are delivered on the sampling sequence when the result is collected. Later fallback events are also delivered there. The native Lib-Media video adapter and FFmpeg opt in. On Web, preparation uses the software provider when worker threads are available. A missing result uses ordinary sampling. A rejected platform frame retries in software at the exact source PTS. [Timeline API](../include/huxerui/avkit/timeline.h) · [Codec API](../include/huxerui/avkit/codec.h)
+
+Each video cache keeps up to 64 CPU pictures within 64 MiB, or one picture if it exceeds the byte budget. Cached CPU planes own their bytes independently of the decoder. Each cache holds up to eight platform picture leases. A prepared forward cursor retains its recently decoded pictures for seeks and can advance through up to one second of source time on a forward seek. Reverse seeks can reuse CPU windows covering the target picture. `Seek` cancels pending jobs and releases future cursors unless the caller supplies the exclusive end of the new lookahead. Up to two prepared entries strictly within that window can be retained, including live forward decoders. The macOS preview uses its 400 ms lookahead for this call. A later lookahead update releases preparation for entries it no longer selects. A full reset or project revision change releases the windows. Analysis and composition run at the visible sample time.
 
 `AssetSampler` opens video-only and audio-only cursors on its owning worker sequence. Thumbnail requests report actual decoded PTS. The example selects an interior source time for each thumbnail cell and uses Lib-Media to fit and orient the frame before encoding it as a PNG `ImageAsset`. Waveform buckets align to the audio track start and contain each channel's minimum and maximum decoded PCM value. The example maps whole buckets back to the visible clip and draws them in playback order. The cache keys include the asset path, file metadata, relink revision, track, and sampling resolution. Coarse buckets can merge two cached half-size buckets while preserving their extrema. [Sampling API](../include/huxerui/avkit/asset_sampling.h)
 
@@ -1602,4 +1612,28 @@ work="$PWD/build/ncnn-portrait-check"
 "$preview" --timeline-verify-ncnn-mask "$source" "$pack" "$work" --mixed-models
 open -n "$app" --args --timeline-ncnn-preview "$work/ncnn-portrait.avkit" "$pack"
 "$preview" --timeline-ncnn-export "$work/ncnn-portrait.avkit" "$pack" "$work/export.mp4"
+```
+
+### Static template mask verification
+
+Use the saved mixed-model DanceTrack project from the portrait verification. The verifier uses its source, audio track, trims, and layouts to assemble two visual clips through a template. It binds one asymmetric grayscale PNG to both clips, replaces only the inset's reference, and checks the shared data slot, affected pixels, undo, redo, and reopening. Both playback directions and both seek directions compare to a source-space pixel calculation. Export compares pre-encode pictures and checks the reimported video timestamps and PCM continuity.
+
+```sh
+project="$PWD/build/ncnn-portrait-check/ncnn-portrait.avkit"
+work="$PWD/build/static-template-mask-check"
+"$preview" --timeline-verify-template-masks "$project" "$work"
+open -n "$app" --args --timeline-preview "$work/static-masks.avkit"
+"$preview" --timeline-export "$work/static-masks.avkit" "$work/export.mp4" --software-only
+```
+
+### Animated template mask verification
+
+Use the same DanceTrack project or the saved project from static template mask verification. The main clip and two insets share a three-frame grayscale PNG sequence with a `5/48 s` frame interval. The main clip holds the final frame. The insets start on project frames 12 and 13 and loop from their own starts. The verifier checks sequence boundaries, cropped and mirrored pixels, both seek directions, and descending project-time samples. During clocked playback it adds a 190 ms stall inside the second background decode. The backward seek targets frame 4 to keep both entries inside the 400 ms lookahead. Reversing all source directions makes the insets enter as prepared forward clips. The verifier also checks that a far seek releases both live cursors, that only one of two parallel jobs receives the injected platform fault, and that a rejected platform frame retries at the exact source PTS. It rejects skipped frame positions, late compositions, and PCM underruns. It records the largest frame interval within each playback run and reads back retained preview snapshots after playback. Preview and both exports are compared against their exact-time references.
+
+```sh
+project="$PWD/build/ncnn-portrait-check/ncnn-portrait.avkit"
+work="$PWD/build/animated-template-mask-check"
+"$preview" --timeline-verify-animated-template-masks "$project" "$work"
+open -n "$app" --args --timeline-preview "$work/animated-masks.avkit"
+"$preview" --timeline-export "$work/animated-masks.avkit" "$work/export.mp4" --software-only
 ```

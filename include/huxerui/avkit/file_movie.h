@@ -96,6 +96,11 @@ private:
   friend class TimelineSession;
   // Retain mapped CPU preroll for the reverse cache while filtering platform pictures at the seek time.
   std::optional<media::VideoFrame> ReadVideoInternal(std::stop_token stop, std::optional<media::MediaTimestamp> cpu_preroll);
+  bool AllowsVideoSequenceHandoff() const noexcept;
+  void SetCodecFallbackHandler(OnCodecFallback report);
+  static media::VideoFrame RetryDetachedVideoFrame(const MovieAsset& movie, const MovieCodecProviders& providers,
+                                                  const media::VideoFrame& rejected, const PlatformVideoImportError& cause,
+                                                  const OnCodecFallback& report, std::stop_token stop);
 
   struct Impl;
   std::unique_ptr<Impl> impl_;

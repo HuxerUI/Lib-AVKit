@@ -16,6 +16,7 @@
 #include "timeline_preview.h"
 #include "timeline_mask_verify.h"
 #include "timeline_strip.h"
+#include "timeline_template_mask_verify.h"
 #include "timeline_tracking_verify.h"
 #endif
 #if defined(AVKIT_CAPTURE_PREVIEW)
@@ -92,6 +93,14 @@ int main(int argc, const char** argv) {
         avkit_preview::VerifyTimelineMasks(argv[2]);
         return 0;
       }
+      if (command == "--timeline-verify-template-masks" && argc == 4) {
+        avkit_preview::VerifyTimelineTemplateMasks(argv[2], argv[3]);
+        return 0;
+      }
+      if (command == "--timeline-verify-animated-template-masks" && argc == 4) {
+        avkit_preview::VerifyTimelineAnimatedTemplateMasks(argv[2], argv[3]);
+        return 0;
+      }
       if (command == "--timeline-mask-preview" && (argc == 3 || argc == 4)) {
         avkit_preview::ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
                                                 avkit_preview::CreateMockMaskProvider(), true);
@@ -139,6 +148,8 @@ int main(int argc, const char** argv) {
                    "       --timeline-verify-assets FIRST REPLACEMENT DIRECTORY\n"
                    "       --timeline-verify-tracking DIRECTORY\n"
                    "       --timeline-verify-masks DIRECTORY\n"
+                   "       --timeline-verify-template-masks PROJECT DIRECTORY\n"
+                   "       --timeline-verify-animated-template-masks PROJECT DIRECTORY\n"
                    "       --timeline-mask-preview PROJECT [SECONDS]\n"
                    "       --timeline-tracking-preview PROJECT [SECONDS]\n";
     } catch (const std::exception& error) {
