@@ -108,6 +108,15 @@ std::vector<File> RecentWorkbenchProjects(const File& data) {
 
 WorkbenchDocument EmptyWorkbenchProject() { return NewDocument({640, 360}, "未命名项目"); }
 
+WorkbenchDocument CreateWorkbenchProject(std::vector<AssetReference> assets) {
+  if (assets.empty()) throw std::invalid_argument("A new edit needs initial media");
+  auto document = EmptyWorkbenchProject();
+  for (auto& asset : assets) AppendWorkbenchMovie(document, std::move(asset));
+  document.project = std::make_shared<Project>(Project::FromSnapshot(*document.revision));
+  document.revision = document.project->Snapshot();
+  return document;
+}
+
 WorkbenchDocument OpenWorkbenchProject(const File& file) {
   auto project = std::make_shared<Project>(Project::Open(file));
   return {project, project->Snapshot(), file, file.Stem()};

@@ -84,7 +84,7 @@ if (IOS)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
-    target_sources(example_av_kit PRIVATE src/workbench_overlay.cpp)
+    target_sources(example_av_kit PRIVATE src/workbench_overlay.cpp src/workbench_photo.cpp)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -142,11 +142,12 @@ elseif (ANDROID)
             src/workbench_monitor.cpp
             platform/android/src/workbench_media.cpp
             platform/android/src/workbench_player.cpp
+            platform/android/src/workbench_thumbnail.cpp
     )
     target_include_directories(example_av_kit PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/android/src"
     )
-    target_link_libraries(example_av_kit PRIVATE log)
+    target_link_libraries(example_av_kit PRIVATE android EGL GLESv3 log)
 else ()
     target_sources(example_av_kit PRIVATE
             src/workbench_media_unavailable.cpp

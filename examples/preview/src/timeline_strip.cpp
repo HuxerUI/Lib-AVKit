@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -96,6 +98,40 @@ void ReadStrip(AssetSampler& sampler, TrackKind kind, const ProjectSnapshot& pro
 }
 
 } // namespace
+
+std::shared_ptr<const StripResult> UpdateStripSamples(std::shared_ptr<const StripResult> current,
+    std::shared_ptr<const StripResult> incoming, bool complete) {
+  if (!current || current->revision != incoming->revision ||
+      !Intersection(current->viewport.range, incoming->viewport.range)) return incoming;
+  if (current->viewport.thumbnail_step != incoming->viewport.thumbnail_step)
+    return complete ? incoming : current;
+
+  auto result = std::make_shared<StripResult>(*incoming);
+  const auto key = [](const StripThumbnail& cell) {
+    return std::pair{cell.clip.value, cell.project.start};
+  };
+  const auto less = [](const auto& lhs, const auto& rhs) {
+    return lhs.first != rhs.first ? lhs.first < rhs.first : Before(lhs.second, rhs.second);
+  };
+  std::map<decltype(key(StripThumbnail{})), std::size_t, decltype(less)> cells(less);
+  for (std::size_t i = 0; i < result->thumbnails.size(); ++i) cells.emplace(key(result->thumbnails[i]), i);
+  for (const auto& cell : current->thumbnails) {
+    if (!cell.thumbnail || !Intersection(cell.project, incoming->viewport.range)) continue;
+    const auto found = cells.find(key(cell));
+    if (found == cells.end()) {
+      result->thumbnails.push_back(cell);
+    } else if (auto& next = result->thumbnails[found->second]; !next.thumbnail && next.project == cell.project) {
+      next.thumbnail = cell.thumbnail;
+      next.placeholder_source = cell.placeholder_source;
+    }
+  }
+  if (!complete) {
+    std::ranges::copy_if(current->waveform, std::back_inserter(result->waveform), [&](const auto& bucket) {
+      return Intersection(bucket.project, incoming->viewport.range).has_value();
+    });
+  }
+  return result;
+}
 
 ThumbnailImage MakeStripThumbnail(const VideoFrame& frame, PixelSize size) {
   const VideoTextureOptions options{size.width, size.height, ImageFit::Cover};

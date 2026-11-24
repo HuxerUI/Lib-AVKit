@@ -6,12 +6,13 @@
 
 namespace avkit_preview {
 
-using WorkbenchVideoSelection = std::function<huxerui::Task<void>(std::vector<huxerui::File>)>;
+using WorkbenchMediaSelection = std::function<huxerui::Task<void>(std::vector<huxerui::File>)>;
 
-struct WorkbenchVideoRequest {
+struct WorkbenchMediaRequest {
   std::string title;
   std::uint32_t limit;
-  WorkbenchVideoSelection confirmed;
+  bool include_photos;
+  WorkbenchMediaSelection confirmed;
 };
 
 struct WorkbenchContext {
@@ -23,7 +24,7 @@ struct WorkbenchContext {
   huxerui::State<std::string> message;
   huxerui::State<bool> busy;
   huxerui::State<bool> exporting;
-  huxerui::State<std::shared_ptr<const WorkbenchVideoRequest>> videos;
+  huxerui::State<std::shared_ptr<const WorkbenchMediaRequest>> media_request;
   huxerui::State<bool> browse_library;
 };
 
@@ -54,7 +55,8 @@ huxerui::FilePickerFilter WorkbenchMovieFilter();
 huxerui::FilePickerFilter WorkbenchAudioFilter();
 bool CanSelectWorkbenchVideo(const WorkbenchContext& context);
 void SelectWorkbenchVideo(const WorkbenchContext& context, std::string title, std::uint32_t limit,
-                          WorkbenchVideoSelection confirmed);
+                          WorkbenchMediaSelection confirmed);
+void StartWorkbenchProject(const WorkbenchContext& context, std::function<void()> on_created);
 huxerui::FilePickerFilter WorkbenchProjectFilter();
 std::string WorkbenchSeconds(double seconds, int precision = 2);
 std::string WorkbenchTimecode(double seconds);

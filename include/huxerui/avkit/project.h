@@ -350,6 +350,8 @@ class Project {
 public:
   /// @brief Creates an empty project with the given physical canvas size.
   explicit Project(PixelSize canvas);
+  /// @brief Starts an editable project from a validated snapshot with empty undo and redo history.
+  static Project FromSnapshot(ProjectSnapshot snapshot);
   Project(const Project&) = delete;
   Project& operator=(const Project&) = delete;
   Project(Project&&) noexcept = default;

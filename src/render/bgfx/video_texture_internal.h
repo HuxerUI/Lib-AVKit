@@ -17,6 +17,9 @@ std::uint64_t GetBgfxInteropTexture(RenderBackend& backend, const ImageSurface& 
 ImportedFrame ImportDecodedBgfxFrame(RenderBackend& backend, const media::VideoFrame& frame,
                                      media::VideoTextureOptions options, TextureTransferPolicy policy);
 ImportedTexture FitCpuVideoFrame(const media::VideoFrame& frame, media::VideoTextureOptions options);
+/// Converts a straight-alpha sRGB bitmap to an opaque SDR encoder picture over black.
+EncoderPicture EncodeCpuBitmap(const Bitmap& bitmap, const media::VideoFormat& format, media::MediaTimestamp pts,
+                               std::optional<media::MediaTimestamp> duration);
 PublishedTexture PublishBgfxTexture(RenderBackend& backend, const ColorSurface& surface, media::MediaTimestamp pts);
 EncoderPicture EncodeBgfxTexture(RenderBackend& backend, const ColorSurface& surface, const media::VideoEncoderConfig& config,
                                  media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration);

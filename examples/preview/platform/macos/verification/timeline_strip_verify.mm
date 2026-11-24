@@ -3,6 +3,7 @@
 #include "verification/codec_verification.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
+#include "workbench_media.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,60 @@ constexpr TimeRange Interval(std::int64_t start, std::int64_t end) { return {Tic
 
 void Check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
+}
+
+void CheckStripHandoff(const std::shared_ptr<const StripResult>& current) {
+  auto partial = std::make_shared<StripResult>(*current);
+  ++partial->generation;
+  partial->viewport.range.start = Tick(24);
+  const auto ready = current->thumbnails.at(2);
+  const auto next_clip = current->thumbnails.at(4);
+  partial->thumbnails = {ready};
+  partial->thumbnails.front().thumbnail.reset();
+  partial->waveform.clear();
+  const auto display = UpdateStripSamples(current, partial, false);
+  Check(display->thumbnails.size() == 6 && display->thumbnails.front().thumbnail &&
+        display->thumbnails.front().thumbnail->image == ready.thumbnail->image &&
+        std::ranges::any_of(display->thumbnails, [&](const auto& cell) {
+          return cell.clip == next_clip.clip && cell.thumbnail && cell.thumbnail->image == next_clip.thumbnail->image;
+        }) && !display->waveform.empty(), "Scrolling cleared usable pictures or the waveform while decoding");
+  auto zoomed = std::make_shared<StripResult>(*partial);
+  zoomed->viewport.thumbnail_step = Tick(6);
+  Check(UpdateStripSamples(display, zoomed, false) == display && UpdateStripSamples(display, zoomed, true) == zoomed,
+        "Zoom replaced the displayed strip before the new sampling grid was ready");
+  auto relinked = std::make_shared<StripResult>(*partial);
+  ++relinked->revision;
+  Check(UpdateStripSamples(display, relinked, false) == relinked, "A relink carried stale samples into the new project revision");
+}
+
+void CheckInitialProject(const File& directory, const AssetReference& video, const MovieCodecProviders& providers) {
+  const File photo_file(directory, "initial-photo.mp4");
+  auto photo_image = Bitmap::FromRgba8(97, 55, Bytes(97 * 55 * 4, std::byte{240}));
+  const auto photo = PrepareWorkbenchPhoto(std::move(photo_image), photo_file);
+  Check(photo.tracks.size() == 1 && photo.tracks.front().kind == TrackKind::Video &&
+        photo.tracks.front().presentation == Interval(0, 72), "The photo was not imported as one three-second video clip");
+  auto document = CreateWorkbenchProject({video, photo});
+  const auto baseline = document.revision;
+  Check(baseline->tracks.front().clips.size() == 2 && baseline->assets.front().source == video &&
+        baseline->assets.back().source == photo && !document.project->CanUndo() && !document.project->CanRedo(),
+        "Initial media order or baseline edit history was incorrect");
+  const auto second = baseline->tracks.front().clips.back();
+  TimelineSession session(baseline, providers, kSoftware);
+  for (const auto at : {Tick(60), Tick(131), Tick(76)}) {
+    session.Seek(at);
+    const auto frame = session.SampleVideo(at);
+    const auto& picture = std::get<VideoFrame>(frame.inputs.front());
+    Check(picture.format.visible.width == 98 && picture.format.visible.height == 56, "Seeking lost the initial photo");
+  }
+  document.project->Edit([&](ProjectEdit& edit) { edit.RemoveClip(second.id); });
+  Check(document.project->Undo() && document.project->Snapshot()->tracks == baseline->tracks &&
+        !document.project->Undo() && document.project->Redo(), "Undo did not stop at the initial media baseline");
+  document.project->Undo();
+  const File saved(directory, "initial-media.avkit");
+  document.project->Save(saved);
+  const auto reopened = OpenWorkbenchProject(saved);
+  Check(reopened.revision->tracks == baseline->tracks && !reopened.project->CanUndo(),
+        "Reopening lost the initial sequence or exposed its assembly as undo history");
 }
 
 Project MakeProject(const AssetReference& asset) {
@@ -239,7 +294,9 @@ void VerifyTimelineStrip(std::string_view first, std::string_view next, std::str
             "The first thumbnail was not published before the strip and waveform completed");
       Check(strip->thumbnails.size() == 8 && strip->thumbnails[0].source_time == Tick(12) &&
             strip->thumbnails[4].source_time == Tick(48), "Unexpected sampling grid across both clips");
+      CheckStripHandoff(strip);
     }
+    CheckInitialProject(directory, InspectTimelineMovie(original.file), providers);
 
     TimelineSession playback(base, providers, kSoftware);
     for (const auto [at, expected] : std::array<std::pair<int,int>, 5>{{{0, 6}, {47, 53}, {48, 53}, {49, 52}, {95, 6}}}) {

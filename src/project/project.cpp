@@ -473,6 +473,8 @@ void ProjectEdit::Relink(AssetId id, AssetReference replacement) {
 
 Project::Project(PixelSize canvas) : Project(ProjectSnapshot{.canvas = canvas}) {}
 
+Project Project::FromSnapshot(ProjectSnapshot snapshot) { return Project(std::move(snapshot)); }
+
 Project::Project(ProjectSnapshot snapshot) {
   detail::ValidateProject(snapshot);
   current_ = std::make_shared<const ProjectSnapshot>(std::move(snapshot));

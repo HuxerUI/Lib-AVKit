@@ -96,6 +96,44 @@ void CheckPagAlpha() {
             << " semitransparent pixels match bgfx source-over\n";
 }
 
+void CheckPointTextRendering() {
+  constexpr PixelSize size{960, 540};
+  constexpr std::array ink{96, 176, 240};
+  constexpr std::array<std::byte, 4> background{std::byte{40}, std::byte{90}, std::byte{170}, std::byte{255}};
+  auto backing = std::make_shared<decltype(background)>(background);
+  const ColorSurface solid{RetainImagePixels({{1, 1}, PixelFormat::Rgba8Unorm}, {BufferReference(*backing, backing), 4}),
+                           AlphaMode::Opaque};
+  const CanvasOverlay title{.id = {1}, .kind = CanvasOverlayKind::Text, .range = {Tick(0), Tick(40)},
+      .destination = {0.083F, 0.723F, 0.813F, 0.197F}, .text = "PAG overlay",
+      .style = {.foreground = Color::Rgb(ink[0], ink[1], ink[2], 0.64F)}};
+  const Draw text{.input_slot = 0, .blend = Blend::PremultipliedOver, .destination = title.destination, .opacity = 0.73F};
+  auto plan = std::make_shared<RenderPlan>(RenderPlan{{size, PixelFormat::Bgra8Unorm}, {text}});
+  MovieRenderer renderer(size);
+  PagOverlayStats stats;
+  const TimelineInput input = CanvasOverlaySample{title, Tick(0)};
+  const auto source = Pixels(renderer.Draw(TimelineFrame{Tick(0), plan, {input}}, stats, true));
+  Check(stats.batched_flushes == 1, "A single title did not use the canvas-sized PAG target");
+  auto backdrop = std::make_shared<RenderPlan>(*plan);
+  backdrop->draws.insert(backdrop->draws.begin(), {1, Blend::Replace});
+  const auto composed = Pixels(renderer.Draw(TimelineFrame{Tick(0), backdrop, {input, solid}}, stats, true));
+  Check(stats.batched_flushes == 1, "The unchanged title lost its canvas-sized cache");
+  unsigned edges = 0, fill = 0;
+  for (std::size_t i = 0; i < source.size(); i += 4) {
+    const int alpha = std::to_integer<int>(source[i + 3]);
+    edges += alpha > 12 && alpha < 108;
+    fill += alpha >= 108;
+    for (std::size_t channel = 0; channel < ink.size(); ++channel) {
+      const int color = std::to_integer<int>(source[i + channel]);
+      Check(std::abs(color - (ink[channel] * alpha + 127) / 255) <= 2, "A point text pixel has a dark fringe or incorrect alpha");
+      const auto expected = color + (std::to_integer<int>(background[channel]) * (255 - alpha) + 127) / 255;
+      Check(std::abs(std::to_integer<int>(composed[i + channel]) - expected) <= 1,
+            "The translucent title is not composited with premultiplied source-over");
+    }
+  }
+  Check(edges > 100 && fill > 100, "Expected antialiased edges and filled glyphs in the title");
+  std::cout << "Canvas-sized point text: " << edges << " edge pixels and " << fill << " fill pixels without a dark fringe\n";
+}
+
 void VerifyClocked(TimelineSession& session, const ProjectSnapshot& project, MovieRenderer& renderer,
                    const std::vector<Bytes>& expected) {
   session.Reset();
@@ -591,6 +629,7 @@ void VerifyTimelinePagTransition(std::string_view document, std::string_view dir
 
 void VerifyTimelinePagOverlayBatch(std::string_view first, std::string_view second, std::string_view directory) {
   @autoreleasepool {
+    CheckPointTextRendering();
     const File output(directory);
     Check(output.CreateDirectories(), "Cannot create the PAG overlay verification directory");
     Project project(kTransitionCanvas);

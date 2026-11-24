@@ -20,6 +20,8 @@ double Seconds(media::MediaTimestamp time) { return double(time.ticks) / time.ti
 
 } // namespace
 
+void InstallWorkbenchMedia(ApplicationContext&) {}
+
 bool HasWorkbenchMedia() { return true; }
 
 AssetReference ReadWorkbenchMovie(const File& file) { return InspectTimelineMovie(file); }

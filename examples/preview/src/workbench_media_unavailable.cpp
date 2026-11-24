@@ -9,6 +9,8 @@ namespace avkit_preview {
 using namespace huxerui;
 using namespace huxerui::avkit;
 
+void InstallWorkbenchMedia(ApplicationContext&) {}
+
 bool HasWorkbenchMedia() { return false; }
 
 OverlayAssets LoadOverlayAssets(const Resources&) { return {}; }
@@ -27,6 +29,10 @@ std::function<void()> ObserveWorkbenchMagnification(WindowHandle, std::function<
 
 AssetReference ReadWorkbenchMovie(const File&) {
   throw std::logic_error("Video import is unavailable in this build");
+}
+
+AssetReference PrepareWorkbenchPhoto(Bitmap, const File&) {
+  throw std::logic_error("Photo import is unavailable in this build");
 }
 
 std::optional<View> RequestedFilePreview() { return std::nullopt; }

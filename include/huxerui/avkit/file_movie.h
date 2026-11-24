@@ -152,7 +152,7 @@ using ReadRecordingAudio = std::function<std::optional<media::AudioFrame>()>;
 /// @brief Drains live readers and publishes a finalized MP4 on the caller's worker sequence.
 /// @param pcm Format shared by the audio reader and the export clock.
 /// @param video Picture reader producing positive-duration frames with contiguous timestamps.
-/// @param audio PCM reader producing contiguous samples on the same zero-based timeline.
+/// @param audio PCM reader producing contiguous samples on the same zero-based timeline. Pass an empty reader for video only.
 /// An empty read seals its track. Readers may wait for capture data or throw on interruption.
 /// A codec failure after admission aborts the current staged file.
 void WriteLiveMovie(const File& destination, const MovieCodecProviders& providers, const FileExportSettings& settings,

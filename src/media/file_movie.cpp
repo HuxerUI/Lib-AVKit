@@ -760,7 +760,7 @@ void ExportMovie(const MovieAsset& asset, const File& destination, const MovieCo
 void WriteLiveMovie(const File& destination, const MovieCodecProviders& providers, const FileExportSettings& settings,
                     const AudioFormat& pcm, const ReadRecordingVideo& video, const ReadRecordingAudio& audio,
                     OnCodecFallback on_fallback) {
-  if (!video || !audio || !pcm.sample_rate) throw std::invalid_argument("Live MP4 requires a video and PCM source");
+  if (!video || !pcm.sample_rate) throw std::invalid_argument("Live MP4 requires a video source and a valid sample clock");
   try {
     EncodeMp4(destination, providers, settings, pcm, pcm.sample_rate, video, audio,
               on_fallback, settings.policy == CodecPolicy::SoftwareOnly);

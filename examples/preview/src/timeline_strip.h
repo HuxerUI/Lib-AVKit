@@ -36,6 +36,9 @@ struct StripResult {
   std::string error;
 };
 
+std::shared_ptr<const StripResult> UpdateStripSamples(std::shared_ptr<const StripResult> current,
+    std::shared_ptr<const StripResult> incoming, bool complete);
+
 struct StripWorkerStats { std::uint64_t started{}, cancelled{}, delivered{}; };
 
 class StripWorker {

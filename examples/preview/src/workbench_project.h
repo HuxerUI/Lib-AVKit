@@ -39,6 +39,7 @@ huxerui::File WorkbenchDirectory(const huxerui::File& base, std::string_view nam
 huxerui::File WorkbenchOutput(const huxerui::File& base, std::string_view directory, std::string_view filename);
 std::vector<huxerui::File> RecentWorkbenchProjects(const huxerui::File& data);
 WorkbenchDocument EmptyWorkbenchProject();
+WorkbenchDocument CreateWorkbenchProject(std::vector<huxerui::avkit::AssetReference> assets);
 WorkbenchDocument OpenWorkbenchProject(const huxerui::File& file);
 std::vector<WorkbenchCaption> ReadWorkbenchCaptions(const huxerui::File& file);
 void AppendWorkbenchMovie(WorkbenchDocument& document, huxerui::avkit::AssetReference asset);

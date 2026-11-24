@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -29,6 +31,31 @@ Task<File> ImportWorkbenchReference(const File& data, const FileReference& picke
 }
 
 enum class Page : std::size_t { Home, Capture, Edit, Templates };
+
+void SelectWorkbenchMedia(const WorkbenchContext& context, WorkbenchMediaRequest request) {
+  if (context.browse_library.Get()) {
+    context.message = std::string{};
+    context.media_request = std::make_shared<const WorkbenchMediaRequest>(std::move(request));
+    return;
+  }
+  RunWorkbenchAction(context, [context, request = std::move(request)]() -> Task<void> {
+    if (!request.include_photos) {
+      const auto selected = co_await PickWorkbenchFile(context, WorkbenchMovieFilter(), "Media", "movie.mp4");
+      if (selected) co_await request.confirmed(std::vector<File>{*selected});
+      co_return;
+    }
+    auto filter = WorkbenchMovieFilter();
+    filter.name = "视频和图片";
+    filter.extensions.insert(filter.extensions.end(), {"jpg", "jpeg", "png"});
+    filter.content_types.insert(filter.content_types.end(), {"image/jpeg", "image/png"});
+    const auto picked = co_await context.picker->OpenFilesAsync(std::move(filter));
+    if (picked.empty()) co_return;
+    std::vector<File> files;
+    for (const auto& file : picked)
+      files.push_back(co_await ImportWorkbenchReference(context.data, file, "Media", "media"));
+    co_await request.confirmed(std::move(files));
+  });
+}
 
 struct Preset {
   WorkbenchTemplate kind;
@@ -111,7 +138,10 @@ View Home(WorkbenchContext context, State<Page> page, bool wide) {
   const bool busy = context.busy.Get();
   const auto files = recent.Get();
   const auto current = context.document.Get();
+  const auto new_project = [context, page] { StartWorkbenchProject(context, [page] { page = Page::Edit; }); };
+  const bool can_create = HasWorkbenchMedia() && CanSelectWorkbenchVideo(context);
   const auto destination = [&](const char* title, const char* summary, Page target) {
+    if (target == Page::Edit) return Entry(title, summary, theme, new_project, busy || !can_create, wide).With(Grow());
     return Entry(title, summary, theme, [page, target] { page = target; }, busy, wide).With(Grow());
   };
   View entries = wide ? View(Row{
@@ -124,9 +154,10 @@ View Home(WorkbenchContext context, State<Page> page, bool wide) {
       destination("剪辑", "素材、多轨时间线和导出", Page::Edit),
       destination("模板", "替换镜头并生成工程", Page::Templates),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-  const auto resume = [context, page, current, files] {
-    if (current || files.empty()) page = Page::Edit;
-    else OpenDocument(context, page, files.front());
+  const auto resume = [context, page, current, files, new_project] {
+    if (current) page = Page::Edit;
+    else if (!files.empty()) OpenDocument(context, page, files.front());
+    else new_project();
   };
   const auto feature_height = wide ? 248.0F : 172.0F;
   View feature = Stack{
@@ -136,7 +167,7 @@ View Home(WorkbenchContext context, State<Page> page, bool wide) {
           .Style(TextStyle{.font = Font::System(wide ? 26.0F : 19.0F).WithWeight(FontWeight::SemiBold),
                            .foreground = Color::White()}).LineLimit(1).Overflow(TextOverflow::Ellipsis),
       WorkbenchControl(Button(current || !files.empty() ? "继续剪辑" : "进入剪辑").OnClick(resume)
-                           .With(Enabled(!busy)), theme, WorkbenchActionTone::Primary),
+                           .With(Enabled(!busy && (current || !files.empty() || can_create))), theme, WorkbenchActionTone::Primary),
     }.With(Frame{.max_width = 263.0F}, Padding(12.0F), Spacing(8.0F),
         Background(Color::Rgb(10, 11, 13, 0.88F)), CornerRadius(7.0F))}
         .With(Padding(10.0F))}.With(MainAlign(MainAxisAlignment::End)),
@@ -327,7 +358,7 @@ View Workbench() {
   const auto busy = UseState(false);
   const auto exporting = UseState(false);
   const auto capturing = UseState(false);
-  const auto video_request = UseState(std::shared_ptr<const WorkbenchVideoRequest>{});
+  const auto media_request = UseState(std::shared_ptr<const WorkbenchMediaRequest>{});
   const auto browse_library = UseState(false);
   const auto library = media::UseMediaLibrary();
   const auto tasks = UseTaskScope();
@@ -338,7 +369,7 @@ View Workbench() {
     });
   });
   const WorkbenchContext context{tasks, UseService<FilePicker>(), directories.data_directory, directories.cache_directory,
-                                document, message, busy, exporting, video_request, browse_library};
+                                document, message, busy, exporting, media_request, browse_library};
   const auto selected = page.Get();
   const bool can_switch = !busy.Get() && !capturing.Get();
   const auto navigate = [page, message, template_detail](Page target) {
@@ -355,7 +386,11 @@ View Workbench() {
     case Page::Capture: content = CapturePage(context, page, capturing); break;
   }
   const auto nav_item = [&](const char* label, Page target) {
-    return WorkbenchTab(label, theme, [navigate, target] { navigate(target); }, selected == target, can_switch);
+    const bool new_edit = target == Page::Edit && !document.Get();
+    return WorkbenchTab(label, theme, [context, navigate, target, new_edit] {
+      if (new_edit) StartWorkbenchProject(context, [navigate] { navigate(Page::Edit); });
+      else navigate(target);
+    }, selected == target, can_switch && (!new_edit || (HasWorkbenchMedia() && CanSelectWorkbenchVideo(context))));
   };
   View navigation = Row{nav_item("工作台", Page::Home), nav_item("录制", Page::Capture),
                         nav_item("剪辑", Page::Edit), nav_item("模板", Page::Templates)}
@@ -386,22 +421,24 @@ View Workbench() {
     layout.push_back(Text(busy.Get() ? "正在处理…" : message.Get())
         .With(Foreground(theme.colors.primary), Padding(EdgeInsets::Symmetric(14.0F, 7.0F))));
   }
-  const auto request = video_request.Get();
+  const auto request = media_request.Get();
   View workbench = Column(std::move(layout)).With(CrossAlign(CrossAxisAlignment::Stretch), Background(theme.colors.background),
       Enabled(!request), Semantics{.hidden = bool(request)});
   View picker;
   if (request) {
-    picker = media::MediaLibraryPicker({.filter = media::MediaFilter::Videos, .selection_limit = request->limit,
+    picker = media::MediaLibraryPicker({.filter = request->include_photos ? media::MediaFilter::ImagesAndVideos : media::MediaFilter::Videos,
+        .selection_limit = request->limit,
         .title = request->title, .on_confirm = [context, request](std::vector<FileReference> references) {
-          context.videos = nullptr;
+          context.media_request = nullptr;
           if (references.empty()) return;
           RunWorkbenchAction(context, [context, request, references = std::move(references)]() -> Task<void> {
             std::vector<File> files;
             for (const auto& reference : references)
-              files.push_back(co_await ImportWorkbenchReference(context.data, reference, "Media", "movie.mp4"));
+              files.push_back(co_await ImportWorkbenchReference(context.data, reference, "Media",
+                                                                request->include_photos ? "media" : "movie.mp4"));
             co_await request->confirmed(std::move(files));
           });
-        }, .on_cancel = [video_request] { video_request = nullptr; }});
+        }, .on_cancel = [media_request] { media_request = nullptr; }});
     picker = std::move(picker).With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch),
                                     Background(theme.colors.background));
   }
@@ -545,16 +582,39 @@ bool CanSelectWorkbenchVideo(const WorkbenchContext& context) {
 }
 
 void SelectWorkbenchVideo(const WorkbenchContext& context, std::string title, std::uint32_t limit,
-                          WorkbenchVideoSelection confirmed) {
-  if (context.browse_library.Get()) {
-    context.message = std::string{};
-    context.videos = std::make_shared<const WorkbenchVideoRequest>(WorkbenchVideoRequest{std::move(title), limit, std::move(confirmed)});
-    return;
-  }
-  RunWorkbenchAction(context, [context, confirmed = std::move(confirmed)]() -> Task<void> {
-    const auto selected = co_await PickWorkbenchFile(context, WorkbenchMovieFilter(), "Media", "movie.mp4");
-    if (selected) co_await confirmed(std::vector<File>{*selected});
-  });
+                          WorkbenchMediaSelection confirmed) {
+  SelectWorkbenchMedia(context, {std::move(title), limit, false, std::move(confirmed)});
+}
+
+void StartWorkbenchProject(const WorkbenchContext& context, std::function<void()> on_created) {
+  SelectWorkbenchMedia(context, {"选择初始素材", 10, true,
+      [context, on_created = std::move(on_created)](std::vector<File> files) -> Task<void> {
+        std::vector<AssetReference> assets;
+        for (const auto& file : files) {
+          try {
+            auto extension = file.Extension();
+            std::ranges::transform(extension, extension.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (extension == ".png" || extension == ".jpg" || extension == ".jpeg") {
+              const auto source = co_await RunWorker([file] { return ImageAsset::FromFile(file); });
+              auto bitmap = co_await source.DecodeAsync();
+              assets.push_back(co_await RunWorker([file, data = context.data, bitmap = std::move(bitmap)]() mutable {
+                return PrepareWorkbenchPhoto(std::move(bitmap), WorkbenchOutput(data, "Media", file.Stem() + ".mp4"));
+              }));
+            } else {
+              assets.push_back(co_await RunWorker([file] { return ReadWorkbenchMovie(file); }));
+            }
+          } catch (const std::exception& failure) {
+            throw std::runtime_error("无法导入 " + file.Name() + "。" + failure.what());
+          }
+        }
+        auto document = co_await RunWorker([assets = std::move(assets)]() mutable {
+          return CreateWorkbenchProject(std::move(assets));
+        });
+        if (const auto current = context.document.Get(); current && current->dirty)
+          co_await SaveWorkbenchDocument(context);
+        context.document = std::move(document);
+        on_created();
+      }});
 }
 
 std::string WorkbenchSeconds(double seconds, int precision) {

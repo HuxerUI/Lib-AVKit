@@ -374,7 +374,6 @@ void PaintCanvasSelection(PaintContext& paint, Rect area, const CanvasItem& item
   if (area.IsEmpty()) return;
   const auto corners = CanvasCorners(item, area, canvas);
   auto outline = Path{}.MoveTo(corners[0]).LineTo(corners[1]).LineTo(corners[2]).LineTo(corners[3]).Close();
-  paint.StrokePath(outline, Color::Rgb(0, 0, 0, 0.75F), StrokeStyle{.width = 2.5F});
   paint.StrokePath(outline, Color::White(), StrokeStyle{.width = 1.0F});
   if (!show_controls) return;
   for (std::size_t index = 0; index < corners.size(); ++index) {
@@ -855,11 +854,14 @@ void PaintEditorTimeline(PaintContext& paint, Size size, const ProjectSnapshot* 
         paint.DrawRect(rect, audio ? Color::Rgb(21, 53, 49) : colors.surface_container_high, corner);
         paint.PushClip(rect, corner);
         if (samples && !audio) {
-          const auto first_ready = std::ranges::find_if(samples->thumbnails, [&](const StripThumbnail& item) {
-            return item.clip == clip.id && item.placeholder_source;
-          });
+          const StripThumbnail* first_ready = nullptr;
           for (const auto& item : samples->thumbnails) {
-            if (item.clip != clip.id || first_ready == samples->thumbnails.end()) continue;
+            if (item.clip != clip.id || !item.thumbnail) continue;
+            if (!first_ready || item.placeholder_source) first_ready = &item;
+            if (item.placeholder_source) break;
+          }
+          for (const auto& item : samples->thumbnails) {
+            if (item.clip != clip.id || !first_ready) continue;
             const auto first = x(Seconds(item.project.start) + thumbnail_shift);
             const auto last = x(Seconds(item.project.end) + thumbnail_shift);
             if (last <= kLaneHeader || first >= size.width) continue;
@@ -1862,10 +1864,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     });
   };
   const auto create = [context, enter, transport, timeline_left, timeline_zoom, track_scroll] {
-    RunWorkbenchAction(context, [=]() -> Task<void> {
-      if (const auto current = context.document.Get(); current && current->dirty)
-        co_await SaveWorkbenchDocument(context);
-      context.document = EmptyWorkbenchProject();
+    StartWorkbenchProject(context, [=] {
       enter(EditorTools::Main);
       transport.position = 0.0;
       transport.seek = 0.0;
@@ -1898,7 +1897,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     sheets.Show([=](BottomSheetContext sheet) {
       return Column{
         Text("工程", TextRole::Title),
-        WorkbenchControl(Button("新建工程").OnClick([=] { sheet.Dismiss(); create(); }), theme),
+        WorkbenchControl(Button("新建工程").OnClick([=] { sheet.Dismiss(); create(); })
+            .With(Enabled(HasWorkbenchMedia() && CanSelectWorkbenchVideo(context))), theme),
         WorkbenchControl(Button("打开工程").OnClick([=] { sheet.Dismiss(); open_project(); })
             .With(Enabled(context.picker->CanOpenFiles())), theme),
         WorkbenchControl(Button("保存工程").OnClick([=] { sheet.Dismiss(); save(); })

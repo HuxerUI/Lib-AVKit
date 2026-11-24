@@ -7,8 +7,10 @@
 
 namespace avkit_preview {
 
+void InstallWorkbenchMedia(huxerui::ApplicationContext& context);
 bool HasWorkbenchMedia();
 huxerui::avkit::AssetReference ReadWorkbenchMovie(const huxerui::File& file);
+huxerui::avkit::AssetReference PrepareWorkbenchPhoto(huxerui::Bitmap image, const huxerui::File& destination);
 huxerui::avkit::AssetReference ReadWorkbenchMusic(const huxerui::File& file, const huxerui::File& prepared,
                                                  const huxerui::avkit::ProjectSnapshot& project);
 huxerui::View WorkbenchVideoPicture(std::shared_ptr<huxerui::ExternalTexture> texture);

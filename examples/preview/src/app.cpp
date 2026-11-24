@@ -29,6 +29,7 @@ const Application application{
             .keyboard_avoidance = KeyboardAvoidance::Overlay,
         },
         .show_debug_overlay = false,
-        .application_hooks = {huxerui::avkit::Install, huxerui::media::Install, avkit_preview::InstallPreviewCapture},
+        .application_hooks = {huxerui::avkit::Install, huxerui::media::Install, avkit_preview::InstallPreviewCapture,
+                              avkit_preview::InstallWorkbenchMedia},
     }
 };

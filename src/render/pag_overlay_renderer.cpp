@@ -28,7 +28,7 @@ struct PointText {
 PointText PreparePointText(const CanvasOverlay& overlay, PixelSize canvas, const PagOverlayResources& assets, const PagFont* font) {
   const auto output_width = overlay.destination.width * canvas.width;
   const auto output_height = overlay.destination.height * canvas.height;
-  // Rasterize the overlay at its destination size in the current render target.
+  // Lay out the glyphs using the overlay's size in the current render target.
   const auto scale = std::min({1.0F, 8192.0F / output_width, 8192.0F / output_height});
   const auto width = static_cast<int>(std::max(8.0F, std::ceil(output_width * scale)));
   const auto height = static_cast<int>(std::max(8.0F, std::ceil(output_height * scale)));
@@ -40,14 +40,13 @@ PointText PreparePointText(const CanvasOverlay& overlay, PixelSize canvas, const
   if (!style) throw std::runtime_error("Cannot open the point text master");
   style->text = overlay.text;
   style->fontSize = height * 0.46F * overlay.style.size;
+  style->applyFill = true;
+  style->applyStroke = false;
   style->fillColor = PagColor(overlay.style.foreground);
   if (font) {
     style->fontFamily = font->Family();
     style->fontStyle = "Regular";
   }
-  style->applyStroke = true;
-  style->strokeWidth = std::max(0.6F * scale, height * 0.014F);
-  style->strokeOverFill = false;
   if (overlay.style.background.alpha > 0) {
     auto background = pag::PAGSolidLayer::Make(1'000'000, width, height, PagColor(overlay.style.background),
                                               Byte(overlay.style.background.alpha));
@@ -305,7 +304,7 @@ struct PagOverlayRenderer::Impl {
         auto end = start;
         group.clear();
         while (end < draws.size() && eligible(draws[end])) group.push_back(sources[draws[end++].input_slot]);
-        if (group.size() > 1) {
+        if (group.size() > 1 || group.front().entry->point_text) {
           auto found = std::ranges::find_if(batches, [&](const auto& batch) { return batch->Matches(group); });
           auto& batch = *(found == batches.end() ? batches.emplace_back(std::make_unique<OverlayBatch>(group, canvas)) : *found);
           batch.last_used = frame_number;

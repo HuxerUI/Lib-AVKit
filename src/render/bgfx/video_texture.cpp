@@ -73,9 +73,9 @@ float EncodeTransfer(std::byte sample, media::ColorTransfer transfer) {
   return static_cast<float>(std::pow(linear, 1.0 / kBt709DisplayGamma));
 }
 
-detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSurface& surface,
-                                         const media::VideoFormat& format, media::MediaTimestamp pts,
-                                         std::optional<media::MediaTimestamp> duration) {
+detail::EncoderPicture MakeEncoderPicture(std::span<const std::byte> source, bool bgra, RowOrigin origin,
+                                         bool straight_alpha, const media::VideoFormat& format,
+                                         media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) {
   using R = detail::EncoderPicture;
   using namespace media;
   const bool nv12 = format.pixel_format == VideoPixelFormat::NV12;
@@ -84,9 +84,6 @@ detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSur
       format.transfer == ColorTransfer::HLG) {
     return R::Failure({kUnsupported, "CPU texture transfer requires an eight-bit SDR I420 or NV12 encoder"});
   }
-  auto read = ReadBgfxPixels(backend, surface);
-  if (!read.Succeeded()) return R::Failure(read.Error());
-  const auto source = read.Value().AsBytes();
   const auto width = std::size_t(format.width);
   const auto height = std::size_t(format.height);
   const auto chroma_width = (width + 1) / 2;
@@ -98,15 +95,17 @@ detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSur
   const auto limited = [](float value, float scale, float offset) {
     return std::byte(std::lround(std::clamp(value * scale + offset, 0.0F, 255.0F)));
   };
-  const bool bgra = surface.pixels.image.format == PixelFormat::Bgra8Unorm;
   const float kr = format.matrix == ColorMatrix::BT601 ? 0.299F : 0.2126F;
   const float kb = format.matrix == ColorMatrix::BT601 ? 0.114F : 0.0722F;
   const auto sample = [&](std::size_t x, std::size_t y) {
-    const auto row = surface.pixels.origin == RowOrigin::TopLeft ? y : height - 1 - y;
+    const auto row = origin == RowOrigin::TopLeft ? y : height - 1 - y;
     const auto* color = source.data() + (row * width + x) * 4;
-    const auto r = EncodeTransfer(color[bgra ? 2 : 0], format.transfer);
-    const auto g = EncodeTransfer(color[1], format.transfer);
-    const auto b = EncodeTransfer(color[bgra ? 0 : 2], format.transfer);
+    const auto channel = [&](unsigned index) {
+      const auto value = straight_alpha ? std::byte((std::to_integer<unsigned>(color[index]) *
+          std::to_integer<unsigned>(color[3]) + 127) / 255) : color[index];
+      return EncodeTransfer(value, format.transfer);
+    };
+    const auto r = channel(bgra ? 2 : 0), g = channel(1), b = channel(bgra ? 0 : 2);
     const auto y_value = kr * r + (1 - kr - kb) * g + kb * b;
     return Yuv{y_value, (b - y_value) / (2 * (1 - kb)), (r - y_value) / (2 * (1 - kr))};
   };
@@ -141,6 +140,15 @@ detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSur
   VideoFrame result(format, pts, duration, std::move(planes));
   if (!result.Validate()) return R::Failure({kInvalidFrame, "CPU encoder picture has invalid timing or plane geometry"});
   return R::Success(std::move(result));
+}
+
+detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSurface& surface,
+                                         const media::VideoFormat& format, media::MediaTimestamp pts,
+                                         std::optional<media::MediaTimestamp> duration) {
+  auto read = ReadBgfxPixels(backend, surface);
+  if (!read.Succeeded()) return detail::EncoderPicture::Failure(read.Error());
+  return MakeEncoderPicture(read.Value().AsBytes(), surface.pixels.image.format == PixelFormat::Bgra8Unorm,
+                            surface.pixels.origin, false, format, pts, duration);
 }
 
 Task<detail::ImportedTexture> CompleteImport(detail::ImportedTexture result) {
@@ -289,6 +297,13 @@ detail::ImportedTexture detail::FitCpuVideoFrame(const media::VideoFrame& frame,
       options.width > 8192 || options.height > 8192)
     return ImportedTexture::Failure({kInvalidFrame, "Invalid CPU video frame or target extent"});
   return ImportCpuVideo(frame, options, avkit::detail::FitVideoTexture(frame.format, options));
+}
+
+detail::EncoderPicture detail::EncodeCpuBitmap(const Bitmap& bitmap, const media::VideoFormat& format,
+                                              media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) {
+  if (!bitmap.HasValue() || bitmap.PixelWidth() != format.width || bitmap.PixelHeight() != format.height)
+    return EncoderPicture::Failure({kInvalidFrame, "Bitmap must match the encoder's coded size"});
+  return MakeEncoderPicture(bitmap.Pixels(), false, RowOrigin::TopLeft, true, format, pts, duration);
 }
 
 Task<Result<ColorSurface, RenderError>> ImportBgfxTexture(

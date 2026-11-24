@@ -22,11 +22,16 @@ using namespace huxerui::avkit;
 
 double Seconds(media::MediaTimestamp time) { return double(time.ticks) / time.timescale; }
 
-PixelSize PreviewSize(PixelSize canvas) {
+PixelSize PreviewSize(PixelSize canvas, float display_scale) {
   const auto short_edge = std::min(canvas.width, canvas.height);
   const auto long_edge = std::max(canvas.width, canvas.height);
-  const auto scale = std::max(1U, std::min((540U + short_edge - 1U) / short_edge, 1280U / long_edge));
-  return {canvas.width * scale, canvas.height * scale};
+  const auto preferred_short = display_scale >= 2.0F ? 720.0 : 540.0;
+  const auto scale = std::min(preferred_short / short_edge, 1280.0 / long_edge);
+  if (scale <= 1.0) return canvas;
+  const auto pixels = [scale](std::uint32_t edge) {
+    return static_cast<std::uint32_t>(std::max(1L, std::lround(edge * scale / 2.0)) * 2);
+  };
+  return {pixels(canvas.width), pixels(canvas.height)};
 }
 
 PixelSize ExportSize(PixelSize canvas, unsigned short_edge) {
@@ -174,7 +179,8 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
   const auto playback = UseState(WorkbenchPlayback{});
   const auto exporting = context.exporting;
   const auto resource_pack = views.assets;
-  const auto size = has_media ? PreviewSize(project->canvas) : PixelSize{};
+  const auto display_scale = UseService<Resources>()->Configuration().display_scale;
+  const auto size = has_media ? PreviewSize(project->canvas, display_scale) : PixelSize{};
   const auto canvas = has_media && !exporting.Get() && resource_pack ? std::optional(size) : std::nullopt;
   Lifecycle([player, playback, canvas, resource_pack, timeline] {
     auto active = canvas ? std::make_shared<WorkbenchPlayer>(*canvas, *resource_pack) : nullptr;
@@ -211,8 +217,10 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
     tasks.Launch([active, playback, timeline]() -> Task<void> {
       while (!active->Closed()) {
         const auto state = active->Status();
-        if (state != playback.Get()) playback = state;
-        if (state.ready && !timeline.scrubbing.Get() && !timeline.seek.Get() && state.seconds != timeline.position.Get())
+        const auto previous = playback.Get();
+        if (state != previous) playback = state;
+        if (state.ready && (state.playing || previous.playing) && !timeline.scrubbing.Get() && !timeline.seek.Get() &&
+            state.seconds != timeline.position.Get())
           timeline.position = state.seconds;
         co_await Delay(std::chrono::milliseconds(60));
       }
@@ -450,6 +458,7 @@ std::shared_ptr<const StripResult> UseWorkbenchStrip(std::shared_ptr<const Proje
   struct PendingStrip {
     std::mutex mutex;
     std::shared_ptr<const StripResult> latest;
+    bool complete{};
     bool queued{};
   };
   const auto result = UseState(Sample{});
@@ -460,23 +469,30 @@ std::shared_ptr<const StripResult> UseWorkbenchStrip(std::shared_ptr<const Proje
     if (result->first != project) result = Sample{};
     if (sampler && project && visible.range.start.Compare(visible.range.end) == -1) {
       auto pending = std::make_shared<PendingStrip>();
-      const auto deliver = [tasks, generation, result, project, pending](std::shared_ptr<const StripResult> strip) {
+      const auto deliver = [tasks, generation, result, project, pending](std::shared_ptr<const StripResult> strip, bool complete) {
         {
           std::scoped_lock lock(pending->mutex);
           pending->latest = std::move(strip);
+          pending->complete = complete;
           if (std::exchange(pending->queued, true)) return;
         }
         tasks.Post([generation, result, project, pending] {
           std::shared_ptr<const StripResult> strip;
+          bool complete;
           {
             std::scoped_lock lock(pending->mutex);
             strip = std::move(pending->latest);
+            complete = pending->complete;
             pending->queued = false;
           }
-          if (generation.Get() == strip->generation) result = Sample{project, strip};
+          if (generation.Get() != strip->generation) return;
+          const auto current = result.Get();
+          result = Sample{project, UpdateStripSamples(current.first == project ? current.second : nullptr,
+                                                     std::move(strip), complete)};
         });
       };
-      request = sampler->Schedule(project, visible, deliver, deliver);
+      request = sampler->Schedule(project, visible, [deliver](auto strip) { deliver(std::move(strip), true); },
+                                                  [deliver](auto strip) { deliver(std::move(strip), false); });
     }
     generation = request;
     return [sampler, request] { if (request) sampler->Cancel(request); };

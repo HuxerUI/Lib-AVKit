@@ -1,5 +1,6 @@
 #include "workbench_media.h"
 #include "workbench_player.h"
+#include "workbench_thumbnail.h"
 
 #include <utility>
 
@@ -27,7 +28,8 @@ std::optional<int> RunFileMediaCommand(int, const char**) { return std::nullopt;
 
 std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectSnapshot> project, StripViewport visible) {
   return UseWorkbenchStrip(std::move(project), visible, [] {
-    return std::make_shared<StripWorker>(MovieCodecProviders{CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()}, MakeStripThumbnail);
+    return std::make_shared<StripWorker>(MovieCodecProviders{CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()},
+                                         OpenWorkbenchThumbnailSource());
   });
 }
 
