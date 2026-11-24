@@ -21,6 +21,8 @@ namespace huxerui::avkit {
 
 /// @brief Inspects a supported MP4 or MOV and returns its importable source tracks and ranges.
 AssetReference InspectTimelineMovie(const File& file);
+/// @brief Inspects a prepared PCM WAVE asset for use as an independent audio clip.
+AssetReference InspectTimelineAudio(const File& file);
 
 /// @brief Animated sticker instance sampled at a clip-local project time.
 struct AnimatedStickerSample {
@@ -33,7 +35,12 @@ struct AnimatedStickerSample {
 };
 
 /// @brief Decoded picture, sticker resource sample, or prepared color surface bound to an input slot.
-using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::ColorSurface, AnimatedStickerSample>;
+struct CanvasOverlaySample {
+  CanvasOverlay overlay;
+  media::MediaTimestamp elapsed;
+};
+
+using TimelineInput = std::variant<media::VideoFrame, ResourceRef, render::ColorSurface, AnimatedStickerSample, CanvasOverlaySample>;
 
 /// @brief Prepares a decoded input on the compositor sequence.
 /// Throw PlatformVideoImportError when a platform video texture cannot be shared with the compositor.
@@ -83,6 +90,13 @@ struct TimelineFrame {
   std::vector<TransitionAnimationSample> transition_animations;
 };
 
+/// @brief Transforms an already-sampled visual layer and its spatial descendants in normalized canvas coordinates.
+struct VisualTransformOverride {
+  std::variant<ClipId, InstanceId> target;
+  Transform2D transform;
+  bool operator==(const VisualTransformOverride&) const = default;
+};
+
 /// @brief Samples one immutable revision on a worker sequence.
 /// Each instance owns its codec cursors, analysis generations, and ECS world.
 class TimelineSession {
@@ -111,6 +125,10 @@ public:
   TimelineFrame SampleVideo(media::MediaTimestamp at, render::PixelFormat output = render::PixelFormat::Bgra8Unorm,
                             std::stop_token stop = {}, const ImportVideoFrame& import = {},
                             std::optional<std::chrono::milliseconds> analysis_wait = {});
+  /// @brief Re-evaluates the most recent sample's draws using its existing input slots and retained surfaces.
+  /// The override applies only to the returned plan. Use the original frame from the last SampleVideo call.
+  std::shared_ptr<const render::RenderPlan> RecomposeVideo(const TimelineFrame& frame,
+                                                          const VisualTransformOverride& override);
   /// @brief Requests up to two video entries strictly inside the lookahead, ordered by entry time.
   /// Selects reverse clips and trimmed forward clips that enter outside a transition while another picture remains visible.
   /// Call on the sampling sequence. Providers must support concurrent Probe and Open for independent sessions.
@@ -148,9 +166,11 @@ using ComposeTimelineFrame = std::function<media::VideoFrame(const TimelineFrame
 /// @param compose Compositor callback. A recoverable platform encoder failure can replay it from the start.
 /// @param analysis Provider for tracked stickers and portrait background replacement required by the project.
 /// @param import Optionally prepares video inputs with the same per-clip software retry as preview.
+/// @param target_format Color attachment format used by the compositor.
 void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
                     const MovieCodecProviders& providers, const FileExportSettings& settings,
                     const ComposeTimelineFrame& compose, OnCodecFallback on_fallback = {},
-                    std::shared_ptr<analysis::AnalysisProvider> analysis = {}, const ImportVideoFrame& import = {});
+                    std::shared_ptr<analysis::AnalysisProvider> analysis = {}, const ImportVideoFrame& import = {},
+                    render::PixelFormat target_format = render::PixelFormat::Bgra8Unorm);
 
 } // namespace huxerui::avkit

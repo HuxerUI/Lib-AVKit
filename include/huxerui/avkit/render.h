@@ -143,6 +143,7 @@ struct Draw {
   std::optional<Transform2D> transform;
   std::optional<SourceSampling> source_sampling;
   std::optional<DepthOcclusion> depth_occlusion; ///< Applies to source-over draws.
+  float opacity{1.0F}; ///< Multiplies premultiplied color and alpha after sampling.
   bool operator==(const Draw&) const = default;
 };
 

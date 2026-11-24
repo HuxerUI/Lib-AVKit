@@ -98,7 +98,7 @@ void CheckStrip(const StripResult& result, const ProjectSnapshot& project, const
     const auto& clip = locate(item.track, item.clip);
     const auto mapped = MapClipToSource(clip, item.project);
     Check(Before(mapped.start, item.source_time) && Before(item.source_time, mapped.end) && item.thumbnail &&
-          item.thumbnail->pts == FrameAt(item.source_time) && item.thumbnail->image.PixelWidth() == 96,
+          item.thumbnail->pts == FrameAt(item.source_time) && item.thumbnail->size == PixelSize{96, 54},
           "Thumbnail did not use the interior source time, actual PTS or pixel size");
     if (clip.source.reverse && previous_clip == item.clip)
       Check(Before(item.thumbnail->pts, *previous), "Reversed thumbnail strip did not descend in source PTS");
@@ -128,7 +128,7 @@ void VerifySourceCaches(const ProjectSnapshot& project, const ProjectSnapshot& r
                         const std::vector<std::int16_t>& pcm, const std::vector<std::int16_t>& replacement_pcm) {
   verification::DecoderUsage usage;
   const MovieCodecProviders counted{providers.platform, std::make_shared<verification::ObservedCodecProvider>(providers.software, &usage)};
-  AssetSampler sampler(counted, EncodeStripThumbnail, kSoftware);
+  AssetSampler sampler(counted, MakeStripThumbnail, kSoftware);
   const auto id = project.assets.front().id;
   ThumbnailRequest request{id, movie.video.id, {Tick(12), {1001, 1000}, {1501, 1000}}, {96, 54}};
   const auto pictures = sampler.ReadThumbnails(project, request);
@@ -153,7 +153,7 @@ void VerifySourceCaches(const ProjectSnapshot& project, const ProjectSnapshot& r
   Check(aligned.start == MediaTimestamp{6, 25} && aligned.peaks.size() == 202, "A partially trimmed waveform failed to return aligned full buckets");
   const auto audio_opens = usage.audio.opened;
   const auto changed = sampler.ReadThumbnails(relinked, {id, replacement.video.id, {Tick(12)}, {96, 54}});
-  Check(changed.front() && !std::ranges::equal(changed.front()->image.EncodedBytes(), pictures.front()->image.EncodedBytes()) &&
+  Check(changed.front() && !std::ranges::equal(std::get<Bitmap>(changed.front()->image).Pixels(), std::get<Bitmap>(pictures.front()->image).Pixels()) &&
         usage.video.opened == 2, "Relink reused a thumbnail from the old asset version");
   const auto new_wave = sampler.ReadWaveform(relinked, {id, replacement.audio.id, Interval(6, 54), {1, 50}});
   Check(usage.audio.opened > audio_opens && new_wave.peaks != aligned.peaks, "Relink reused peaks from the old asset version");
@@ -165,7 +165,7 @@ void VerifySourceCaches(const ProjectSnapshot& project, const ProjectSnapshot& r
 
 class ThumbnailGate {
 public:
-  ImageAsset Encode(const VideoFrame& frame, PixelSize size) {
+  ThumbnailImage Encode(const VideoFrame& frame, PixelSize size) {
     Check(std::this_thread::get_id() != playback_, "Timeline assets are using the playback sequence");
     {
       std::unique_lock lock(mutex_);
@@ -173,7 +173,7 @@ public:
       if (index <= 3 && !changed_.wait_for(lock, 6s, [&] { return released_ >= index; }))
         throw std::runtime_error("Timed out waiting for a newer viewport");
     }
-    return EncodeStripThumbnail(frame, size);
+    return MakeStripThumbnail(frame, size);
   }
 
   unsigned Entered() {
@@ -220,15 +220,23 @@ void VerifyTimelineStrip(std::string_view first, std::string_view next, std::str
       std::mutex mutex;
       std::condition_variable changed;
       std::shared_ptr<const StripResult> strip;
-      StripWorker worker(providers, EncodeStripThumbnail);
+      std::shared_ptr<const StripResult> first_picture;
+      StripWorker worker(providers, MakeStripThumbnail);
       worker.Schedule(base, VisibleStrip(*base, 0, 0), [&](std::shared_ptr<const StripResult> result) {
         std::scoped_lock lock(mutex);
         strip = std::move(result);
         changed.notify_one();
+      }, [&](std::shared_ptr<const StripResult> partial) {
+        std::scoped_lock lock(mutex);
+        if (!first_picture) first_picture = std::move(partial);
       });
       std::unique_lock lock(mutex);
       Check(changed.wait_for(lock, 6s, [&] { return bool(strip); }), "Initial trimmed and reversed strip did not finish");
       CheckStrip(*strip, *base, original, original_pcm);
+      Check(first_picture && first_picture->generation == strip->generation && first_picture->waveform.empty() &&
+            std::ranges::count_if(first_picture->thumbnails, &StripThumbnail::placeholder_source) == 1 &&
+            std::ranges::count_if(first_picture->thumbnails, [](const auto& cell) { return cell.thumbnail.has_value(); }) == 1,
+            "The first thumbnail was not published before the strip and waveform completed");
       Check(strip->thumbnails.size() == 8 && strip->thumbnails[0].source_time == Tick(12) &&
             strip->thumbnails[4].source_time == Tick(48), "Unexpected sampling grid across both clips");
     }

@@ -3,8 +3,8 @@
 /// @file
 /// @brief File import, per-track decode cursors, and staged MP4 output.
 ///
-/// Link AVKit::Media. The initial file profile uses one H.264 video track and one AAC-LC audio track
-/// in MP4 or MOV. Movie ranges and decoded PTS use the file's presentation clock.
+/// Link AVKit::Media. The file profile uses one 8-bit SDR H.264 or HEVC video track and an optional
+/// AAC-LC audio track in MP4 or MOV. Movie ranges and decoded PTS use the file's presentation clock.
 
 #include <cstdint>
 #include <functional>
@@ -20,7 +20,8 @@
 
 namespace huxerui::avkit {
 
-/// @brief Inspected file with selected tracks, their presentation ranges, and the decoded PCM format.
+/// @brief Inspected file with selected tracks and their presentation ranges.
+/// The audio track can be absent. In that case `pcm` provides the default mix format.
 struct MovieAsset {
   File file;
   media::MediaTrack video;
@@ -29,6 +30,9 @@ struct MovieAsset {
   media::MediaPresentationRange audio_range;
   media::MediaTimestamp end;
   media::AudioFormat pcm;
+
+  /// @brief Reports whether the file has a selected audio track.
+  bool HasAudio() const noexcept { return !audio.descriptions.empty(); }
 };
 
 /// @brief Provider candidates for independent audio and video sessions.
@@ -51,9 +55,16 @@ struct CodecFallback {
 /// @brief Receives fallback diagnostics on the calling worker sequence.
 using OnCodecFallback = std::function<void(const CodecFallback&)>;
 
-/// @brief Inspects a movie for the file profile and selects its first compatible video and audio tracks.
+/// @brief Selects the first compatible video track and, when present, a compatible audio track.
 /// @throws std::runtime_error On unsupported media metadata or I/O failure.
 MovieAsset ImportMovie(const File& file);
+
+/// @brief Inspects an AVKit PCM WAVE asset or a supported movie's original audio.
+MovieAsset ImportMovieAudio(const File& file);
+
+/// @brief Normalizes a local MP3, AAC, or WAVE source to an independently seekable PCM WAVE file.
+/// Link AVKit::FFmpeg. The destination is published after a successful decode and conversion.
+void PrepareTimelineAudio(const File& source, const File& destination, media::AudioFormat output);
 
 /// @brief A decoded platform video frame could not be imported by the compositor.
 class PlatformVideoImportError : public std::runtime_error {
@@ -111,6 +122,8 @@ struct FileExportSettings {
   media::VideoEncoderConfig video;
   std::uint32_t audio_bitrate{128000};
   CodecPolicy policy{CodecPolicy::Auto};
+  /// Optionally select the software AAC encoder independently of video.
+  CodecPolicy audio_policy{CodecPolicy::Auto};
 };
 
 /// @brief A compositor could not supply a frame using the negotiated platform storage.

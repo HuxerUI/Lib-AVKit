@@ -1,12 +1,9 @@
 #include <huxerui/avkit.h>
 #include <huxerui/huxerui.h>
+#include <huxerui/media_library.h>
 
 #include <exception>
 #include <utility>
-
-#if defined(__APPLE__)
-#include <TargetConditionals.h>
-#endif
 
 #include "capture_preview.h"
 #include "workbench_media.h"
@@ -28,10 +25,10 @@ const Application application{
     {
         .window = {
             .title = "AVKit Workbench",
-#if defined(TARGET_OS_OSX) && TARGET_OS_OSX
             .initial_size = {1200.0F, 800.0F},
-#endif
+            .keyboard_avoidance = KeyboardAvoidance::Overlay,
         },
-        .application_hooks = {huxerui::avkit::Install, avkit_preview::InstallPreviewCapture},
+        .show_debug_overlay = false,
+        .application_hooks = {huxerui::avkit::Install, huxerui::media::Install, avkit_preview::InstallPreviewCapture},
     }
 };

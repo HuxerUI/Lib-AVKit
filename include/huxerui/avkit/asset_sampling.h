@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <stop_token>
+#include <variant>
 #include <vector>
 
 #include <huxerui/avkit/file_movie.h>
@@ -27,16 +28,24 @@ struct ThumbnailRequest {
   PixelSize size;
 };
 
-/// @brief Encoded thumbnail and the actual decoded source presentation time.
+/// @brief Retained thumbnail image suitable for presentation on the UI sequence.
+using ThumbnailImage = std::variant<ImageAsset, Bitmap, std::shared_ptr<ExternalTexture>>;
+
+/// @brief Thumbnail image and the actual decoded source presentation time.
 struct Thumbnail {
   media::MediaTimestamp pts;
-  ImageAsset image;
+  ThumbnailImage image;
+  PixelSize size;
 };
 
 /// @brief Thumbnails in request order, with an empty entry for an unavailable picture.
 using ThumbnailStrip = std::vector<std::optional<Thumbnail>>;
+/// @brief Receives each resolved request slot on the sampling sequence, including cache hits.
+using OnThumbnail = std::function<void(std::size_t, const std::optional<Thumbnail>&)>;
 /// @brief Encodes an oriented picture at the requested physical size on the sampling sequence.
 using EncodeThumbnail = std::function<ImageAsset(const media::VideoFrame&, PixelSize)>;
+/// @brief Produces an oriented thumbnail at the requested physical size on the sampling sequence.
+using MakeThumbnail = std::function<ThumbnailImage(const media::VideoFrame&, PixelSize)>;
 
 /// @brief Requested source interval and bucket resolution for one audio track.
 struct WaveformRequest {
@@ -63,8 +72,8 @@ struct Waveform {
 /// Source caches are scoped by asset revision, file metadata, track, and resolution.
 class AssetSampler {
 public:
-  /// @brief Creates a sampler using the supplied codec providers and thumbnail encoder.
-  AssetSampler(MovieCodecProviders providers, EncodeThumbnail encode, CodecPolicy policy = CodecPolicy::Auto);
+  /// @brief Creates a sampler using the supplied codec providers and thumbnail adapter.
+  AssetSampler(MovieCodecProviders providers, MakeThumbnail make_thumbnail, CodecPolicy policy = CodecPolicy::Auto);
   ~AssetSampler();
   AssetSampler(const AssetSampler&) = delete;
   AssetSampler& operator=(const AssetSampler&) = delete;
@@ -72,7 +81,8 @@ public:
   /// @brief Decodes the video track and returns actual PTS in request order.
   /// @param stop Cooperatively cancels background sampling before publishing cache entries.
   /// @throws std::system_error With std::errc::operation_canceled when stopped.
-  ThumbnailStrip ReadThumbnails(const ProjectSnapshot& project, const ThumbnailRequest& request, std::stop_token stop = {});
+  ThumbnailStrip ReadThumbnails(const ProjectSnapshot& project, const ThumbnailRequest& request,
+                                std::stop_token stop = {}, const OnThumbnail& ready = {});
   /// @brief Decodes the audio track and returns whole buckets aligned to the track start.
   /// @throws std::system_error With std::errc::operation_canceled when stopped.
   Waveform ReadWaveform(const ProjectSnapshot& project, const WaveformRequest& request, std::stop_token stop = {});

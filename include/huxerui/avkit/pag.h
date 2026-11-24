@@ -1,19 +1,26 @@
 #pragma once
 
 /// @file
-/// @brief Optional libpag adapter for retained animation frames and two-input compositions.
+/// @brief libpag adapter for retained animation frames and two-input compositions.
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include <huxerui/avkit/animation.h>
 #include <huxerui/avkit/render.h>
 #include <huxerui/media_format.h>
 
 namespace huxerui::avkit {
+
+struct CanvasOverlay;
+struct ResourceRef;
+struct StickerReplacements;
+struct TimelineFrame;
 
 /// @brief Registers the first face in a packaged font for use by PAG text layers. Link AVKit::PAG.
 /// Share a font between animations using the same resource. The last owner releases the registration.
@@ -22,6 +29,8 @@ public:
   /// @throws std::invalid_argument If the bytes do not contain a supported font.
   explicit PagFont(BufferReference encoded);
   ~PagFont();
+  /// @brief Family registered for this packaged font on its owning sequence.
+  const std::string& Family() const noexcept { return family_; }
   PagFont(const PagFont&) = delete;
   PagFont& operator=(const PagFont&) = delete;
 
@@ -50,18 +59,62 @@ struct PagImageReplacement {
 class PagAnimation {
 public:
   /// @brief Opens the composition and applies replacements before the first sample.
+  /// @param backend Optional graphics backend kept alive on the owning sequence through destruction.
   /// @throws std::invalid_argument For invalid content, timing, or editable layer indices.
   explicit PagAnimation(BufferReference encoded, std::span<const PagTextReplacement> texts = {},
-                        std::span<const PagImageReplacement> images = {});
+                        std::span<const PagImageReplacement> images = {}, render::RenderBackend* backend = nullptr);
   ~PagAnimation();
   PagAnimation(const PagAnimation&) = delete;
   PagAnimation& operator=(const PagAnimation&) = delete;
 
-  /// @brief Rasterizes a clip-local elapsed time to a retained premultiplied RGBA8 surface.
+  /// @brief Samples a clip-local elapsed time to a retained premultiplied color surface.
   /// Previous surfaces stay readable when another time is sampled.
   /// @throws std::invalid_argument For an invalid elapsed time or playback mode.
   /// @throws std::runtime_error If libpag cannot render the requested animation frame.
   render::ColorSurface Sample(media::MediaTimestamp elapsed, AnimationPlayback playback);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+/// @brief Authored animation and resolved editable slots for one overlay instance.
+struct PagOverlayAsset {
+  BufferReference encoded;
+  std::vector<PagTextReplacement> texts;
+  std::vector<PagImageReplacement> images;
+};
+
+/// @brief Supplies packaged assets without giving the application ownership of the render cache.
+struct PagOverlayResources {
+  BufferReference point_text;
+  std::function<BufferReference(const ResourceRef&)> font;
+  std::function<PagOverlayAsset(const CanvasOverlay&)> canvas_animation;
+  std::function<PagOverlayAsset(const ResourceRef&, const StickerReplacements&)> clip_animation;
+};
+
+/// @brief Optional cumulative counters for one overlay renderer on its owning sequence.
+struct PagOverlayStats {
+  std::size_t flushes{}, batched_flushes{};
+  std::size_t text_layers{}, text_layer_cache_hits{}; ///< Prepared layers and reuses, independent of GPU flushes.
+  std::chrono::nanoseconds gpu_sync{}; ///< Time in platform fence and completion calls.
+};
+
+/// @brief Measures the normalized artwork bounds used when selecting a canvas overlay.
+Rect MeasurePagOverlay(const CanvasOverlay& overlay, PixelSize canvas, const PagOverlayResources& resources);
+
+/// @brief Binds PAG and other color sources for a complete timeline plan, before its bgfx submission.
+/// Keep the backend alive on the same execution sequence until this renderer is destroyed.
+class PagOverlayRenderer {
+public:
+  PagOverlayRenderer(render::RenderBackend& backend, PagOverlayResources resources);
+  ~PagOverlayRenderer();
+  using ResolveColor = std::function<render::ColorSurface(std::size_t slot)>;
+  /// @brief Retains and caches resolved textures. Data inputs retain their original slot order.
+  /// The reference path keeps each overlay in a dedicated texture for diagnostics.
+  render::RenderRequest Prepare(const TimelineFrame& frame, const ResolveColor& resolve_color,
+                                std::vector<render::ImageSurface> data = {}, PagOverlayStats* stats = nullptr,
+                                bool batch_overlays = true);
 
 private:
   struct Impl;

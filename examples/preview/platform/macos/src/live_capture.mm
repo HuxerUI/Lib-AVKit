@@ -1,4 +1,5 @@
 #include "live_capture.h"
+#include "workbench_render.h"
 #include "bgfx_metal_texture.h"
 #include "metal_preview.h"
 #include "movie_renderer.h"
@@ -454,6 +455,11 @@ struct LiveCapture::Impl {
   void Render(std::stop_token stop) {
     @autoreleasepool {
       try {
+        const WorkbenchRenderLease lease(stop);
+        if (!lease) {
+          mailbox->Finish();
+          return;
+        }
         MovieRenderer renderer(kCaptureSize);
         std::optional<std::chrono::nanoseconds> preview_origin;
         std::uint64_t preview_generation{};

@@ -51,19 +51,12 @@ huxerui_add_app(example_av_kit
 
 huxerui_configure_project_app(example_av_kit)
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(AVKIT_ENABLE_FILE_MEDIA ON)
-    set(AVKIT_ENABLE_FFMPEG ON)
-    set(AVKIT_ENABLE_PAG ON)
-    set(AVKIT_ENABLE_NCNN ON)
-endif ()
-
 huxerui_use_library(example_av_kit
         TARGET HuxerUI::AVKit
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+if (APPLE OR ANDROID OR WIN32 OR HUXERUI_LIBRARY_GRAPH_ONLY)
     set(AVKIT_LIB_CAMERA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../Lib-Camera"
             CACHE PATH "Lib-Camera source checkout")
     huxerui_use_library(example_av_kit TARGET HuxerUI::Camera PATH "${AVKIT_LIB_CAMERA_SOURCE_DIR}")
@@ -73,7 +66,13 @@ if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
 
-target_include_directories(example_av_kit PRIVATE src)
+target_include_directories(example_av_kit PRIVATE src "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+
+if (IOS OR ANDROID OR WIN32)
+    target_sources(example_av_kit PRIVATE src/capture_camera.cpp)
+elseif (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_sources(example_av_kit PRIVATE src/capture_unavailable.cpp)
+endif ()
 
 if (IOS)
     # Include the existing resource-free static targets in the HuxerUI iOS app archive.
@@ -84,14 +83,20 @@ if (IOS)
     huxerui_use_library(example_av_kit TARGET flecs::flecs_static)
 endif ()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
+    target_sources(example_av_kit PRIVATE src/workbench_overlay.cpp)
+endif ()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJCXX)
     target_sources(example_av_kit PRIVATE
             src/capture.cpp
             src/sticker_scene.cpp
+            src/timeline_playback.cpp
             src/timeline_strip.cpp
             src/timeline_strip_view.cpp
             src/verification/tracking_fixture.cpp
+            src/workbench_monitor.cpp
             platform/macos/src/file_preview.mm
             platform/macos/src/live_capture.mm
             platform/macos/src/media_commands.cpp
@@ -100,6 +105,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             platform/macos/src/timeline_preview.mm
             platform/macos/src/timeline_strip_macos.mm
             platform/macos/src/workbench_media.cpp
+            platform/macos/src/workbench_input.mm
             platform/macos/src/workbench_player.mm
             platform/macos/verification/timeline_depth_verify.mm
             platform/macos/verification/timeline_mask_verify.mm
@@ -117,11 +123,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             platform/macos/src
             platform/macos/verification
             "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/macos/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
     )
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    target_link_libraries(example_av_kit PRIVATE
-            AVKit::FFmpeg AVKit::PAG AVKit::NCNN "-framework CoreImage" "-framework ImageIO")
+    target_link_libraries(example_av_kit PRIVATE "-framework CoreImage" "-framework ImageIO")
     if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
         set(avkit_pag_framework "${CMAKE_MATCH_1}")
         get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
@@ -131,10 +135,20 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
                     "$<TARGET_BUNDLE_DIR:example_av_kit>/Contents/Frameworks/${avkit_pag_framework_name}"
                 VERBATIM)
     endif ()
+elseif (ANDROID)
+    target_sources(example_av_kit PRIVATE
+            src/timeline_playback.cpp
+            src/timeline_strip.cpp
+            src/workbench_monitor.cpp
+            platform/android/src/workbench_media.cpp
+            platform/android/src/workbench_player.cpp
+    )
+    target_include_directories(example_av_kit PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/android/src"
+    )
+    target_link_libraries(example_av_kit PRIVATE log)
 else ()
     target_sources(example_av_kit PRIVATE
-            src/bgfx_preview.cpp
-            src/capture_unavailable.cpp
             src/workbench_media_unavailable.cpp
     )
 endif ()

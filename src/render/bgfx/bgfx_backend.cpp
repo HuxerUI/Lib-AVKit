@@ -122,6 +122,15 @@ struct Target {
   bgfx::FrameBufferHandle framebuffer = BGFX_INVALID_HANDLE;
 };
 
+enum class Transfer : std::uint8_t { Identity, Bt709ToSrgb, SrgbToBt709 };
+
+struct TransferTextureStorage final : SurfaceStorage {
+  TransferTextureStorage(std::shared_ptr<const SurfaceStorage> texture, Transfer transfer)
+      : texture(std::move(texture)), transfer(transfer) {}
+  std::shared_ptr<const SurfaceStorage> texture;
+  Transfer transfer;
+};
+
 void DestroyTarget(const Target& target) {
   Destroy(target.framebuffer);
   Destroy(target.texture);
@@ -168,7 +177,7 @@ public:
     mask_sampler_ = bgfx::createUniform("s_mask", bgfx::UniformType::Sampler);
     depth_sampler_ = bgfx::createUniform("s_depth", bgfx::UniformType::Sampler);
     input_flips_ = bgfx::createUniform("u_input_flips", bgfx::UniformType::Vec4);
-    input_alpha_ = bgfx::createUniform("u_input_alpha", bgfx::UniformType::Vec4);
+    input_color_ = bgfx::createUniform("u_input_color", bgfx::UniformType::Vec4);
     mask_parameters_ = bgfx::createUniform("u_mask_parameters", bgfx::UniformType::Vec4);
     mask_region_ = bgfx::createUniform("u_mask_region", bgfx::UniformType::Vec4);
     sampling_ = bgfx::createUniform("u_sampling", bgfx::UniformType::Vec4, 6);
@@ -178,7 +187,7 @@ public:
     top_left_ = CreateQuad();
     if (!bgfx::isValid(program_) || !bgfx::isValid(masked_program_) || !bgfx::isValid(sampler_) ||
         !bgfx::isValid(incoming_sampler_) || !bgfx::isValid(mask_sampler_) || !bgfx::isValid(input_flips_) ||
-        !bgfx::isValid(input_alpha_) || !bgfx::isValid(mask_parameters_) || !bgfx::isValid(mask_region_) || !bgfx::isValid(destination_) ||
+        !bgfx::isValid(input_color_) || !bgfx::isValid(mask_parameters_) || !bgfx::isValid(mask_region_) || !bgfx::isValid(destination_) ||
         !bgfx::isValid(off_diagonal_) || !bgfx::isValid(top_left_) || !bgfx::isValid(sampling_) ||
         !bgfx::isValid(depth_sampler_) || !bgfx::isValid(occlusion_)) {
       throw std::runtime_error("Could not create the composite program or quad");
@@ -215,7 +224,7 @@ public:
     Destroy(mask_sampler_);
     Destroy(depth_sampler_);
     Destroy(input_flips_);
-    Destroy(input_alpha_);
+    Destroy(input_color_);
     Destroy(mask_parameters_);
     Destroy(mask_region_);
     Destroy(sampling_);
@@ -292,13 +301,18 @@ public:
     if (job_ && job_->ticket == ticket) job_.reset();
   }
 
-  detail::ImportedTexture Acquire(const ExternalTexture& texture) {
+  detail::ImportedTexture Acquire(const ExternalTexture& texture, const media::VideoFormat* decoded_format) {
     if (!bridge_) {
       return detail::ImportedTexture::Failure({RenderErrorCode::Unsupported, "No external GPU texture bridge is available"});
     }
     auto input = bridge_->Acquire(texture);
-    if (input.Succeeded() && !ValidInput(input.Value().pixels)) {
+    if (!input.Succeeded()) return input;
+    auto& pixels = input.Value().pixels;
+    if (!ValidInput(pixels)) {
       return detail::ImportedTexture::Failure({RenderErrorCode::Unsupported, "The GPU image cannot be sampled by this renderer"});
+    }
+    if (decoded_format && bridge_->SamplesBt709Signal(*decoded_format)) {
+      pixels.storage = std::make_shared<TransferTextureStorage>(std::move(pixels.storage), Transfer::Bt709ToSrgb);
     }
     return input;
   }
@@ -311,13 +325,40 @@ public:
     return detail::PublishedTexture::Failure({RenderErrorCode::Unsupported, "No external GPU texture bridge is available"});
   }
 
+  ColorSurface CreateInteropTexture(ImageDesc image) {
+    if (!bridge_ || image.format != image_.format) throw std::runtime_error("No compatible bgfx interop texture bridge");
+    auto storage = bridge_->CreateOutput(image);
+    if (!storage) throw std::runtime_error("Cannot create a bgfx interop texture");
+    return {{image, TargetOrigin(), std::move(storage)}, AlphaMode::Premultiplied};
+  }
+
+  std::uint64_t InteropTexture(const ImageSurface& image) const {
+    return bridge_ ? bridge_->GetTexture(image) : 0;
+  }
+
   detail::EncoderPicture Encode(const ColorSurface& surface, const media::VideoEncoderConfig& config,
                                 media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) {
     if (!FindTarget(surface.pixels)) {
       return detail::EncoderPicture::Failure({RenderErrorCode::InvalidFrame, "Expected a completed output lease"});
     }
-    if (bridge_) return bridge_->Encode(surface, config, pts, duration);
-    return detail::EncoderPicture::Failure({RenderErrorCode::Unsupported, "No external GPU texture bridge is available"});
+    using R = detail::EncoderPicture;
+    if (!bridge_) return R::Failure({RenderErrorCode::Unsupported, "No external GPU texture bridge is available"});
+    if (!bridge_->ExpectsBt709Signal(config)) return bridge_->Encode(surface, config, pts, duration);
+
+    if (!encoder_transfer_) {
+      encoder_transfer_ = std::make_shared<RenderPlan>(RenderPlan{image_, {Draw{0, Blend::Replace}}, {}});
+    }
+    auto input = surface;
+    input.alpha = AlphaMode::Opaque;
+    input.pixels.storage = std::make_shared<TransferTextureStorage>(surface.pixels.storage, Transfer::SrgbToBt709);
+    const auto submitted = TrySubmit({encoder_transfer_, {std::move(input)}, {}});
+    if (!submitted.Succeeded() || !submitted.Value())
+      return R::Failure({RenderErrorCode::Unsupported, "Cannot submit the GPU encoder color conversion"});
+    Pump();
+    auto converted = TryTake(*submitted.Value());
+    if (!converted.Succeeded() || !converted.Value())
+      return R::Failure({RenderErrorCode::Unsupported, "Cannot complete the GPU encoder color conversion"});
+    return bridge_->Encode(*converted.Value(), config, pts, duration);
   }
 
   Result<BufferReference, RenderError> ReadPixels(const ColorSurface& surface) {
@@ -345,8 +386,10 @@ private:
 
   const Target* FindTarget(const ImageSurface& surface) const {
     if (surface.image != image_ || surface.origin != TargetOrigin() || !surface.storage) return nullptr;
+    const auto* transfer = dynamic_cast<const TransferTextureStorage*>(surface.storage.get());
+    const auto& storage = transfer ? transfer->texture : surface.storage;
     for (const auto& target : targets_) {
-      if (target.storage == surface.storage) return &target;
+      if (target.storage == storage) return &target;
     }
     return nullptr;
   }
@@ -395,7 +438,7 @@ private:
       if (count > remaining_draws) return false;
       remaining_draws -= count;
       return std::ranges::all_of(draws, [&](const Draw& draw) {
-        if (draw.input_slot >= colors || draw.destination.IsEmpty()) return false;
+        if (draw.input_slot >= colors || draw.destination.IsEmpty() || !(draw.opacity >= 0 && draw.opacity <= 1)) return false;
         const auto quad = Destination(draw);
         const auto finite = [](float value) { return std::isfinite(value); };
         if (!std::ranges::all_of(quad.destination, finite) || !std::ranges::all_of(quad.off_diagonal, finite)) return false;
@@ -443,7 +486,14 @@ private:
     if (FindTarget(input)) return true;
     if (GetImagePixels(input))
       return bgfx::isTextureValid(0, false, 1, BgfxFormat(input.image.format), BGFX_TEXTURE_NONE);
-    return bridge_ && bridge_->GetTexture(input) != 0;
+    return bridge_ && BridgeTexture(input) != 0;
+  }
+
+  std::uint64_t BridgeTexture(const ImageSurface& input) const {
+    if (const auto* video = dynamic_cast<const TransferTextureStorage*>(input.storage.get())) {
+      return bridge_->GetTexture({input.image, input.origin, video->texture});
+    }
+    return bridge_->GetTexture(input);
   }
 
   bgfx::TextureHandle ImportInput(const ImageSurface& input, std::chrono::nanoseconds* upload_time) const {
@@ -462,7 +512,7 @@ private:
       if (upload_time) *upload_time += Clock::now() - start;
       return texture;
     }
-    return CreateTexture(input.image, BGFX_TEXTURE_NONE, nullptr, bridge_->GetTexture(input));
+    return CreateTexture(input.image, BGFX_TEXTURE_NONE, nullptr, BridgeTexture(input));
   }
 
   bool EnsureSubcompositionTargets(std::size_t count) {
@@ -529,6 +579,11 @@ private:
       if (mode == AlphaMode::Opaque) return 1.0F;
       return mode == AlphaMode::Straight ? 2.0F : 0.0F;
     };
+    const auto transfer = [&](std::uint32_t slot) {
+      if (slot >= external_colors) return float(Transfer::Identity);
+      const auto* storage = dynamic_cast<const TransferTextureStorage*>(request.inputs[slot].pixels.storage.get());
+      return float(storage ? storage->transfer : Transfer::Identity);
+    };
     bgfx::setViewFrameBuffer(view, target);
     bgfx::setViewRect(view, 0, 0, static_cast<std::uint16_t>(image_.size.width),
                       static_cast<std::uint16_t>(image_.size.height));
@@ -541,14 +596,14 @@ private:
       bgfx::setUniform(off_diagonal_, quad.off_diagonal.data());
       bgfx::setTexture(0, sampler_, color(draw.input_slot));
       const std::array modes{alpha(draw.input_slot), draw.masked_blend ? alpha(draw.masked_blend->incoming_slot) : 0.0F,
-                             0.0F, 0.0F};
-      bgfx::setUniform(input_alpha_, modes.data());
+                             transfer(draw.input_slot), draw.masked_blend ? transfer(draw.masked_blend->incoming_slot) : 0.0F};
+      bgfx::setUniform(input_color_, modes.data());
       auto program = program_;
       const auto flip = [](RowOrigin value) { return value == RowOrigin::BottomLeft ? 1.0F : 0.0F; };
       if (draw.masked_blend) {
         const auto& blend = *draw.masked_blend;
         const std::array flips{flip(origin(draw.input_slot)), flip(origin(blend.incoming_slot)),
-                               flip(request.data_inputs[blend.mask_slot].origin), 0.0F};
+                               flip(request.data_inputs[blend.mask_slot].origin), draw.opacity};
         const std::array parameters{blend.feather, blend.inverted ? 1.0F : 0.0F, 0.0F, 0.0F};
         const auto& rect = blend.mask_region;
         const std::array region{rect.x, rect.y, rect.width, rect.height};
@@ -566,7 +621,7 @@ private:
           uniforms[index + 1] = {uv.m12, uv.m22, uv.translate_y, 0};
         };
         put(0, sampling.draw_to_source_uv);
-        std::array flips{flip(origin(draw.input_slot)), 0.0F, 0.0F, 0.0F};
+        std::array flips{flip(origin(draw.input_slot)), 0.0F, 0.0F, draw.opacity};
         auto coverage = color(draw.input_slot);
         if (sampling.background) {
           const auto& background = *sampling.background;
@@ -620,6 +675,7 @@ private:
   std::vector<Target> targets_;
   std::vector<Target> subcomposition_targets_;
   std::optional<Job> job_;
+  std::shared_ptr<const RenderPlan> encoder_transfer_;
   std::uint64_t next_ticket_{1};
   bgfx::ProgramHandle program_ = BGFX_INVALID_HANDLE;
   bgfx::ProgramHandle masked_program_ = BGFX_INVALID_HANDLE;
@@ -628,7 +684,7 @@ private:
   bgfx::UniformHandle mask_sampler_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle depth_sampler_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle input_flips_ = BGFX_INVALID_HANDLE;
-  bgfx::UniformHandle input_alpha_ = BGFX_INVALID_HANDLE;
+  bgfx::UniformHandle input_color_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_parameters_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle mask_region_ = BGFX_INVALID_HANDLE;
   bgfx::UniformHandle sampling_ = BGFX_INVALID_HANDLE;
@@ -660,7 +716,6 @@ std::unique_ptr<RenderBackend> detail::CreateBgfxBackend(ImageDesc target, const
 
 std::unique_ptr<RenderBackend> CreateBgfxBackend(ImageDesc target, BgfxPlatformHandles handles) {
   bgfx::Init init;
-  init.type = bgfx::RendererType::AVKIT_BGFX_RENDERER;
   init.fallback = false;
   init.swapChain.nwh = handles.window;
   init.swapChain.ndt = handles.display;
@@ -684,8 +739,9 @@ Result<BufferReference, RenderError> ReadBgfxPixels(RenderBackend& backend, cons
   return Result<BufferReference, RenderError>::Failure({RenderErrorCode::Unsupported, "Expected a bgfx backend"});
 }
 
-detail::ImportedTexture detail::AcquireBgfxTexture(RenderBackend& backend, const ExternalTexture& texture) {
-  if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->Acquire(texture);
+detail::ImportedTexture detail::AcquireBgfxTexture(RenderBackend& backend, const ExternalTexture& texture,
+                                                  const media::VideoFormat* decoded_format) {
+  if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->Acquire(texture, decoded_format);
   return ImportedTexture::Failure({RenderErrorCode::Unsupported, "Expected a bgfx backend"});
 }
 
@@ -693,6 +749,16 @@ detail::PublishedTexture detail::PublishBgfxTexture(RenderBackend& backend, cons
                                                    media::MediaTimestamp pts) {
   if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->Publish(surface, pts);
   return PublishedTexture::Failure({RenderErrorCode::Unsupported, "Expected a bgfx backend"});
+}
+
+ColorSurface detail::CreateBgfxInteropTexture(RenderBackend& backend, ImageDesc image) {
+  if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->CreateInteropTexture(image);
+  throw std::runtime_error("Expected a bgfx backend");
+}
+
+std::uint64_t detail::GetBgfxInteropTexture(RenderBackend& backend, const ImageSurface& image) {
+  if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->InteropTexture(image);
+  return 0;
 }
 
 detail::EncoderPicture detail::EncodeBgfxTexture(RenderBackend& backend, const ColorSurface& surface,

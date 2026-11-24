@@ -317,7 +317,10 @@ id<MTLTexture> GetMetalTexture(const render::ColorSurface& surface) {
 namespace huxerui::avkit::render::detail {
 
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
-  if (init.swapChain.nwh) return CreateBgfxBackend(target, init);
+  if (init.swapChain.nwh) {
+    init.type = bgfx::RendererType::Metal;
+    return CreateBgfxBackend(target, init);
+  }
   @autoreleasepool {
     return macos::CreateBgfxBackend(MTLCreateSystemDefaultDevice(), target);
   }

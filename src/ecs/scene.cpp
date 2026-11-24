@@ -128,7 +128,7 @@ std::shared_ptr<const render::RenderPlan> SceneEvaluator::Evaluate(media::MediaT
                                {layer.input_slot, layer.blend, resolved->destination,
                                 mask ? std::optional{*mask} : std::nullopt, resolved->transform,
                                 sampling ? std::optional{*sampling} : std::nullopt,
-                                occlusion ? std::optional{*occlusion} : std::nullopt}});
+                                occlusion ? std::optional{*occlusion} : std::nullopt, layer.opacity}});
     } else {
       invalid_transform = true;
     }

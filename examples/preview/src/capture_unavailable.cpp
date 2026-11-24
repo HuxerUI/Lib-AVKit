@@ -1,4 +1,5 @@
 #include "capture_preview.h"
+#include "workbench.h"
 
 namespace avkit_preview {
 
@@ -9,9 +10,16 @@ std::optional<View> RequestedCapturePreview() { return std::nullopt; }
 std::optional<int> RunCaptureCommand(int, const char**) { return std::nullopt; }
 
 [[huxerui::composable]]
-View WorkbenchCapture(File, State<bool>, std::function<void(File)>) {
-  return Column{Text("录制", TextRole::Title), Text("当前平台的示例构建尚未接入相机和麦克风。")}
-      .With(Padding(16.0F), Spacing(12.0F));
+View WorkbenchCapture(File, State<bool>, std::function<void(File)>, std::function<void()> import_movie) {
+  const auto& theme = UseTheme();
+  return Column{
+    Column{
+      Text("相机录制不可用", TextRole::Title),
+      import_movie ? WorkbenchControl(Button("导入视频去剪辑").OnClick(std::move(import_movie)),
+          theme, WorkbenchActionTone::Primary) : View{},
+    }.With(Spacing(14.0F), CrossAlign(CrossAxisAlignment::Center)),
+  }.With(Padding(20.0F), Background(theme.colors.background), MainAlign(MainAxisAlignment::Center),
+        CrossAlign(CrossAxisAlignment::Center));
 }
 
 } // namespace avkit_preview

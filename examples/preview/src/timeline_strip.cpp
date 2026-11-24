@@ -10,6 +10,7 @@
 
 #include "support/cancellation.h"
 #include "support/media_time.h"
+#include "render/bgfx/video_texture_internal.h"
 
 namespace avkit_preview {
 namespace {
@@ -37,8 +38,10 @@ MediaTimestamp Midpoint(TimeRange range) {
   return Add(range.start, {duration.ticks, duration.timescale * 2});
 }
 
-void ReadStrip(AssetSampler& sampler, const ProjectSnapshot& project, StripResult& strip, std::stop_token stop) {
+void ReadStrip(AssetSampler& sampler, TrackKind kind, const ProjectSnapshot& project, StripResult& strip,
+               std::stop_token stop, const std::function<void()>& progress = {}) {
   for (const auto& track : project.tracks) {
+    if (track.kind != kind) continue;
     for (const auto& clip : track.clips) {
       CheckCancelled(stop);
       const auto& placement = clip.placement;
@@ -60,11 +63,18 @@ void ReadStrip(AssetSampler& sampler, const ProjectSnapshot& project, StripResul
           strip.thumbnails.push_back({track.id, clip.id, cell, source, {}});
           at = next;
         }
-        auto pictures = sampler.ReadThumbnails(project, request, stop);
-        for (std::size_t index = 0; index < pictures.size(); ++index)
-          strip.thumbnails[first + index].thumbnail = std::move(pictures[index]);
+        bool first_picture = true;
+        sampler.ReadThumbnails(project, request, stop, [&](std::size_t index, const auto& picture) {
+          auto& cell = strip.thumbnails[first + index];
+          cell.thumbnail = picture;
+          if (!picture) return;
+          cell.placeholder_source = std::exchange(first_picture, false);
+          if (progress) progress();
+        });
         continue;
       }
+
+      if (track.kind != TrackKind::Audio) continue;
 
       const auto wave = sampler.ReadWaveform(project, {placement.source.asset, placement.source.track,
           MapClipToSource(placement, *visible), strip.viewport.bucket_step}, stop);
@@ -87,16 +97,31 @@ void ReadStrip(AssetSampler& sampler, const ProjectSnapshot& project, StripResul
 
 } // namespace
 
+ThumbnailImage MakeStripThumbnail(const VideoFrame& frame, PixelSize size) {
+  const VideoTextureOptions options{size.width, size.height, ImageFit::Cover};
+  if (frame.Storage() == VideoStorage::Platform) {
+    auto texture = MakeExternalTexture(frame, options);
+    if (!texture.Succeeded()) throw PlatformVideoImportError(texture.Error().message);
+    return std::move(texture).Value();
+  }
+  const auto fitted = render::detail::FitCpuVideoFrame(frame, options);
+  if (!fitted.Succeeded()) throw std::runtime_error(fitted.Error().message);
+  const auto pixels = render::GetImagePixels(fitted.Value().pixels).value();
+  return Bitmap::CopyPixels(size.width, size.height, pixels.bytes.AsBytes(), pixels.row_bytes, Bitmap::PixelFormat::Rgba8888);
+}
+
 struct StripWorker::Impl {
   struct Work {
     std::uint64_t generation;
     std::shared_ptr<const ProjectSnapshot> project;
     StripViewport viewport;
     Publish publish;
+    Publish progress;
   };
 
-  Impl(MovieCodecProviders providers, EncodeThumbnail encoder)
-      : sampler(std::move(providers), std::move(encoder), CodecPolicy::SoftwareOnly),
+  Impl(MovieCodecProviders providers, MakeThumbnail make_thumbnail)
+      : thumbnails(static_cast<bool>(make_thumbnail)), pictures(providers, std::move(make_thumbnail)),
+        waveforms(std::move(providers), {}, CodecPolicy::SoftwareOnly),
         thread([this](std::stop_token stop) { Run(stop); }) {}
 
   ~Impl() {
@@ -125,11 +150,22 @@ struct StripWorker::Impl {
       }
 
       auto result = std::make_shared<StripResult>(StripResult{work->generation, work->project->revision, work->viewport});
-      try { ReadStrip(sampler, *work->project, *result, request); }
-      catch (const std::exception& error) {
+      try {
+        if (thumbnails) {
+          ReadStrip(pictures, TrackKind::Video, *work->project, *result, request, [&] {
+            if (work->progress && !request.stop_requested()) work->progress(std::make_shared<StripResult>(*result));
+          });
+        }
+      } catch (const std::exception& error) {
         result->error = error.what();
         result->thumbnails.clear();
-        result->waveform.clear();
+      }
+      if (!request.stop_requested()) {
+        try { ReadStrip(waveforms, TrackKind::Audio, *work->project, *result, request); }
+        catch (const std::exception& error) {
+          if (result->error.empty()) result->error = error.what();
+          result->waveform.clear();
+        }
       }
       {
         std::scoped_lock lock(mutex);
@@ -143,7 +179,8 @@ struct StripWorker::Impl {
     }
   }
 
-  AssetSampler sampler;
+  bool thumbnails;
+  AssetSampler pictures, waveforms;
   mutable std::mutex mutex;
   std::condition_variable changed;
   std::optional<Work> pending;
@@ -153,16 +190,17 @@ struct StripWorker::Impl {
   std::jthread thread;
 };
 
-StripWorker::StripWorker(MovieCodecProviders providers, EncodeThumbnail encoder)
-    : impl_(std::make_unique<Impl>(std::move(providers), std::move(encoder))) {}
+StripWorker::StripWorker(MovieCodecProviders providers, MakeThumbnail make_thumbnail)
+    : impl_(std::make_unique<Impl>(std::move(providers), std::move(make_thumbnail))) {}
 StripWorker::~StripWorker() = default;
 
-std::uint64_t StripWorker::Schedule(std::shared_ptr<const ProjectSnapshot> project, StripViewport viewport, Publish publish) {
+std::uint64_t StripWorker::Schedule(std::shared_ptr<const ProjectSnapshot> project, StripViewport viewport,
+                                    Publish publish, Publish progress) {
   if (!project || !Before(viewport.range.start, viewport.range.end) || !Before({}, viewport.thumbnail_step) || !Before({}, viewport.bucket_step))
     throw std::invalid_argument("Timeline strip needs a visible interval and positive sampling steps");
   std::scoped_lock lock(impl_->mutex);
   impl_->active.request_stop();
-  impl_->pending = Impl::Work{++impl_->generation, std::move(project), viewport, std::move(publish)};
+  impl_->pending = Impl::Work{++impl_->generation, std::move(project), viewport, std::move(publish), std::move(progress)};
   impl_->changed.notify_one();
   return impl_->generation;
 }

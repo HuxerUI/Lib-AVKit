@@ -23,6 +23,7 @@ struct TemplateClip {
   std::vector<StickerSpec> stickers;
   std::optional<BackgroundReplacement> background;
   bool reverse{};
+  bool include_original_audio{}; ///< Assemble linked audio from the same slot for this video clip.
 };
 
 /// @brief Template track and its clip definitions in assembly order.

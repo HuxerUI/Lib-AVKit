@@ -1,6 +1,7 @@
 #include <GLES3/gl3.h>
 #include <huxerui/android/external_texture.h>
 
+#include "bgfx_gles_texture.h"
 #include "gl_texture_bridge.h"
 
 namespace huxerui::avkit::render::detail {
@@ -29,8 +30,34 @@ void CopyIntoPublicationTexture(GLuint source, GLuint destination, PixelSize siz
   if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot copy the composite for EGL publication");
 }
 
+void PublishGlFrame(android::GlTexture& mailbox, GLuint name, PixelSize size) {
+  android::GlTexture::Frame frame{.texture_name = name, .pixel_width = static_cast<int>(size.width),
+                                 .pixel_height = static_cast<int>(size.height)};
+  try {
+    mailbox.PublishCurrent(frame);
+  } catch (const std::runtime_error&) {
+    // A separate GL image covers drivers that reject republishing a reused render target.
+    PublicationTexture copy(size);
+    CopyIntoPublicationTexture(name, copy.name, size);
+    frame.texture_name = copy.name;
+    mailbox.PublishCurrent(frame);
+  }
+}
+
 class GlesTextureBridge final : public GlTextureBridge {
 public:
+  bool SamplesBt709Signal(const media::VideoFormat& format) const override {
+    // The EGL video sampler expands the range and applies the matrix, retaining the SDR signal transfer.
+    // MediaCodec's SDR transfer code also covers BT.601. Select the BT.709 profile using both fields.
+    return format.pixel_format == media::VideoPixelFormat::Opaque && format.matrix == media::ColorMatrix::BT709 &&
+           format.transfer == media::ColorTransfer::BT709;
+  }
+
+  bool ExpectsBt709Signal(const media::VideoEncoderConfig& config) const override {
+    // The MediaCodec input surface converts RGB to YUV. It expects the requested signal transfer in RGB.
+    return config.input_storage == media::VideoStorage::Platform && config.input.transfer == media::ColorTransfer::BT709;
+  }
+
   ImportedTexture Acquire(const ExternalTexture& texture) override {
     using R = ImportedTexture;
     CollectReleasedNames();
@@ -57,17 +84,7 @@ public:
     const auto [width, height] = surface.pixels.image.size;
     try {
       auto mailbox = std::make_shared<android::GlTexture>(Size{float(width), float(height)});
-      android::GlTexture::Frame frame{.texture_name = name, .pixel_width = static_cast<int>(width),
-                                     .pixel_height = static_cast<int>(height)};
-      try {
-        mailbox->PublishCurrent(frame);
-      } catch (const std::runtime_error&) {
-        // A separate GL image covers drivers that reject republishing a reused render target.
-        PublicationTexture copy({width, height});
-        CopyIntoPublicationTexture(name, copy.name, {width, height});
-        frame.texture_name = copy.name;
-        mailbox->PublishCurrent(frame);
-      }
+      PublishGlFrame(*mailbox, name, {width, height});
       mailbox->Finish();
       return R::Success(std::move(mailbox));
     } catch (const std::exception& error) {
@@ -78,7 +95,15 @@ public:
 
 } // namespace
 
+void PublishBgfxGlTexture(android::GlTexture& mailbox, const ColorSurface& surface) {
+  const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+  if (!storage || storage->image != surface.pixels.image || storage->origin != surface.pixels.origin)
+    throw std::invalid_argument("Expected a completed GLES render target");
+  PublishGlFrame(mailbox, storage->name->texture, storage->image.size);
+}
+
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+  init.type = bgfx::RendererType::OpenGLES;
   if (target.format == PixelFormat::Rgba8Unorm) {
     return CreateBgfxBackend(target, init, std::make_unique<GlesTextureBridge>());
   }

@@ -83,6 +83,9 @@ void ValidateAsset(const AssetReference& source) {
               track.id && ids.insert(track.id).second && kinds.insert(track.kind).second,
           "Expected a single source track per media kind");
     ValidateRange(track.presentation);
+    if (track.display_size)
+      Check(track.kind == TrackKind::Video && track.display_size->width && track.display_size->height,
+            "Invalid source display dimensions");
   }
 }
 
@@ -92,6 +95,21 @@ std::uint64_t NextRevision(std::uint64_t revision) {
 }
 
 } // namespace
+
+Transform2D CanvasRotation(Rect destination, PixelSize canvas, float degrees) {
+  if (!canvas.width || !canvas.height || !std::isfinite(degrees))
+    throw std::invalid_argument("Canvas rotation needs a finite angle and a positive canvas size");
+  if (degrees == 0) return {};
+  const auto radians = std::remainder(degrees, 360.0F) * 0.017453292519943295F;
+  const auto cosine = std::cos(radians), sine = std::sin(radians);
+  const auto aspect = float(canvas.width) / canvas.height;
+  const auto center = Point{destination.x + destination.width / 2, destination.y + destination.height / 2};
+  Transform2D transform{cosine, sine * aspect, -sine / aspect, cosine};
+  const auto rotated = transform.Apply(center);
+  transform.translate_x = center.x - rotated.x;
+  transform.translate_y = center.y - rotated.y;
+  return transform;
+}
 
 TimeRange MapClipToSource(const ClipPlacement& clip, TimeRange project) {
   return MapInterval(project, clip.timeline, clip.source.range, clip.source.reverse);
@@ -121,6 +139,36 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
     unique_id(asset.id);
     ValidateAsset(asset.source);
   }
+  for (const auto& overlay : snapshot.overlays) {
+    unique_id(overlay.id);
+    ValidateRange(overlay.range);
+    ValidateRect(overlay.destination);
+    Check(std::isfinite(overlay.rotation_degrees), "Expected finite overlay rotation");
+    const auto check_color = [](Color color) {
+      for (const auto value : {color.red, color.green, color.blue, color.alpha})
+        Check(value >= 0 && value <= 1, "Overlay color components must be in [0, 1]");
+    };
+    check_color(overlay.style.foreground);
+    check_color(overlay.style.background);
+    Check(overlay.style.size >= 0.25F && overlay.style.size <= 4.0F && overlay.opacity >= 0 && overlay.opacity <= 1 &&
+          (overlay.style.font == ResourceRef{} || Versioned(overlay.style.font)), "Invalid overlay style");
+    switch (overlay.kind) {
+      case CanvasOverlayKind::Text:
+      case CanvasOverlayKind::Subtitle:
+        Check(!overlay.text.empty(), "Text overlays require content");
+        break;
+      case CanvasOverlayKind::Sticker:
+      case CanvasOverlayKind::PagText:
+        Check(Versioned(overlay.resource), "Canvas stickers need a versioned resource");
+        break;
+      default: throw std::invalid_argument("Unsupported canvas overlay kind");
+    }
+  }
+  std::unordered_map<std::uint64_t, const ClipInfo*> video_clips;
+  for (const auto& track : snapshot.tracks)
+    if (track.kind == TrackKind::Video)
+      for (const auto& clip : track.clips) video_clips.emplace(clip.id.value, &clip);
+  std::unordered_set<std::uint64_t> linked_audio;
   std::unordered_map<std::uint64_t, const TransitionInfo*> transitions;
   for (const auto& transition : snapshot.transitions) {
     unique_id(transition.id);
@@ -162,6 +210,22 @@ void ValidateProject(const ProjectSnapshot& snapshot) {
       Check(Difference(timeline.end, timeline.start) == Difference(source.range.end, source.range.start),
             "This timeline supports source playback at 1x");
       ValidateRect(clip.destination);
+      Check(std::isfinite(clip.rotation_degrees) && (track.kind == TrackKind::Video || !clip.rotation_degrees),
+            "Expected finite rotation on visual clips");
+      Check(track.kind == TrackKind::Video || !clip.fill, "Only visual clips have a picture fit mode");
+      const auto& mix = clip.audio_mix;
+      Check(std::isfinite(mix.gain) && mix.gain >= 0 && mix.gain <= 2 &&
+            mix.fade_in.timescale && mix.fade_in.ticks >= 0 && mix.fade_out.timescale && mix.fade_out.ticks >= 0,
+            "Invalid audio clip mix");
+      Check(track.kind == TrackKind::Audio || (!clip.audio_of && mix == AudioMix{}), "Audio settings require an audio clip");
+      if (clip.audio_of) {
+        const auto owner = video_clips.find(clip.audio_of->value);
+        Check(owner != video_clips.end() && linked_audio.insert(clip.audio_of->value).second,
+              "Original sound must have one video owner");
+        const auto& picture = owner->second->placement;
+        Check(picture.timeline == timeline && picture.source.asset == source.asset && picture.source.reverse == source.reverse,
+              "Original sound must follow its video clip");
+      }
       Check(track.kind == TrackKind::Video || clip.stickers.empty(), "Stickers require a visual clip");
       if (clip.background) {
         const auto& effect = *clip.background;
@@ -222,6 +286,8 @@ TimeRange ProjectSnapshot::Range() const {
     if (!track.clips.empty() && Before(end, track.clips.back().placement.timeline.end))
       end = track.clips.back().placement.timeline.end;
   }
+  for (const auto& overlay : overlays)
+    if (Before(end, overlay.range.end)) end = overlay.range.end;
   return {{}, end};
 }
 
@@ -266,8 +332,52 @@ ClipInfo& ProjectEdit::Clip(ClipId clip) {
   throw std::invalid_argument("Unknown clip identifier");
 }
 
-void ProjectEdit::SetClip(ClipId clip, ClipPlacement placement) { Clip(clip).placement = placement; }
+void ProjectEdit::SetClip(ClipId clip, ClipPlacement placement) {
+  auto& picture = Clip(clip);
+  const auto previous = picture.placement.source.range;
+  for (auto& track : draft_.tracks) {
+    if (track.kind != TrackKind::Audio) continue;
+    for (auto& audio : track.clips) {
+      if (audio.audio_of != clip) continue;
+      audio.placement.timeline = placement.timeline;
+      audio.placement.source.reverse = placement.source.reverse;
+      auto& range = audio.placement.source.range;
+      range.start = detail::Add(range.start, Difference(placement.source.range.start, previous.start));
+      range.end = detail::Add(range.end, Difference(placement.source.range.end, previous.end));
+    }
+  }
+  picture.placement = placement;
+}
 void ProjectEdit::SetLayout(ClipId clip, Rect destination) { Clip(clip).destination = destination; }
+void ProjectEdit::SetClipRotation(ClipId clip, float degrees) { Clip(clip).rotation_degrees = degrees; }
+void ProjectEdit::RemoveClip(ClipId clip) {
+  (void)Clip(clip);
+  for (auto& track : draft_.tracks) {
+    std::erase_if(track.clips, [clip](const auto& item) { return item.id == clip || item.audio_of == clip; });
+  }
+  std::erase_if(draft_.transitions, [clip](const auto& item) { return item.from == clip || item.to == clip; });
+}
+void ProjectEdit::SetClipFill(ClipId clip, bool fill) { Clip(clip).fill = fill; }
+void ProjectEdit::SetCanvas(PixelSize canvas) { draft_.canvas = canvas; }
+void ProjectEdit::BindAudio(ClipId audio, std::optional<ClipId> video) { Clip(audio).audio_of = video; }
+void ProjectEdit::SetAudioMix(ClipId audio, AudioMix mix) { Clip(audio).audio_mix = mix; }
+
+InstanceId ProjectEdit::AddOverlay(CanvasOverlay overlay) {
+  overlay.id = {AllocateId()};
+  const auto id = overlay.id;
+  draft_.overlays.push_back(std::move(overlay));
+  return id;
+}
+
+void ProjectEdit::SetOverlay(CanvasOverlay overlay) {
+  Find(draft_.overlays, overlay.id, "Unknown canvas overlay identifier") = std::move(overlay);
+}
+
+void ProjectEdit::RemoveOverlay(InstanceId id) {
+  const auto found = std::ranges::find(draft_.overlays, id, &CanvasOverlay::id);
+  Check(found != draft_.overlays.end(), "Unknown canvas overlay identifier");
+  draft_.overlays.erase(found);
+}
 
 void ProjectEdit::SetBackground(ClipId clip, std::optional<BackgroundReplacement> background) {
   Clip(clip).background = std::move(background);

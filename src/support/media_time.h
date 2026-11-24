@@ -46,6 +46,12 @@ inline std::int64_t ExactTicks(MediaTimestamp time, std::uint32_t scale) {
   return converted.ticks;
 }
 
+inline MediaTimestamp FloorOnGrid(MediaTimestamp time, std::uint32_t scale) {
+  auto converted = AtScale(time, scale);
+  if (Before(time, converted)) --converted.ticks;
+  return converted;
+}
+
 inline std::uint32_t UniformFrameIndex(MediaTimestamp offset, MediaTimestamp duration, std::uint32_t frame_count) {
   if (!frame_count || !offset.timescale || !duration.timescale || offset.ticks < 0 || offset.Compare(duration) != -1)
     throw std::invalid_argument("Frame sampling requires a nonempty sequence and time within its duration");

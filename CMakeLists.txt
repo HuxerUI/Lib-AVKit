@@ -30,20 +30,18 @@ huxerui_add_library(huxerui_avkit
 
 add_library(HuxerUI::AVKit ALIAS huxerui_avkit)
 
-set(AVKIT_LIB_MEDIA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Lib-Media" CACHE PATH "Lib-Media source checkout")
+set(AVKIT_LIB_MEDIA_SOURCE_DIR "" CACHE PATH "Optional Lib-Media source checkout")
 if (TARGET HuxerUI::Media)
     huxerui_use_library(huxerui_avkit TARGET HuxerUI::Media)
-else ()
+elseif (AVKIT_LIB_MEDIA_SOURCE_DIR)
     huxerui_use_library(huxerui_avkit TARGET HuxerUI::Media PATH "${AVKIT_LIB_MEDIA_SOURCE_DIR}")
+else ()
+    huxerui_use_library(huxerui_avkit
+            TARGET HuxerUI::Media
+            URL "https://github.com/HuxerUI/Lib-Media.git"
+            COMMIT "0cf9f33125bed200563e07626cbe7ae0eb978f38"
+    )
 endif ()
-
-option(AVKIT_ENABLE_FILE_MEDIA "Build the file media module and Lib-Media adapter" OFF)
-if (AVKIT_ENABLE_FILE_MEDIA)
-    option(AVKIT_ENABLE_FFMPEG "Build the FFmpeg software codec provider" ON)
-endif ()
-
-option(AVKIT_ENABLE_NCNN "Build the ncnn CPU vision analysis provider" OFF)
-option(AVKIT_ENABLE_PAG "Build the libpag animation adapter" OFF)
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
@@ -82,16 +80,7 @@ target_include_directories(avkit_core SYSTEM PUBLIC
 )
 
 include(cmake/AVKitBgfx.cmake)
-target_link_libraries(huxerui_avkit PUBLIC AVKit::Bgfx)
-
-if (AVKIT_ENABLE_FILE_MEDIA)
-    include(cmake/AVKitMedia.cmake)
-endif ()
-
-if (AVKIT_ENABLE_NCNN)
-    include(cmake/AVKitNCNN.cmake)
-endif ()
-
-if (AVKIT_ENABLE_PAG)
-    include(cmake/AVKitPAG.cmake)
-endif ()
+include(cmake/AVKitMedia.cmake)
+include(cmake/AVKitNCNN.cmake)
+include(cmake/AVKitPAG.cmake)
+target_link_libraries(huxerui_avkit PUBLIC AVKit::Bgfx AVKit::FFmpeg AVKit::NCNN AVKit::PAG)

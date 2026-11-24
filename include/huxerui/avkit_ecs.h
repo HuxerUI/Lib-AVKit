@@ -45,6 +45,7 @@ struct CompositeLayer {
   std::uint32_t input_slot;
   std::int32_t order;
   render::Blend blend{render::Blend::PremultipliedOver};
+  float opacity{1.0F};
 };
 
 /// @brief Owns the Flecs world for one scene evaluation sequence.

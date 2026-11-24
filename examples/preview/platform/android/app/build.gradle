@@ -41,6 +41,10 @@ def huxeruiTargetSdk = huxeruiProperty("huxeruiTargetSdk").toInteger()
 def huxeruiNdkVersion = huxeruiProperty("huxeruiNdkVersion")
 def huxeruiAbis = huxeruiProperty("huxeruiAbis").split(",")
 def huxeruiStl = huxeruiProperty("huxeruiStl")
+def pagArchive = providers.environmentVariable("AVKIT_ANDROID_PAG_AAR").orNull
+if (pagArchive == null || !file(pagArchive).isFile()) {
+    throw new GradleException("Set AVKIT_ANDROID_PAG_AAR to the libpag AAR for the preview app")
+}
 
 android {
     buildFeatures {
@@ -62,6 +66,7 @@ android {
             cmake {
                 arguments "-DANDROID_STL=${huxeruiStl}",
                         "-DHUXERUI_HOME=${huxeruiHome.absolutePath}",
+                        "-DAVKIT_ANDROID_PAG_AAR=${file(pagArchive).absolutePath}",
                         "-DHUXERUI_OPTIMIZATION=${providers.gradleProperty('huxeruiOptimization').orElse('default').get()}",
                         "-DHUXERUI_ENABLE_LTO=${providers.gradleProperty('huxeruiLto').orElse('OFF').get()}"
             }
@@ -174,6 +179,7 @@ androidComponents.onVariants(androidComponents.selector().all()) { variant ->
 }
 
 dependencies {
+    implementation files(pagArchive)
     if (rootProject.gradle.ext.huxeruiUsesSource) {
         implementation project(":HuxerUI")
     } else {

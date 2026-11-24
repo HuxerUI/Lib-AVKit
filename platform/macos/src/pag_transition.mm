@@ -3,6 +3,7 @@
 #include <huxerui/avkit/pag.h>
 
 #include "bgfx_metal_texture.h"
+#include "animation/pag_frame_renderer.h"
 #include "support/media_time.h"
 
 #import <CoreVideo/CoreVideo.h>
@@ -141,6 +142,34 @@ struct OutputSlot {
   std::shared_ptr<pag::PAGSurface> drawable;
 };
 
+class PagMetalTarget final : public detail::PagGpuTarget {
+public:
+  explicit PagMetalTarget(PixelSize size) : size_(size), device_(MTLCreateSystemDefaultDevice()) {
+    Check(device_ != nil, "No Metal device for the PAG render target");
+  }
+
+  ColorSurface Draw(pag::PAGPlayer& player, PagOverlayStats* stats) override {
+    auto found = std::ranges::find_if(outputs_, [](const auto& slot) { return slot->surface.pixels.storage.use_count() == 1; });
+    auto& slot = *(found != outputs_.end() ? *found : outputs_.emplace_back(
+        std::make_unique<OutputSlot>(device_, context_.Get(), size_)));
+    CurrentContext current(context_.Get());
+    player.setSurface(slot.drawable);
+    if (stats) ++stats->flushes;
+    player.flush();
+    const auto waiting = stats ? Clock::now() : Clock::time_point{};
+    glFinish();
+    if (stats) stats->gpu_sync += Clock::now() - waiting;
+    Check(glGetError() == GL_NO_ERROR, "PAG texture rendering failed");
+    return slot.surface;
+  }
+
+private:
+  GlContext context_;
+  PixelSize size_;
+  id<MTLDevice> device_;
+  std::vector<std::unique_ptr<OutputSlot>> outputs_;
+};
+
 class Interop {
 public:
   Interop(id<MTLDevice> device, PixelSize size)
@@ -194,6 +223,10 @@ id<MTLTexture> TextureFor(const ColorSurface& surface, PixelSize size) {
 }
 
 } // namespace
+
+std::unique_ptr<detail::PagGpuTarget> detail::CreatePagGpuTarget(render::RenderBackend&, PixelSize size) {
+  return std::make_unique<PagMetalTarget>(size);
+}
 
 struct PagTransition::Impl {
   Impl(BufferReference bytes, PixelSize size, int outgoing, int incoming)

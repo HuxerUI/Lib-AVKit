@@ -23,7 +23,6 @@
 </head>
 <body>
   <div id="huxerui-root"></div>
-  <canvas id="avkit-bgfx-canvas" hidden></canvas>
   <script type="module">
     import createHuxerUIApp from "./@HUXERUI_WEB_MODULE_FILE@";
 

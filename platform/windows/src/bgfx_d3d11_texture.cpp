@@ -133,6 +133,7 @@ private:
 } // namespace
 
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+  init.type = bgfx::RendererType::Direct3D11;
   auto bridge = std::make_unique<D3D11TextureBridge>();
   init.platformData.context = bridge->Device();
   return CreateBgfxBackend(target, init, std::move(bridge));

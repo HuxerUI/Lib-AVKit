@@ -7,7 +7,9 @@
 #include <huxerui/external_texture.h>
 
 #if defined(__OBJC__)
-#include <huxerui/avkit/timeline.h>
+#include "timeline_playback.h"
+#include "workbench_player.h"
+
 #include <huxerui/macos/external_texture.h>
 #endif
 
@@ -33,17 +35,6 @@ huxerui::avkit::MovieCodecProviders TimelineProviders();
 
 #if defined(__OBJC__)
 class MovieRenderer;
-inline constexpr std::uint32_t kTimelinePreviewRate = 24;
-using TimelineSeek = std::function<std::optional<huxerui::media::MediaTimestamp>(huxerui::media::MediaTimestamp)>;
-enum class TimelinePreviewMode { Interactive, Once };
-
-struct TimelinePlaybackStats {
-  std::size_t clocked_frames{};
-  std::size_t late_video_frames{};
-  double maximum_video_lag_ms{};
-  std::uint64_t audio_underruns{};
-};
-
 void RenderTimelineSample(huxerui::avkit::TimelineSession& session, MovieRenderer& renderer,
                           huxerui::media::MediaTimestamp at, huxerui::macos::MetalTexture& mailbox,
                           std::stop_token stop = {});
@@ -54,7 +45,8 @@ TimelinePlaybackStats PlayTimeline(huxerui::avkit::TimelineSession& session, hux
 void ExportComposedTimeline(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, const huxerui::File& file,
                             const huxerui::avkit::MovieCodecProviders& providers, MovieRenderer& renderer,
                             huxerui::avkit::CodecPolicy policy, huxerui::avkit::OnCodecFallback on_fallback = {},
-                            std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {});
+                            std::shared_ptr<huxerui::avkit::analysis::AnalysisProvider> analysis = {},
+                            const WorkbenchExportFrame& on_frame = {});
 #endif
 
 } // namespace avkit_preview

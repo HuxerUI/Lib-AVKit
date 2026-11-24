@@ -273,15 +273,23 @@ Task<detail::ImportedTexture> ImportSnapshot(Task<std::optional<Bitmap>> read) {
   }
 }
 
-detail::ImportedTexture AcquireTexture(RenderBackend& backend, const ExternalTexture& texture) {
+detail::ImportedTexture AcquireTexture(RenderBackend& backend, const ExternalTexture& texture,
+                                      const media::VideoFormat* decoded_format = nullptr) {
   try {
-    return detail::AcquireBgfxTexture(backend, texture);
+    return detail::AcquireBgfxTexture(backend, texture, decoded_format);
   } catch (const std::exception& error) {
     return detail::ImportedTexture::Failure({kUnsupported, error.what()});
   }
 }
 
 } // namespace
+
+detail::ImportedTexture detail::FitCpuVideoFrame(const media::VideoFrame& frame, media::VideoTextureOptions options) {
+  if (!frame.Validate() || frame.Storage() != media::VideoStorage::Cpu || options.width == 0 || options.height == 0 ||
+      options.width > 8192 || options.height > 8192)
+    return ImportedTexture::Failure({kInvalidFrame, "Invalid CPU video frame or target extent"});
+  return ImportCpuVideo(frame, options, avkit::detail::FitVideoTexture(frame.format, options));
+}
 
 Task<Result<ColorSurface, RenderError>> ImportBgfxTexture(
     RenderBackend& backend, std::shared_ptr<const ExternalTexture> texture, TextureTransferPolicy policy) {
@@ -320,7 +328,7 @@ detail::ImportedFrame detail::ImportDecodedBgfxFrame(RenderBackend& backend, con
   if (frame.Storage() == media::VideoStorage::Platform) {
     auto texture = media::MakeExternalTexture(frame, options);
     if (!texture.Succeeded()) return R::Failure({kUnsupported, texture.Error().message});
-    return wrap(AcquireTexture(backend, *texture.Value()));
+    return wrap(AcquireTexture(backend, *texture.Value(), &frame.format));
   }
   if (policy == TextureTransferPolicy::GpuOnly) {
     return R::Failure({kUnsupported, "A GPU transfer requires a platform video frame"});

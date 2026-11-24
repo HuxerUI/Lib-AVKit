@@ -21,6 +21,9 @@
 
 namespace huxerui::avkit {
 
+/// @brief Rotates normalized canvas positions around the destination center in physical canvas space.
+Transform2D CanvasRotation(Rect destination, PixelSize canvas, float degrees);
+
 /// @brief Half-open media interval [start, end) with exact rational boundaries.
 struct TimeRange {
   media::MediaTimestamp start, end;
@@ -47,6 +50,8 @@ struct AssetTrack {
   std::uint32_t id;
   media::TrackKind kind;
   TimeRange presentation;
+  /// Visible dimensions after applying the source orientation, when known.
+  std::optional<PixelSize> display_size;
   bool operator==(const AssetTrack&) const = default;
 };
 
@@ -199,6 +204,39 @@ struct BackgroundReplacement {
   bool operator==(const BackgroundReplacement&) const = default;
 };
 
+/// @brief Clip audio gain and linear fades in project time.
+struct AudioMix {
+  float gain{1.0F};
+  bool muted{};
+  media::MediaTimestamp fade_in, fade_out;
+  bool operator==(const AudioMix&) const = default;
+};
+
+enum class CanvasOverlayKind { Text, Subtitle, Sticker, PagText };
+
+/// @brief Style overrides for a canvas text instance. Font size is relative to its bounds.
+struct CanvasTextStyle {
+  Color foreground = Color::White();
+  Color background{0, 0, 0, 0};
+  float size{1.0F};
+  ResourceRef font;
+  bool operator==(const CanvasTextStyle&) const = default;
+};
+
+/// @brief A visual overlay with its own project-time interval and normalized canvas bounds.
+struct CanvasOverlay {
+  InstanceId id;
+  CanvasOverlayKind kind;
+  TimeRange range;
+  Rect destination;
+  std::string text;
+  ResourceRef resource;
+  CanvasTextStyle style;
+  float opacity{1.0F};
+  float rotation_degrees{}; ///< Clockwise about the center of the destination in canvas pixels.
+  bool operator==(const CanvasOverlay&) const = default;
+};
+
 /// @brief Clip placement, normalized canvas bounds, and clip-local stickers.
 struct ClipInfo {
   ClipId id;
@@ -206,6 +244,12 @@ struct ClipInfo {
   Rect destination{0, 0, 1, 1};
   std::vector<StickerInstance> stickers;
   std::optional<BackgroundReplacement> background;
+  /// On an audio clip, identifies the video clip that owns its original sound.
+  std::optional<ClipId> audio_of;
+  AudioMix audio_mix;
+  /// Crop the source proportionally to cover the destination rectangle.
+  bool fill{};
+  float rotation_degrees{}; ///< Clockwise about the center of the destination in canvas pixels.
   bool operator==(const ClipInfo&) const = default;
 };
 
@@ -225,6 +269,7 @@ struct ProjectSnapshot {
   std::vector<AssetInfo> assets;
   std::vector<TrackInfo> tracks;
   std::vector<TransitionInfo> transitions;
+  std::vector<CanvasOverlay> overlays;
 
   /// @brief Returns the project interval from zero to the last clip end.
   TimeRange Range() const;
@@ -248,6 +293,22 @@ public:
   void SetClip(ClipId clip, ClipPlacement placement);
   /// @brief Sets normalized canvas bounds for a clip.
   void SetLayout(ClipId clip, Rect destination);
+  /// @brief Sets clockwise picture rotation around the center of the destination.
+  void SetClipRotation(ClipId clip, float degrees);
+  /// @brief Removes a clip, its bound original audio, and its transitions.
+  void RemoveClip(ClipId clip);
+  /// @brief Chooses between fitting the complete image and covering the clip rectangle.
+  void SetClipFill(ClipId clip, bool fill);
+  /// @brief Sets the output canvas size in physical pixels.
+  void SetCanvas(PixelSize canvas);
+  /// @brief Attaches audio to its video clip, or exposes it as independent audio when detached.
+  void BindAudio(ClipId audio, std::optional<ClipId> video);
+  /// @brief Sets the mix parameters for an audio clip.
+  void SetAudioMix(ClipId audio, AudioMix mix);
+  /// @brief Inserts, updates, or removes a canvas overlay with a stable project identifier.
+  InstanceId AddOverlay(CanvasOverlay overlay);
+  void SetOverlay(CanvasOverlay overlay);
+  void RemoveOverlay(InstanceId id);
   /// @brief Sets or removes a visual clip's background and its coverage source.
   void SetBackground(ClipId clip, std::optional<BackgroundReplacement> background);
   /// @brief Rebinds an existing packaged mask on this clip while preserving its playback and inversion.
@@ -300,6 +361,10 @@ public:
   /// @param changes Synchronous callback. The ProjectEdit reference is valid only during this call.
   /// @return The committed revision. A rejected or interrupted edit preserves the previous revision.
   std::shared_ptr<const ProjectSnapshot> Edit(const std::function<void(ProjectEdit&)>& changes);
+  /// @brief Returns whether there is an edit to undo.
+  bool CanUndo() const noexcept { return !undo_.empty(); }
+  /// @brief Returns whether there is an undone edit to restore.
+  bool CanRedo() const noexcept { return !redo_.empty(); }
   /// @brief Restores the previous edit as a new revision, or returns false if history is empty.
   bool Undo();
   /// @brief Restores the next undone edit as a new revision, or returns false if history is empty.

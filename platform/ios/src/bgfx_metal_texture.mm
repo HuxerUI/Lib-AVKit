@@ -286,6 +286,7 @@ private:
 } // namespace
 
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+  init.type = bgfx::RendererType::Metal;
   if (init.swapChain.nwh) return CreateBgfxBackend(target, init);
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <huxerui/avkit/asset_sampling.h>
+#include <huxerui/paint.h>
 #include <huxerui/view.h>
 
 namespace avkit_preview {
@@ -17,6 +18,7 @@ struct StripThumbnail {
   huxerui::avkit::TimeRange project;
   huxerui::media::MediaTimestamp source_time;
   std::optional<huxerui::avkit::Thumbnail> thumbnail;
+  bool placeholder_source{};
 };
 
 struct StripBucket {
@@ -39,9 +41,10 @@ struct StripWorkerStats { std::uint64_t started{}, cancelled{}, delivered{}; };
 class StripWorker {
 public:
   using Publish = std::function<void(std::shared_ptr<const StripResult>)>;
-  StripWorker(huxerui::avkit::MovieCodecProviders providers, huxerui::avkit::EncodeThumbnail encoder);
+  StripWorker(huxerui::avkit::MovieCodecProviders providers, huxerui::avkit::MakeThumbnail make_thumbnail);
   ~StripWorker();
-  std::uint64_t Schedule(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, StripViewport viewport, Publish publish);
+  std::uint64_t Schedule(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, StripViewport viewport,
+                         Publish publish, Publish progress = {});
   void Cancel(std::uint64_t generation);
   StripWorkerStats Stats() const;
 
@@ -52,7 +55,10 @@ private:
 
 inline constexpr std::uint32_t kStripClock = 192;
 StripViewport VisibleStrip(const huxerui::avkit::ProjectSnapshot& project, std::int64_t left, unsigned zoom);
-huxerui::ImageAsset EncodeStripThumbnail(const huxerui::media::VideoFrame& frame, huxerui::avkit::PixelSize size);
+huxerui::avkit::ThumbnailImage MakeStripThumbnail(const huxerui::media::VideoFrame& frame, huxerui::avkit::PixelSize size);
+inline void DrawStripThumbnail(huxerui::PaintContext& paint, const huxerui::avkit::Thumbnail& thumbnail, huxerui::Rect rect) {
+  std::visit([&](const auto& image) { paint.DrawImage(image, rect); }, thumbnail.image);
+}
 void PaintTimelineStrip(huxerui::PaintContext& paint, huxerui::Size size,
                         const huxerui::avkit::ProjectSnapshot& project, const StripResult& strip);
 

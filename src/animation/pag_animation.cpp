@@ -10,6 +10,8 @@
 
 #include <pag/pag.h>
 
+#include "animation/pag_frame_renderer.h"
+
 namespace huxerui::avkit {
 namespace {
 
@@ -51,75 +53,48 @@ PagFont::PagFont(BufferReference encoded) : encoded_(std::move(encoded)) {
 
 PagFont::~PagFont() { pag::PAGFont::UnregisterFont({family_, kFontStyle}); }
 
-struct PagAnimation::Impl {
-  Impl(BufferReference bytes, std::span<const PagTextReplacement> texts, std::span<const PagImageReplacement> images)
-      : encoded(std::move(bytes)) {
-    const auto composition = OpenComposition(encoded);
-    ValidateEditableIndices(*composition, pag::LayerType::Text, texts);
-    ValidateEditableIndices(*composition, pag::LayerType::Image, images);
-    for (const auto& value : texts) {
-      auto document = composition->getTextData(value.editable_index);
-      if (!document) throw std::invalid_argument("Cannot open the editable PAG text document");
-      if (value.text) document->text = *value.text;
-      if (value.font) {
-        document->fontFamily = value.font->family_;
-        document->fontStyle = kFontStyle;
-        fonts.push_back(value.font);
-      }
-      if (value.text || value.font) composition->replaceText(value.editable_index, std::move(document));
+std::shared_ptr<pag::PAGFile> detail::OpenPagAnimation(const BufferReference& encoded,
+    std::span<const PagTextReplacement> texts, std::span<const PagImageReplacement> images) {
+  const auto composition = OpenComposition(encoded);
+  ValidateEditableIndices(*composition, pag::LayerType::Text, texts);
+  ValidateEditableIndices(*composition, pag::LayerType::Image, images);
+  for (const auto& value : texts) {
+    auto document = composition->getTextData(value.editable_index);
+    if (!document) throw std::invalid_argument("Cannot open the editable PAG text document");
+    if (value.text) document->text = *value.text;
+    if (value.font) {
+      document->fontFamily = value.font->Family();
+      document->fontStyle = kFontStyle;
     }
-    for (const auto& value : images) {
-      const auto pixels = value.encoded.AsBytes();
-      if (pixels.empty()) throw std::invalid_argument("PAG image replacement is empty");
-      auto image = pag::PAGImage::FromBytes(pixels.data(), pixels.size());
-      if (!image) throw std::invalid_argument("Cannot decode the PAG image replacement");
-      composition->replaceImage(value.editable_index, std::move(image));
-      image_bytes.push_back(value.encoded);
-    }
-    decoder = pag::PAGDecoder::MakeFrom(composition, composition->frameRate());
-    if (!decoder) throw std::invalid_argument("Cannot open the PAG decoder");
-    frames = decoder->numFrames();
-    frame_rate = decoder->frameRate();
-    if (frames <= 0 || !std::isfinite(frame_rate) || frame_rate <= 0)
-      throw std::invalid_argument("Invalid PAG animation timing");
-    image = {{static_cast<std::uint32_t>(decoder->width()), static_cast<std::uint32_t>(decoder->height())},
-             render::PixelFormat::Rgba8Unorm};
+    if (value.text || value.font) composition->replaceText(value.editable_index, std::move(document));
   }
+  for (const auto& value : images) {
+    const auto pixels = value.encoded.AsBytes();
+    if (pixels.empty()) throw std::invalid_argument("PAG image replacement is empty");
+    auto image = pag::PAGImage::FromBytes(pixels.data(), pixels.size());
+    if (!image) throw std::invalid_argument("Cannot decode the PAG image replacement");
+    composition->replaceImage(value.editable_index, std::move(image));
+  }
+  return composition;
+}
 
-  BufferReference encoded;
-  std::vector<std::shared_ptr<const PagFont>> fonts;
-  std::vector<BufferReference> image_bytes;
-  std::shared_ptr<pag::PAGDecoder> decoder;
-  render::ImageDesc image;
-  int frames;
-  float frame_rate;
-  int last_index{-1};
-  render::ColorSurface last_surface;
+struct PagAnimation::Impl {
+  Impl(BufferReference bytes, std::span<const PagTextReplacement> texts, std::span<const PagImageReplacement> images,
+       render::RenderBackend* backend)
+      : asset{std::move(bytes), {texts.begin(), texts.end()}, {images.begin(), images.end()}},
+        renderer(detail::OpenPagAnimation(asset.encoded, asset.texts, asset.images), backend) {}
+
+  PagOverlayAsset asset;
+  detail::PagFrameRenderer renderer;
 };
 
 PagAnimation::PagAnimation(BufferReference encoded, std::span<const PagTextReplacement> texts,
-                           std::span<const PagImageReplacement> images)
-    : impl_(std::make_unique<Impl>(std::move(encoded), texts, images)) {}
+                           std::span<const PagImageReplacement> images, render::RenderBackend* backend)
+    : impl_(std::make_unique<Impl>(std::move(encoded), texts, images, backend)) {}
 PagAnimation::~PagAnimation() = default;
 
 render::ColorSurface PagAnimation::Sample(media::MediaTimestamp elapsed, AnimationPlayback playback) {
-  if (elapsed.ticks < 0 || !elapsed.timescale ||
-      (playback != AnimationPlayback::HoldLast && playback != AnimationPlayback::Loop))
-    throw std::invalid_argument("Invalid animation sample time or playback mode");
-  auto& state = *impl_;
-  const auto frame = std::floor(static_cast<long double>(elapsed.ticks) * state.frame_rate / elapsed.timescale);
-  const auto index = playback == AnimationPlayback::Loop ? static_cast<int>(std::fmod(frame, state.frames)) :
-                     frame >= state.frames ? state.frames - 1 : static_cast<int>(frame);
-  if (index == state.last_index) return state.last_surface;
-
-  const auto stride = std::size_t(state.image.size.width) * 4;
-  auto pixels = std::make_shared<Bytes>(stride * state.image.size.height);
-  if (!state.decoder->readFrame(index, pixels->data(), stride, pag::ColorType::RGBA_8888, pag::AlphaType::Premultiplied))
-    throw std::runtime_error("PAG could not rasterize the sampled animation frame");
-  auto surface = render::RetainImagePixels(state.image, {BufferReference(*pixels, pixels), stride});
-  state.last_surface = {std::move(surface), render::AlphaMode::Premultiplied};
-  state.last_index = index;
-  return state.last_surface;
+  return impl_->renderer.Sample(elapsed, playback);
 }
 
 } // namespace huxerui::avkit

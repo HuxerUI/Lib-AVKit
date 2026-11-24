@@ -1,9 +1,9 @@
 $input v_texcoord0, v_targetcoord
 
 #include <bgfx_shader.sh>
-#include "avkit_alpha.sh"
+#include "avkit_color.sh"
 
-uniform vec4 u_input_alpha;
+uniform vec4 u_input_color;
 uniform vec4 u_input_flips;
 uniform vec4 u_sampling[6];
 uniform vec4 u_occlusion[5];
@@ -39,7 +39,7 @@ bool visibleAtDepth(vec2 targetUv) {
 void main() {
     vec2 uv = mapUv(v_texcoord0, u_sampling[0], u_sampling[1]);
     uv.y = mix(uv.y, 1.0 - uv.y, u_input_flips.x);
-    vec4 foreground = normalizeAlpha(texture2D(s_source, uv), u_input_alpha.x);
+    vec4 foreground = normalizeColor(texture2D(s_source, uv), u_input_color.x, u_input_color.z);
     if (u_sampling[0].w > 0.5) {
         vec2 maskUv = mapUv(v_texcoord0, u_sampling[2], u_sampling[3]);
         vec4 valid = u_sampling[4];
@@ -58,5 +58,5 @@ void main() {
         foreground *= coverage;
         foreground += u_sampling[5] * (1.0 - foreground.a);
     }
-    gl_FragColor = visibleAtDepth(v_targetcoord) ? foreground : vec4(0.0);
+    gl_FragColor = visibleAtDepth(v_targetcoord) ? foreground * u_input_flips.w : vec4(0.0);
 }

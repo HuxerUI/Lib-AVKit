@@ -129,7 +129,8 @@ void VerifyClocked(TimelineSession& session, const ProjectSnapshot& project, Mov
 }
 
 void VerifyExport(const std::shared_ptr<const ProjectSnapshot>& project, const MovieCodecProviders& codecs,
-                  const File& file, const std::vector<Bytes>& expected) {
+                  const File& file, const std::vector<Bytes>& expected, PagOverlayStats* stats = nullptr,
+                  bool batch_overlays = true) {
   MovieRenderer renderer(project->canvas);
   FileExportSettings settings;
   settings.policy = CodecPolicy::SoftwareOnly;
@@ -138,7 +139,7 @@ void VerifyExport(const std::shared_ptr<const ProjectSnapshot>& project, const M
   int written = 0;
   const auto import = [&](const VideoFrame& picture) { return renderer.ImportFrame(picture); };
   ExportTimeline(project, file, codecs, settings, [&](const TimelineFrame& frame, const auto& config, auto duration) {
-    const auto surface = renderer.Draw(frame);
+    const auto surface = stats ? renderer.Draw(frame, *stats, batch_overlays) : renderer.Draw(frame);
     Check(frame.pts == Tick(written) && Pixels(surface) == expected.at(written),
           "PAG export changed sampled pixels before encoding");
     ++written;
@@ -585,6 +586,111 @@ void VerifyTimelinePagTransition(std::string_view document, std::string_view dir
     hd->canvas = {1920, 1080};
     ReportTransitionTiming(hd, codecs);
     ReportTransitionTiming(hd, codecs, CodecPolicy::Auto);
+  }
+}
+
+void VerifyTimelinePagOverlayBatch(std::string_view first, std::string_view second, std::string_view directory) {
+  @autoreleasepool {
+    const File output(directory);
+    Check(output.CreateDirectories(), "Cannot create the PAG overlay verification directory");
+    Project project(kTransitionCanvas);
+    const auto read = [](std::string_view path) { return InspectTimelineMovie(File(path)); };
+    project.Edit([&](ProjectEdit& edit) {
+      const auto insert = [&](const auto& source, TrackKind kind, TimeRange time, MediaTimestamp offset) {
+        const auto track = std::ranges::find(source.tracks, kind, &AssetTrack::kind);
+        Check(track != source.tracks.end(), "Missing required fixture track");
+        const auto length = time.end.ticks - time.start.ticks;
+        return edit.InsertClip(edit.AddTrack(kind), {{edit.Import(source), track->id,
+            {offset, Tick(offset.ticks + length)}}, time});
+      };
+      const auto main = read(first), inset = read(second);
+      const TimeRange range{Tick(0), Tick(kProjectFrames)};
+      insert(main, TrackKind::Video, range, Tick(0));
+      insert(main, TrackKind::Audio, range, Tick(0));
+      const auto pip = insert(inset, TrackKind::Video, range, Tick(6));
+      edit.SetLayout(pip, {0.42F, 0.1F, 0.5F, 0.5F});
+      edit.AddOverlay({{}, CanvasOverlayKind::Text, range, {0.08F, 0.72F, 0.84F, 0.21F}, "PAG overlay"});
+      edit.AddOverlay({{}, CanvasOverlayKind::Sticker, range, {0.48F, 0.17F, 0.31F, 0.46F}, "",
+          {"avkit.preview", "1", "pag-spark"}});
+      edit.AddOverlay({{}, CanvasOverlayKind::Sticker, {Tick(5), range.end}, {0.58F, 0.2F, 0.3F, 0.41F}, "",
+          {"avkit.preview", "1", "pag-arrow"}, {}, 0.72F, 13.0F});
+    });
+    const File saved(output, "overlay-batch.avkit");
+    project.Save(saved);
+    const auto snapshot = Project::Open(saved).Snapshot();
+    const auto codecs = TimelineProviders();
+    const auto sample = [](TimelineSession& session, MovieRenderer& renderer, int index) {
+      return session.SampleVideo(Tick(index), PixelFormat::Bgra8Unorm, {},
+          [&](const auto& frame) { return renderer.ImportFrame(frame); });
+    };
+    std::vector<Bytes> expected, batched_pixels;
+    const auto preview = [&](bool batch) {
+      MovieRenderer renderer(snapshot->canvas);
+      TimelineSession session(snapshot, codecs, CodecPolicy::SoftwareOnly);
+      PagOverlayStats stats;
+      for (int frame = 0; frame < kProjectFrames; ++frame) {
+        const auto pixels = Pixels(renderer.Draw(sample(session, renderer, frame), stats, batch));
+        if (!batch) expected.push_back(pixels);
+        else batched_pixels.push_back(pixels);
+      }
+      if (batch) {
+        for (const auto frame : {30, 2, 38, 6, 0}) {
+          session.Seek(Tick(frame));
+          Check(Pixels(renderer.Draw(sample(session, renderer, frame))) == batched_pixels[frame],
+                "PAG batching changed the forward or backward seek pixels");
+        }
+        VerifyClocked(session, *snapshot, renderer, batched_pixels);
+      }
+      return stats;
+    };
+    const auto compare = [](const char* name, const PagOverlayStats& single, const PagOverlayStats& batch) {
+      Check(single.text_layers == 1 && batch.text_layers == 1 && single.text_layer_cache_hits == kProjectFrames - 1 &&
+                batch.text_layer_cache_hits == single.text_layer_cache_hits, "PAG batching changed the static text cache");
+      Check(batch.batched_flushes == kProjectFrames && batch.flushes == kProjectFrames && single.flushes > batch.flushes,
+            "PAG batching did not render the title and active stickers together");
+      using Milliseconds = std::chrono::duration<double, std::milli>;
+      std::cout << name << ": " << single.flushes << " -> " << batch.flushes << " PAG flushes, "
+                << Milliseconds(single.gpu_sync).count() << " -> " << Milliseconds(batch.gpu_sync).count()
+                << " ms total PAG GPU wait, " << batch.text_layer_cache_hits << " text layer cache hits\n";
+    };
+    const auto single = preview(false);
+    const auto batch = preview(true);
+    Check(File(output, "reference.rgba").WriteBytes(expected.at(22)) &&
+              File(output, "batched.rgba").WriteBytes(batched_pixels.at(22)),
+          "Cannot save the overlay comparison frames");
+    std::size_t different = 0;
+    std::uint64_t total = 0;
+    int maximum = 0;
+    for (std::size_t frame = 0; frame < expected.size(); ++frame) {
+      const auto& a = expected[frame];
+      const auto& b = batched_pixels[frame];
+      Check(a.size() == b.size(), "PAG batching changed the output dimensions");
+      constexpr auto row = kTransitionCanvas.width * 4;
+      Check(std::equal(a.begin(), a.begin() + row * 20, b.begin()) &&
+                std::equal(a.begin() + row * 168, a.end(), b.begin() + row * 168),
+            "PAG batching changed pixels outside the overlay rows");
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto delta = std::abs(std::to_integer<int>(a[i]) - std::to_integer<int>(b[i]));
+        different += delta > 0;
+        total += delta;
+        maximum = std::max(maximum, delta);
+      }
+    }
+    const auto mean = double(total) / (expected.size() * expected.front().size());
+    std::cout << "A/B pixel comparison: " << different << " differing channels, mean " << mean
+              << " / 255, maximum " << maximum << " / 255\n";
+    Check(mean < 1.0, "PAG batching changed the preview pixels beyond expected edge rasterization differences");
+    constexpr auto overlap = (73 * kTransitionCanvas.width + 214) * 4;
+    const std::array blended{210, 239, 89, 255};
+    for (std::size_t channel = 0; channel < blended.size(); ++channel) {
+      const auto value = std::to_integer<int>(batched_pixels.at(22)[overlap + channel]);
+      Check(std::abs(value - blended[channel]) <= 1, "The translucent arrow must draw over the opaque spark");
+    }
+    compare("Preview", single, batch);
+    PagOverlayStats single_export, batch_export;
+    VerifyExport(snapshot, codecs, File(output, "overlay-reference.mp4"), expected, &single_export, false);
+    VerifyExport(snapshot, codecs, File(output, "overlay-batch.mp4"), batched_pixels, &batch_export);
+    compare("Export", single_export, batch_export);
   }
 }
 

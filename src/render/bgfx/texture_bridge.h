@@ -20,6 +20,10 @@ public:
   virtual ImportedTexture Acquire(const ExternalTexture&) {
     return ImportedTexture::Failure({RenderErrorCode::Unsupported, "The texture cannot be imported by this renderer"});
   }
+  /// @return Whether the fitted decoder texture still carries the BT.709 signal transfer after GPU import.
+  virtual bool SamplesBt709Signal(const media::VideoFormat&) const { return false; }
+  /// @return Whether the platform video encoder expects RGB already encoded with the BT.709 transfer.
+  virtual bool ExpectsBt709Signal(const media::VideoEncoderConfig&) const { return false; }
   virtual PublishedTexture Publish(const ColorSurface&, media::MediaTimestamp) {
     return PublishedTexture::Failure({RenderErrorCode::Unsupported, "This renderer cannot publish a GPU preview texture"});
   }

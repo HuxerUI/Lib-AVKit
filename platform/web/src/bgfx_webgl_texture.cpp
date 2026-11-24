@@ -125,6 +125,7 @@ private:
 } // namespace
 
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+  init.type = bgfx::RendererType::OpenGLES;
   const auto* canvas_selector = static_cast<const char*>(init.swapChain.nwh);
   if (!canvas_selector) throw std::invalid_argument("WebGL requires a canvas selector");
   if (target.format == PixelFormat::Rgba8Unorm) {

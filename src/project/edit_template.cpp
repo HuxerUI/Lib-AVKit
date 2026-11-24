@@ -47,6 +47,7 @@ EditTemplatePlan PlanEditTemplate(const Project& project, const EditTemplateReci
   auto prepared = draft.Edit([&](ProjectEdit& edit) {
     for (const auto& track : recipe.tracks) {
       const auto track_id = edit.AddTrack(track.kind);
+      std::optional<TrackId> original_audio;
       for (const auto& clip : track.clips) {
         const auto binding = bindings.find(clip.slot);
         if (binding == bindings.end()) throw std::invalid_argument("Unknown template slot: " + clip.slot);
@@ -59,6 +60,16 @@ EditTemplatePlan PlanEditTemplate(const Project& project, const EditTemplateReci
         edit.SetLayout(id, clip.destination);
         if (clip.background) edit.SetBackground(id, clip.background);
         for (const auto& sticker : clip.stickers) edit.AddSticker(id, sticker);
+        if (clip.include_original_audio) {
+          if (track.kind != media::TrackKind::Video) throw std::invalid_argument("Only video can request original audio");
+          const auto sound = std::ranges::find(asset.source.tracks, media::TrackKind::Audio, &AssetTrack::kind);
+          if (sound == asset.source.tracks.end()) throw std::invalid_argument("No original audio for template slot: " + clip.slot);
+          if (!original_audio) original_audio = edit.AddTrack(media::TrackKind::Audio);
+          const TimeRange audio_range{detail::Add(sound->presentation.start, clip.source.start),
+                                      detail::Add(sound->presentation.start, clip.source.end)};
+          const auto audio = edit.InsertClip(*original_audio, {{asset.id, sound->id, audio_range, clip.reverse}, clip.timeline});
+          edit.BindAudio(audio, id);
+        }
       }
     }
   });

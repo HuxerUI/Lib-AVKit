@@ -6,6 +6,7 @@
 #include "render/bgfx/timing.h"
 #include "render/bgfx/video_texture_internal.h"
 #include "sticker_scene.h"
+#include "workbench_overlay.h"
 
 #include <algorithm>
 #include <array>
@@ -76,6 +77,15 @@ BufferReference ReadPreviewResource(const RawResource& asset) {
   return BufferReference(*bytes, bytes);
 }
 
+PagOverlayAsset ResolvePreviewPagSticker(const ResourceRef& resource, const StickerReplacements& replacements);
+
+PagOverlayResources PreviewPagResources() {
+  static const auto assets = LoadOverlayAssets(OpenPreviewResources());
+  auto resources = WorkbenchPagResources(assets);
+  resources.clip_animation = ResolvePreviewPagSticker;
+  return resources;
+}
+
 } // namespace
 
 struct MovieRenderer::Impl {
@@ -117,34 +127,27 @@ struct MovieRenderer::Impl {
     return DrawSticker(imported.surface, time, cue);
   }
 
-  ColorSurface Draw(const TimelineFrame& frame, PreviewPagTransitionTiming* timing) {
+  ColorSurface Draw(const TimelineFrame& frame, PreviewPagTransitionTiming* timing,
+                    PagOverlayStats* overlays = nullptr, bool batch_overlays = true) {
     @autoreleasepool {
       if (timing) *timing = {};
-      ++pag_frame_;
-      std::vector<ColorSurface> inputs;
-      inputs.reserve(frame.inputs.size());
-      for (const auto& input : frame.inputs) {
-        if (const auto* picture = std::get_if<VideoFrame>(&input)) {
-          inputs.push_back(ImportFrame(*picture).surface);
-        } else if (const auto* surface = std::get_if<ColorSurface>(&input)) {
-          inputs.push_back(*surface);
-        } else if (const auto* animated = std::get_if<AnimatedStickerSample>(&input)) {
-          inputs.push_back(SamplePagSticker(*animated));
-        } else {
-          inputs.push_back(Sticker(std::get<ResourceRef>(input)));
-        }
-      }
-      std::erase_if(pag_stickers_, [&](const auto& entry) { return entry.second.last_frame != pag_frame_; });
       auto data = frame.analysis_masks;
       data.reserve(data.size() + frame.depth_maps.size() + frame.static_masks.size() + frame.animated_masks.size() + frame.masks.size());
       data.insert(data.end(), frame.depth_maps.begin(), frame.depth_maps.end());
       for (const auto& resource : frame.static_masks) data.push_back(StaticMaskTexture(resource));
       for (const auto& sample : frame.animated_masks) data.push_back(AnimatedMaskTexture(sample));
       for (const auto& sample : frame.masks) data.push_back(TransitionMaskTexture(sample));
+      if (!overlays_) overlays_ = std::make_unique<PagOverlayRenderer>(*backend_, PreviewPagResources());
+      auto request = overlays_->Prepare(frame, [&](std::size_t slot) {
+        const auto& input = frame.inputs[slot];
+        if (const auto* picture = std::get_if<VideoFrame>(&input)) return ImportFrame(*picture).surface;
+        if (const auto* surface = std::get_if<ColorSurface>(&input)) return *surface;
+        return Sticker(std::get<ResourceRef>(input));
+      }, std::move(data), overlays, batch_overlays);
       if (!frame.transition_animations.empty()) {
-        return DrawPagTransitions(frame, std::move(inputs), data, timing);
+        return DrawPagTransitions(frame, std::move(request), timing);
       }
-      return Render({frame.plan, std::move(inputs), std::move(data)});
+      return Render(request);
     }
   }
 
@@ -185,9 +188,10 @@ private:
     return Render({std::move(side), std::move(used), data});
   }
 
-  ColorSurface DrawPagTransitions(const TimelineFrame& frame, std::vector<ColorSurface> inputs,
-                                  const std::vector<ImageSurface>& data, PreviewPagTransitionTiming* timing) {
-    const auto& source = *frame.plan;
+  ColorSurface DrawPagTransitions(const TimelineFrame& frame, RenderRequest request, PreviewPagTransitionTiming* timing) {
+    const auto& source = *request.plan;
+    auto& inputs = request.inputs;
+    const auto& data = request.data_inputs;
     auto final = std::make_shared<RenderPlan>(RenderPlan{source.target, source.draws});
     const auto external_slots = inputs.size();
     std::vector<std::optional<std::uint32_t>> slots(source.subcompositions.size());
@@ -231,25 +235,6 @@ private:
     });
     auto used = CompactColorInputs(*final, inputs);
     return Render({std::move(final), std::move(used), data}, timing);
-  }
-
-  struct CachedPagSticker {
-    ResourceRef resource;
-    StickerReplacements replacements;
-    std::unique_ptr<PagAnimation> animation;
-    std::uint64_t last_frame;
-  };
-
-  ColorSurface SamplePagSticker(const AnimatedStickerSample& sample) {
-    auto cached = pag_stickers_.find(sample.instance.value);
-    if (cached == pag_stickers_.end() || cached->second.resource != sample.resource ||
-        cached->second.replacements != sample.replacements) {
-      auto animation = OpenPreviewPagSticker(sample.resource, sample.replacements);
-      cached = pag_stickers_.insert_or_assign(sample.instance.value,
-          CachedPagSticker{sample.resource, sample.replacements, std::move(animation), pag_frame_}).first;
-    }
-    cached->second.last_frame = pag_frame_;
-    return cached->second.animation->Sample(sample.elapsed, sample.playback);
   }
 
   const ColorSurface& Sticker(const ResourceRef& resource) {
@@ -436,9 +421,8 @@ private:
   std::array<std::optional<ImageSurface>, kPreviewWipeFrameCount> wipe_frames_;
   std::array<std::optional<ImageSurface>, 2> static_masks_;
   std::optional<std::array<ImageSurface, kClipMaskFrames.size()>> animated_masks_;
-  std::unordered_map<std::uint64_t, CachedPagSticker> pag_stickers_;
+  std::unique_ptr<PagOverlayRenderer> overlays_;
   std::unordered_map<std::uint64_t, std::unique_ptr<PagTransition>> pag_transitions_;
-  std::uint64_t pag_frame_{};
 };
 
 MovieRenderer::MovieRenderer(PixelSize size) : impl_(std::make_unique<Impl>(size)) {}
@@ -454,6 +438,10 @@ ColorSurface MovieRenderer::Draw(const VideoFrame& input, bool cue) { return imp
 
 ColorSurface MovieRenderer::Draw(const TimelineFrame& frame, PreviewPagTransitionTiming* timing) {
   return impl_->Draw(frame, timing);
+}
+
+ColorSurface MovieRenderer::Draw(const TimelineFrame& frame, PagOverlayStats& stats, bool batch_overlays) {
+  return impl_->Draw(frame, nullptr, &stats, batch_overlays);
 }
 
 ColorSurface MovieRenderer::Draw(CVPixelBufferRef input, huxerui::Rect crop, VideoRotation rotation,
@@ -510,11 +498,13 @@ std::unique_ptr<PagTransition> OpenPreviewPagTransition(PixelSize size) {
   return std::make_unique<PagTransition>(encoded, size, 1, 0);
 }
 
-std::unique_ptr<PagAnimation> OpenPreviewPagSticker(const ResourceRef& resource, const StickerReplacements& replacements) {
+namespace {
+
+PagOverlayAsset ResolvePreviewPagSticker(const ResourceRef& resource, const StickerReplacements& replacements) {
   if (resource == PreviewPagStickerResource()) {
     Check(replacements.Empty(), "The like PAG fixture has no editable slots");
     static const auto encoded = ReadPreviewResource(app::raw::stickers_like_pag);
-    return std::make_unique<PagAnimation>(encoded);
+    return {encoded};
   }
   if (resource != PreviewEditablePagResource())
     throw std::runtime_error("The animated sticker resource is unavailable: " + resource.key);
@@ -532,7 +522,15 @@ std::unique_ptr<PagAnimation> OpenPreviewPagSticker(const ResourceRef& resource,
     static const auto pixels = ReadPreviewResource(app::raw::stickers_replacement_png);
     images.push_back({0, pixels});
   }
-  return std::make_unique<PagAnimation>(encoded, texts, images);
+  return {encoded, {texts.begin(), texts.end()}, std::move(images)};
+}
+
+} // namespace
+
+std::unique_ptr<PagAnimation> OpenPreviewPagSticker(const ResourceRef& resource, const StickerReplacements& replacements,
+                                                    RenderBackend* backend) {
+  auto asset = ResolvePreviewPagSticker(resource, replacements);
+  return std::make_unique<PagAnimation>(std::move(asset.encoded), asset.texts, asset.images, backend);
 }
 
 const ResourceRef& TrackingStickerResource(analysis::TrackedPart part) {

@@ -35,7 +35,8 @@ void PaintTimelineStrip(PaintContext& paint, Size size, const ProjectSnapshot& p
   paint.DrawRect({0, 0, size.width, size.height}, Color::Rgb(27, 34, 43));
   for (const auto& item : strip.thumbnails) {
     const auto left = x(item.project.start), right = x(item.project.end);
-    if (item.thumbnail && right > left) paint.DrawImage(item.thumbnail->image, {left, row(item.track) + 1, right - left, kTrackHeight - 2});
+    if (item.thumbnail && right > left)
+      DrawStripThumbnail(paint, *item.thumbnail, {left, row(item.track) + 1, right - left, kTrackHeight - 2});
   }
   for (const auto& item : strip.waveform) {
     const auto left = x(item.project.start), right = x(item.project.end);

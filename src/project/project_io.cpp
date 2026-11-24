@@ -60,6 +60,14 @@ void Put(std::ostream& output, Rect value) {
   output << value.x << ' ' << value.y << ' ' << value.width << ' ' << value.height;
 }
 
+Color ReadColor(std::istream& input) {
+  return {Read<float>(input), Read<float>(input), Read<float>(input), Read<float>(input)};
+}
+
+void Put(std::ostream& output, Color color) {
+  output << color.red << ' ' << color.green << ' ' << color.blue << ' ' << color.alpha;
+}
+
 void RequireIo(IoResult<void> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
 }
@@ -97,7 +105,17 @@ void Project::Save(const File& destination) const {
   const bool animated_transitions = std::ranges::any_of(project.transitions, [](const auto& transition) {
     return transition.spec.animation.has_value();
   });
-  const int version = animated_transitions ? 12 : replaced_stickers ? 11 : animated_stickers ? 10 : depth_stickers ? 9 :
+  const bool display_geometry = std::ranges::any_of(project.assets, [](const auto& asset) {
+    return std::ranges::any_of(asset.source.tracks, [](const auto& track) { return track.display_size.has_value(); });
+  });
+  const bool clip_settings = any_clip([](const auto& clip) { return clip.audio_of || clip.audio_mix != AudioMix{} || clip.fill; });
+  const bool styled = std::ranges::any_of(project.overlays, [](const auto& overlay) {
+    return overlay.style != CanvasTextStyle{} || overlay.opacity != 1.0F;
+  });
+  const bool rotated = any_clip([](const auto& clip) { return clip.rotation_degrees != 0; }) ||
+      std::ranges::any_of(project.overlays, [](const auto& overlay) { return overlay.rotation_degrees != 0; });
+  const int version = rotated ? 15 : styled ? 14 : display_geometry || clip_settings || !project.overlays.empty() ? 13 :
+                      animated_transitions ? 12 : replaced_stickers ? 11 : animated_stickers ? 10 : depth_stickers ? 9 :
                       animated_masks ? 8 : static_masks ? 7 :
                       selected_models ? 6 : backgrounds ? 5 :
                       tracked ? 4 : versioned_assets || reversed ? 3 :
@@ -113,6 +131,10 @@ void Project::Save(const File& destination) const {
     for (const auto& track : asset.source.tracks) {
       output << "source " << track.id << ' ' << Kind(track.kind) << ' ';
       Put(output, track.presentation);
+      if (version >= 13) {
+        const auto size = track.display_size.value_or(PixelSize{});
+        output << ' ' << size.width << ' ' << size.height;
+      }
       output << '\n';
     }
   }
@@ -157,6 +179,15 @@ void Project::Save(const File& destination) const {
           }
         }
       }
+      if (version >= 13) {
+        output << ' ' << clip.audio_of.value_or(ClipId{}).value << ' ' << clip.audio_mix.gain << ' '
+               << clip.audio_mix.muted << ' ';
+        Put(output, clip.audio_mix.fade_in);
+        output << ' ';
+        Put(output, clip.audio_mix.fade_out);
+        output << ' ' << clip.fill;
+      }
+      if (version >= 15) output << ' ' << clip.rotation_degrees;
       output << '\n';
       for (const auto& sticker : clip.stickers) {
         const auto& resource = sticker.spec.resource;
@@ -215,6 +246,28 @@ void Project::Save(const File& destination) const {
       }
     }
   }
+  if (version >= 13) {
+    output << "overlays " << project.overlays.size() << '\n';
+    for (const auto& overlay : project.overlays) {
+      output << "overlay " << overlay.id.value << ' ' << static_cast<unsigned>(overlay.kind) << ' ';
+      Put(output, overlay.range);
+      output << ' ';
+      Put(output, overlay.destination);
+      output << ' ' << std::quoted(overlay.text) << ' ' << std::quoted(overlay.resource.pack) << ' '
+             << std::quoted(overlay.resource.revision) << ' ' << std::quoted(overlay.resource.key);
+      if (version >= 14) {
+        output << ' ';
+        Put(output, overlay.style.foreground);
+        output << ' ';
+        Put(output, overlay.style.background);
+        output << ' ' << overlay.style.size << ' ' << std::quoted(overlay.style.font.pack) << ' '
+               << std::quoted(overlay.style.font.revision) << ' ' << std::quoted(overlay.style.font.key) << ' '
+               << overlay.opacity;
+      }
+      if (version >= 15) output << ' ' << overlay.rotation_degrees;
+      output << '\n';
+    }
+  }
   output << "end\n";
   if (!output) throw std::runtime_error("Cannot serialize the project");
   for (const auto& asset : project.assets) {
@@ -235,7 +288,7 @@ Project Project::Open(const File& source) {
   input.imbue(std::locale::classic());
   Tag(input, "AVKIT_PROJECT");
   const auto version = Read<unsigned>(input);
-  if (version < 1 || version > 12) throw std::runtime_error("Unsupported project document version");
+  if (version < 1 || version > 15) throw std::runtime_error("Unsupported project document version");
   ProjectSnapshot project;
   Tag(input, "canvas");
   project.canvas = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
@@ -250,7 +303,12 @@ Project Project::Open(const File& source) {
     if (version >= 3) asset.content_revision = Read<std::uint64_t>(input);
     for (auto tracks = track_count; tracks; --tracks) {
       Tag(input, "source");
-      asset.source.tracks.push_back({Read<std::uint32_t>(input), ReadKind(input), ReadRange(input)});
+      AssetTrack track{Read<std::uint32_t>(input), ReadKind(input), ReadRange(input)};
+      if (version >= 13) {
+        const PixelSize size{Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
+        if (size.width || size.height) track.display_size = size;
+      }
+      asset.source.tracks.push_back(track);
     }
     project.assets.push_back(std::move(asset));
   }
@@ -279,6 +337,13 @@ Project Project::Open(const File& source) {
                                                          Read<bool>(input)};
         }
       }
+      if (version >= 13) {
+        const auto owner = Read<std::uint64_t>(input);
+        if (owner) clip.audio_of = ClipId{owner};
+        clip.audio_mix = {Read<float>(input), Read<bool>(input), ReadTime(input), ReadTime(input)};
+        clip.fill = Read<bool>(input);
+      }
+      if (version >= 15) clip.rotation_degrees = Read<float>(input);
       for (auto stickers = sticker_count; stickers; --stickers) {
         Tag(input, "sticker");
         StickerInstance sticker{{Read<std::uint64_t>(input)}, {{Text(input), Text(input), Text(input)}, ReadRect(input)}};
@@ -326,6 +391,20 @@ Project Project::Open(const File& source) {
         transition.spec.feather_keys.push_back({at, value, interpolation == 'h' ? Interpolation::Hold : Interpolation::Linear});
       }
       project.transitions.push_back(std::move(transition));
+    }
+  }
+  if (version >= 13) {
+    Tag(input, "overlays");
+    for (auto count = Read<std::size_t>(input); count; --count) {
+      Tag(input, "overlay");
+      CanvasOverlay overlay{{Read<std::uint64_t>(input)}, static_cast<CanvasOverlayKind>(Read<unsigned>(input)),
+                            ReadRange(input), ReadRect(input), Text(input), {Text(input), Text(input), Text(input)}};
+      if (version >= 14) {
+        overlay.style = {ReadColor(input), ReadColor(input), Read<float>(input), {Text(input), Text(input), Text(input)}};
+        overlay.opacity = Read<float>(input);
+      }
+      if (version >= 15) overlay.rotation_degrees = Read<float>(input);
+      project.overlays.push_back(std::move(overlay));
     }
   }
   Tag(input, "end");

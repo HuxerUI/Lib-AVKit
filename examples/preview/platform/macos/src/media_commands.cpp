@@ -89,6 +89,10 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
       }
       if (command == "--timeline-verify-pag-transition")
         std::cerr << "Usage: --timeline-verify-pag-transition PROJECT DIRECTORY\n";
+      if (command == "--timeline-verify-pag-overlay-batch" && argc == 5) {
+        VerifyTimelinePagOverlayBatch(argv[2], argv[3], argv[4]);
+        return 0;
+      }
       if (command == "--timeline-mask-preview" && (argc == 3 || argc == 4)) {
         ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
                                                 CreateMockMaskProvider(), true);

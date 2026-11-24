@@ -33,6 +33,8 @@ public:
       huxerui::media::VideoRotation rotation, huxerui::media::MediaTimestamp time, bool cue = false);
   huxerui::avkit::render::ColorSurface Draw(const huxerui::avkit::TimelineFrame& frame,
                                             PreviewPagTransitionTiming* timing = nullptr);
+  huxerui::avkit::render::ColorSurface Draw(const huxerui::avkit::TimelineFrame& frame,
+                                            huxerui::avkit::PagOverlayStats& stats, bool batch_overlays);
   huxerui::media::VideoFrame EncoderFrame(const huxerui::avkit::render::ColorSurface& output,
       const huxerui::media::VideoEncoderConfig& config, huxerui::media::MediaTimestamp pts,
       std::optional<huxerui::media::MediaTimestamp> duration = {});
@@ -53,7 +55,8 @@ const huxerui::avkit::ResourceRef& PreviewPagTransitionResource();
 std::unique_ptr<huxerui::avkit::PagTransition> OpenPreviewPagTransition(huxerui::avkit::PixelSize size);
 std::unique_ptr<huxerui::avkit::PagAnimation> OpenPreviewPagSticker(
     const huxerui::avkit::ResourceRef& resource = PreviewPagStickerResource(),
-    const huxerui::avkit::StickerReplacements& replacements = {});
+    const huxerui::avkit::StickerReplacements& replacements = {},
+    huxerui::avkit::render::RenderBackend* backend = nullptr);
 const huxerui::avkit::ResourceRef& TrackingStickerResource(huxerui::avkit::analysis::TrackedPart part);
 const huxerui::avkit::ResourceRef& PreviewWipeResource();
 const std::array<huxerui::avkit::ResourceRef, 2>& PreviewStaticMaskResources();

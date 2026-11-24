@@ -13,7 +13,7 @@
 #include <huxerui/huxerui.h>
 
 #include "live_capture.h"
-#include "workbench.h"
+#include "workbench_media.h"
 
 namespace avkit_preview {
 namespace {
@@ -165,6 +165,7 @@ int CapturePreviewExitCode(int app_result) {
 struct WorkbenchRecording {
   State<bool> occupied;
   std::function<void(File)> add_movie;
+  std::function<void()> import_movie;
 };
 
 [[huxerui::composable]]
@@ -176,7 +177,7 @@ View CapturePanel(File directory, CapturePreviewMode mode, std::shared_ptr<LiveC
   auto message = UseState(std::string{});
   auto microphone_active = UseState(false);
   auto microphone_starting = UseState(false);
-  auto robot_voice = UseState(true);
+  auto robot_voice = UseState(!workbench.has_value());
   auto observed_live = UseState(LiveCaptureStatus{});
   const auto microphone = audio::UseAudioCapture({.active = microphone_active, .channel_layout = media::AudioChannelLayout::Mono});
   const auto camera = camera::UseCamera({.active = active, .preferred_capture_pixel_width = 640,
@@ -236,12 +237,11 @@ View CapturePanel(File directory, CapturePreviewMode mode, std::shared_ptr<LiveC
   live_busy = RecordingInProgress(live_status.state) || microphone_starting;
   if (live && !status.recording_video) image = Image(live->Texture()).Fit(ImageFit::Contain).With(Grow());
   if (!live_status.error.empty()) label = live_status.error;
-  else if (live_status.state == RecordingState::Complete && label.empty()) label = "Saved avkit.mp4";
+  else if (live_status.state == RecordingState::Complete && label.empty()) label = workbench ? "录像已保存" : "Saved avkit.mp4";
   const auto latest_photo = UseState(std::optional<File>{});
   const auto latest_movie = UseState(std::optional<File>{});
-  const auto settings_open = UseState(false);
+  const auto photo_mode = UseState(false);
   const auto picker = UseService<FilePicker>();
-  const bool wide = UseViewportClass() == ViewportClass::Expanded;
   const auto& theme = UseTheme();
   if (workbench && live) {
     const bool paused = live_status.state == RecordingState::Paused;
@@ -256,78 +256,93 @@ View CapturePanel(File directory, CapturePreviewMode mode, std::shared_ptr<LiveC
         } catch (const std::exception& error) { message = std::string(error.what()); }
       });
     };
-    View monitor = WorkbenchPanel(Column{
-      Column{std::move(image)}.With(Frame{.height = wide ? 378.0F : 280.0F}, CornerRadius(10.0F), Background(Color::Rgb(8, 11, 17)),
-          CrossAlign(CrossAxisAlignment::Stretch)),
-      Text::Format("{} · {} 秒", paused ? "已暂停" : recording ? "录制中" : finalizing ? "正在写入" :
-          completed ? "录像已保存" : ready ? "相机已就绪" : "正在准备相机",
-          WorkbenchSeconds(live_status.sample_rate ? double(live_status.samples) / live_status.sample_rate : 0.0, 1)),
-      Flow{
-        Button(can_stop ? "停止录像" : "开始录像").OnClick([=] {
-          if (RecordingInProgress(live->Status().state)) { live->Stop(); return; }
-          if (microphone_starting) return;
-          microphone_starting = true;
-          workbench->occupied = true;
-          message = std::string{};
-          tasks.Launch([=]() -> Task<void> {
-            try {
-              auto file = WorkbenchOutput(directory, "Captures", "录像.mp4");
-              co_await StartLive(application, live, microphone, microphone_active, file);
-              latest_movie = std::move(file);
-            } catch (const std::exception& error) {
-              message = std::string(error.what());
-              microphone_active = false;
-            }
-            microphone_starting = false;
-          });
-        }).With(Enabled(can_stop || (ready && !live_busy))),
-        Button(paused ? "继续" : "暂停").OnClick([live, paused] { live->Pause(!paused); }).With(Enabled(paused || recording)),
-        Button("拍照").OnClick([=] {
-          tasks.Launch([=]() -> Task<void> {
-            try {
-              auto file = WorkbenchOutput(directory, "Captures", "照片.jpg");
-              co_await SavePhoto(camera, file);
-              latest_photo = std::move(file);
-              message = std::string("照片已保存");
-            } catch (const std::exception& error) { message = std::string(error.what()); }
-          });
-        }).With(Enabled(ready && !live_busy && !status.capturing_photo)),
-      }.With(Spacing(8.0F)),
-      live_status.error.empty() && !status.error ? View(Text(message.Get())) :
-          View(Text(status.error ? status.error->message : live_status.error)),
-    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)), theme);
-    std::vector<View> controls{
-        Text("录制设置", TextRole::Title),
-        Text("画面 · AVKit 贴纸"),
-        Button(robot_voice ? "声音 · 机器人" : "声音 · 原声").OnClick([robot_voice, live] {
-          const bool enable = !robot_voice;
-          robot_voice = enable;
-          live->SetRobotVoice(enable);
-        }),
+    const auto elapsed = live_status.sample_rate ? double(live_status.samples) / live_status.sample_rate : 0.0;
+    const auto status_text = paused ? "已暂停" : recording ? "录制中" : finalizing ? "正在写入" :
+        completed ? "已保存" : ready ? "待拍摄" : "准备相机";
+    const auto photo = [=] {
+      tasks.Launch([=]() -> Task<void> {
+        try {
+          auto file = WorkbenchOutput(directory, "Captures", "照片.jpg");
+          co_await SavePhoto(camera, file);
+          latest_photo = std::move(file);
+          message = std::string("照片已保存");
+        } catch (const std::exception& error) { message = std::string(error.what()); }
+      });
     };
-    View settings = WorkbenchPanel(Column(std::move(controls)).With(Spacing(8.0F),
-        CrossAlign(CrossAxisAlignment::Stretch)), theme);
-    std::vector<View> output;
-    if (completed) {
-      output.emplace_back(Button("加入剪辑").OnClick([file = *latest_movie.Get(), add = workbench->add_movie] {
-        add(file);
-      }));
-      if (picker->CanSaveFiles()) output.emplace_back(Button("保存录像副本").OnClick([=] { save_copy(*latest_movie.Get()); }));
-    }
-    if (latest_photo.Get() && picker->CanSaveFiles())
-      output.emplace_back(Button("保存照片副本").OnClick([=] { save_copy(*latest_photo.Get()); }));
-    View body = wide ? View(Row{std::move(monitor).With(Grow()), std::move(settings).With(Frame{.width = 248.0F})}
-                         .With(Spacing(12.0F))) :
-        View(Column{std::move(monitor), Button(settings_open ? "收起录制设置" : "录制设置")
-                        .OnClick([settings_open] { settings_open = !settings_open.Get(); }),
-                    settings_open.Get() ? std::move(settings) : View(Text(""))}
-             .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-    return ScrollView(Column{
-      Text("录制", TextRole::Title),
-      std::move(body),
-      Flow(std::move(output)).With(Spacing(8.0F)),
-    }.With(Padding(wide ? 20.0F : 12.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)));
+    const auto record = [=] {
+      if (RecordingInProgress(live->Status().state)) { live->Stop(); return; }
+      if (microphone_starting) return;
+      microphone_starting = true;
+      workbench->occupied = true;
+      message = std::string{};
+      tasks.Launch([=]() -> Task<void> {
+        try {
+          auto file = WorkbenchOutput(directory, "Captures", "录像.mp4");
+          co_await StartLive(application, live, microphone, microphone_active, file);
+          latest_movie = std::move(file);
+        } catch (const std::exception& error) {
+          message = std::string(error.what());
+          microphone_active = false;
+        }
+        microphone_starting = false;
+      });
+    };
+    const bool taking_photo = photo_mode.Get();
+    View picture = !ready ? View(Column{
+        Text(status.error || !label.empty() ? "相机不可用" : "正在连接相机…")
+            .With(Foreground(theme.colors.on_surface_variant)),
+      }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center))) :
+        taking_photo ? View(camera::CameraPreview(camera, {.fit = ImageFit::Contain, .mirror = camera::MirrorMode::Off})) :
+        WorkbenchVideoPicture(live->Texture());
+    View top = Row{
+      View(Spacer()).With(Grow()),
+      WorkbenchControl(Button(robot_voice ? "机器人变声" : "原声").OnClick([robot_voice, live] {
+        robot_voice = !robot_voice.Get();
+        live->SetRobotVoice(robot_voice.Get());
+      }).With(Enabled(!taking_photo)), theme, WorkbenchActionTone::Surface, true),
+      View(Spacer()).With(Grow()),
+      Text(taking_photo ? "4:3" : "16:9").Style(
+          TextStyle{.font = Font::Monospace(11.0F), .foreground = theme.colors.on_surface_variant}),
+    }.With(Padding(10.0F), CrossAlign(CrossAxisAlignment::Center));
+    View overlay = Column{
+      std::move(top),
+      View(Spacer()).With(Grow()),
+      live_busy || completed ? View(Row{
+        Text(status_text + std::string("  ") + WorkbenchTimelineTime(elapsed, true)).Style(
+            TextStyle{.font = Font::Monospace(13.0F), .foreground = Color::White()})
+            .With(Padding(8.0F), Background(Color::Rgb(20, 21, 25, 0.9F)), CornerRadius(5.0F)),
+      }.With(Padding(10.0F), MainAlign(MainAxisAlignment::Center))) : View{},
+    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+    View modes = Row{
+      WorkbenchTab("照片", theme, [photo_mode] { photo_mode = true; }, taking_photo, !live_busy),
+      WorkbenchTab("视频", theme, [photo_mode] { photo_mode = false; }, !taking_photo, !live_busy),
+    }.With(MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center), Spacing(12.0F));
+    const bool photo_saved = taking_photo && latest_photo.Get() && picker->CanSaveFiles();
+    const bool can_save = taking_photo ? photo_saved : completed && picker->CanSaveFiles();
+    const auto left = paused || recording ? std::function<void()>([live, paused] { live->Pause(!paused); }) :
+        std::function<void()>([=] {
+          if (can_save) save_copy(taking_photo ? *latest_photo.Get() : *latest_movie.Get());
+          else if (workbench->import_movie) workbench->import_movie();
+        });
+    View controls = Row{
+      WorkbenchControl(Button(paused ? "继续" : recording ? "暂停" : can_save ? "保存副本" : "导入视频").OnClick(left)
+          .With(Enabled(paused || recording || can_save || (!live_busy && bool(workbench->import_movie)))),
+          theme, WorkbenchActionTone::Quiet, true).With(Frame{.width = 76.0F}),
+      WorkbenchShutter(theme, can_stop, taking_photo ? ready && !status.capturing_photo : can_stop || (ready && !live_busy),
+          taking_photo ? "拍照" : can_stop ? "停止录像" : "开始录像",
+          taking_photo ? std::function<void()>(photo) : std::function<void()>(record)),
+      WorkbenchControl(Button("加入剪辑").OnClick([workbench, latest_movie] {
+        if (latest_movie.Get()) workbench->add_movie(*latest_movie.Get());
+      }).With(Enabled(completed)), theme, WorkbenchActionTone::Primary, true).With(Frame{.width = 76.0F}),
+    }.With(Spacing(22.0F), Padding(EdgeInsets::Symmetric(4.0F, 5.0F)),
+        MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Center));
+    View notice = label.empty() ? View{} : View(Text(label).With(
+        Padding(EdgeInsets::Symmetric(10.0F, 4.0F)),
+        Foreground(status.error || !live_status.error.empty() ? theme.colors.error : theme.colors.on_surface_variant),
+        Align(HorizontalAlignment::Center, VerticalAlignment::Center)));
+    return WorkbenchRecordLayout(theme, std::move(picture), std::move(overlay), std::move(modes), std::move(controls), std::move(notice));
   }
+
   View camera_buttons = Row {
       Button("Photo").OnClick([tasks, camera, directory, message] {
         tasks.Launch([camera, directory, message]() -> Task<void> {
@@ -428,16 +443,18 @@ std::optional<int> RunCaptureCommand(int argc, const char** argv) {
 }
 
 [[huxerui::composable]]
-View WorkbenchCapture(File data, State<bool> occupied, std::function<void(File)> add_movie) {
+View WorkbenchCapture(File data, State<bool> occupied, std::function<void(File)> add_movie,
+                      std::function<void()> import_movie) {
   const auto live = UseState(std::shared_ptr<LiveCapture>{});
   Lifecycle([live] {
     auto active = std::make_shared<LiveCapture>();
+    active->SetRobotVoice(false);
     live = active;
     return [active] { active->Close(); };
   });
   if (!live.Get()) return Text("正在准备相机…").With(Padding(16.0F));
   return CapturePanel(std::move(data), CapturePreviewMode::Interactive, live.Get(),
-                      WorkbenchRecording{occupied, std::move(add_movie)});
+                      WorkbenchRecording{occupied, std::move(add_movie), std::move(import_movie)});
 }
 
 } // namespace avkit_preview
