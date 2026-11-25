@@ -1,7 +1,7 @@
 #include "timeline_strip.h"
-#include "timeline_preview.h"
-#include "verification/codec_verification.h"
-#include "metal_preview.h"
+#include "timeline_verify.h"
+#include "codec_verification.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
 #include "workbench_media.h"
 
@@ -74,8 +74,10 @@ void CheckInitialProject(const File& directory, const AssetReference& video, con
         baseline->assets.back().source == photo && !document.project->CanUndo() && !document.project->CanRedo(),
         "Initial media order or baseline edit history was incorrect");
   const auto second = baseline->tracks.front().clips.back();
+  const auto start = ExactTicks(second.placement.timeline.start, kTimelinePreviewRate);
+  const auto end = ExactTicks(second.placement.timeline.end, kTimelinePreviewRate);
   TimelineSession session(baseline, providers, kSoftware);
-  for (const auto at : {Tick(60), Tick(131), Tick(76)}) {
+  for (const auto at : {Tick(start), Tick(end - 1), Tick(start + (end - start) / 2)}) {
     session.Seek(at);
     const auto frame = session.SampleVideo(at);
     const auto& picture = std::get<VideoFrame>(frame.inputs.front());

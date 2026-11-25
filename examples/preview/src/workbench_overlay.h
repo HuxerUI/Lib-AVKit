@@ -34,6 +34,7 @@ inline const std::array kWorkbenchStickers{
     WorkbenchSticker{"pag-circle", "手绘圈", app::raw::stickers_circle_pag, app::images::stickers_circle, 1.0F},
 };
 OverlayAssets LoadOverlayAssets(const huxerui::Resources& resources);
+huxerui::avkit::CanvasOverlay CaptureSticker(huxerui::avkit::PixelSize canvas);
 huxerui::Rect MeasureWorkbenchOverlay(const huxerui::avkit::CanvasOverlay& overlay,
                                      huxerui::avkit::PixelSize canvas, const OverlayAssets& assets);
 

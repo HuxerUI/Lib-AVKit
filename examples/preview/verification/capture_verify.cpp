@@ -1,6 +1,7 @@
-#include "capture_preview.h"
+#include "capture_verify.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -11,9 +12,9 @@
 
 #include <huxerui/camera.h>
 #include <huxerui/huxerui.h>
+#include <huxerui/media_library.h>
+#include <huxerui/avkit.h>
 
-#include "capture_device.h"
-#include "live_capture.h"
 #include "timeline_resources.h"
 #include "capture/camera_recording_verification.h"
 #include "workbench_media.h"
@@ -27,11 +28,9 @@ using huxerui::avkit::CameraRecording;
 using huxerui::avkit::CameraRecordingStatus;
 using huxerui::avkit::detail::CameraRecordingVerification;
 
-enum class CapturePreviewMode { Interactive, VerifyCamera, VerifyLive };
-
 struct CaptureOptions {
   File directory;
-  CapturePreviewMode mode;
+  bool composited;
 };
 std::optional<CaptureOptions> options;
 int verification_exit = 1;
@@ -149,20 +148,8 @@ Task<void> VerifyLive(ApplicationHandle application, std::shared_ptr<CameraRecor
   VerifyLiveMovie(output, status, CameraRecordingVerification::CueSample(*live));
 }
 
-void ConfigureCapturePreview(std::string_view directory, CapturePreviewMode mode) {
-  File output(directory);
-  if (!output.IsDirectory() && !output.CreateDirectories()) throw std::runtime_error("Cannot create the capture directory");
-  options.emplace(CaptureOptions{std::move(output), mode});
-}
-
-int CapturePreviewExitCode(int app_result) {
-  const int result = options->mode != CapturePreviewMode::Interactive && app_result == 0 ? verification_exit : app_result;
-  options.reset();
-  return result;
-}
-
 [[huxerui::composable]]
-View CaptureVerificationPanel(File directory, CapturePreviewMode mode) {
+View CaptureVerificationPanel(File directory, bool composited) {
   const auto application = UseApplication();
   const auto tasks = UseTaskScope();
   const auto active = UseState(false);
@@ -170,14 +157,14 @@ View CaptureVerificationPanel(File directory, CapturePreviewMode mode) {
   const auto recorder = UseState(std::shared_ptr<CameraRecording>{});
   const auto resources = UseService<Resources>();
   Lifecycle([=]() -> std::function<void()> {
-    if (mode != CapturePreviewMode::VerifyLive) return {};
+    if (!composited) return [] {};
     constexpr huxerui::avkit::PixelSize canvas{640, 360};
     auto session = std::make_shared<CameraRecording>(canvas,
         PreviewTimelineResources(LoadOverlayAssets(*resources)));
     session->SetSticker(CaptureSticker(canvas));
     recorder = session;
     return [session] { session->Close(); };
-  }, mode);
+  }, composited);
   const auto live = recorder.Get();
   const auto microphone = audio::UseAudioCapture({.active = microphone_active, .channel_layout = media::AudioChannelLayout::Mono});
   camera::CameraOptions camera_options{.active = active, .preferred_capture_pixel_width = 640,
@@ -186,13 +173,13 @@ View CaptureVerificationPanel(File directory, CapturePreviewMode mode) {
   const auto camera = camera::UseCamera(std::move(camera_options));
 
   Lifecycle([=] {
-    if (mode == CapturePreviewMode::VerifyLive && !live) return;
+    if (composited && !live) return;
     tasks.Launch([=]() -> Task<void> {
       try {
         co_await Authorize(application, Permission::Camera);
         active = true;
         co_await WaitForCamera(camera);
-        if (mode == CapturePreviewMode::VerifyCamera) {
+        if (!composited) {
           co_await VerifyCameraCapture(camera, tasks, directory);
         } else {
           co_await VerifyCameraComposite(live);
@@ -211,31 +198,24 @@ View CaptureVerificationPanel(File directory, CapturePreviewMode mode) {
                 camera::CameraPreview(camera, {.fit = ImageFit::Contain}).With(Grow());
 }
 
-[[huxerui::composable]]
-View CaptureInteractive(File directory) {
-  const auto occupied = UseState(false);
-  return WorkbenchCapture(std::move(directory), occupied, [](File) {}, {});
-}
-
 } // namespace
 
-std::optional<View> RequestedCapturePreview() {
-  if (!options) return std::nullopt;
-  if (options->mode == CapturePreviewMode::Interactive) return CaptureInteractive(options->directory);
-  return CaptureVerificationPanel(options->directory, options->mode);
+View CaptureVerificationApp() {
+  return CaptureVerificationPanel(options->directory, options->composited);
 }
 
-std::optional<int> RunCaptureCommand(int argc, const char** argv) {
-  if (argc != 3) return std::nullopt;
-  using enum CapturePreviewMode;
-  const std::string_view command(argv[1]);
-  if (command != "--camera-preview" && command != "--verify-camera" && command != "--verify-live-capture")
-    return std::nullopt;
+int VerifyCapture(std::string_view directory, bool composited) {
   try {
-    const auto mode = command == "--verify-camera" ? VerifyCamera :
-                      command == "--verify-live-capture" ? VerifyLive : Interactive;
-    ConfigureCapturePreview(argv[2], mode);
-    return CapturePreviewExitCode(RunApplication());
+    File output(directory);
+    if (!output.IsDirectory() && !output.CreateDirectories()) throw std::runtime_error("Cannot create the capture directory");
+    options.emplace(CaptureOptions{std::move(output), composited});
+    // AppKit can terminate the process after runtime shutdown without returning to main.
+    if (std::atexit([] { if (verification_exit != 0) std::_Exit(verification_exit); }) != 0)
+      throw std::runtime_error("Could not register the capture verification exit status");
+    const auto result = RunApplication();
+    options.reset();
+    if (result != 0) verification_exit = result;
+    return verification_exit;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
@@ -243,3 +223,12 @@ std::optional<int> RunCaptureCommand(int argc, const char** argv) {
 }
 
 } // namespace avkit_preview
+
+const huxerui::Application application{
+    avkit_preview::CaptureVerificationApp,
+    {
+        .window = {.title = "AVKit Capture Verification", .initial_size = {640.0F, 480.0F}},
+        .show_debug_overlay = false,
+        .application_hooks = {huxerui::avkit::Install, huxerui::media::Install, huxerui::camera::Install, huxerui::audio::Install},
+    }
+};

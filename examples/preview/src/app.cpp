@@ -3,7 +3,6 @@
 #include <huxerui/media_library.h>
 
 #include <exception>
-#include <utility>
 
 #include "capture_preview.h"
 #include "workbench_media.h"
@@ -12,8 +11,6 @@ using namespace huxerui;
 
 View App() {
   try {
-    if (auto capture = avkit_preview::RequestedCapturePreview()) return std::move(*capture);
-    if (auto file = avkit_preview::RequestedFilePreview()) return std::move(*file);
     return avkit_preview::WorkbenchRoot();
   } catch (const std::exception& error) {
     return Text(error.what());

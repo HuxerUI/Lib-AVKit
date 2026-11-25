@@ -27,7 +27,7 @@ Core and the media orchestration use public HuxerUI and Lib-Media types. The fil
 | `platform/` | Platform texture bridges, graphics context setup, and packaging files. |
 | `cmake/` | Target and dependency setup. `AVKitBgfx.cmake` selects the renderer, shader profile, and platform sources. |
 | `models/` | Versioned model assets with checksums and upstream licenses. |
-| `examples/preview/` | Shared HuxerUI app, timeline, and fixtures in `src/`, with platform entry points and verification under `platform/`. |
+| `examples/preview/` | HuxerUI workbench in `src/`, platform adapters in `platform/`, and the separate macOS command-line tool in `verification/`. |
 
 In documentation and identifiers, use *platform* for platform adapters, capabilities, and storage. Use *system* for operating-system services and scheduling or when referring to an ECS system. Reserve *native* for terms such as JNI declarations and handles. Name a concrete type when it is known, such as a Metal texture or an FFmpeg frame.
 
@@ -46,19 +46,20 @@ cmake -S . -B build/core \
 cmake --build build/core --target avkit_core
 ```
 
-Capture on macOS, iOS, Android, and Windows requires Lib-Camera and Lib-AudioCapture. Place the source checkouts next to Lib-AVKit or set `AVKIT_LIB_CAMERA_SOURCE_DIR` to the Camera checkout. The recording page supports JPEG photos, microphone audio, live voice processing, pause and resume, and saving a copy. iOS, Android, and Windows use Camera's H.264/AAC MP4 recording with the AudioCapture PCM processor. The macOS live recording path includes the AVKit bgfx sticker compositor and codec selection.
+Capture on macOS, iOS, Android, and Windows requires Lib-Camera and Lib-AudioCapture. Place the source checkouts next to Lib-AVKit or set `AVKIT_LIB_CAMERA_SOURCE_DIR` to the Camera checkout. The recording page supports JPEG photos, microphone audio, live voice processing, pause and resume, and saving a copy. iOS and Windows use Camera's H.264/AAC MP4 recording with the AudioCapture PCM processor. macOS and Android use the AVKit bgfx sticker compositor and codec selection for recording.
 
-The macOS workbench also builds file editing, export, PAG, and ncnn. Point `PKG_CONFIG_PATH` at the target-compatible FFmpeg installation described in the [file workflow](docs/architecture.md#macos-file-media-milestone), and supply matching libpag headers and the macOS library.
+The macOS workbench supports file editing, export, PAG, and ncnn. Build the `avkit_verify` target to run regression checks and command-line exports. Point `PKG_CONFIG_PATH` at the target-compatible FFmpeg installation described in the [file workflow](docs/architecture.md#macos-file-media-milestone), and supply matching libpag headers and the macOS library.
 
 ```sh
 cmake -S examples/preview -B build/preview \
   -DAVKIT_PAG_INCLUDE_DIR="/path/to/libpag/include" \
   -DAVKIT_PAG_LIBRARY="/path/to/libpag.framework/libpag"
-cmake --build build/preview --target example_av_kit
+cmake --build build/preview --target example_av_kit avkit_verify
+open build/preview/example_av_kit.app
 
-preview="$PWD/build/preview/example_av_kit.app/Contents/MacOS/example_av_kit"
-"$preview" --verify
-"$preview" --timeline-verify-tracking "$PWD/build/tracking-check"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
+"$verify" --verify
+"$verify" --timeline-verify-tracking "$PWD/build/tracking-check"
 ```
 
 The Android workbench imports MP4 or MOV files in the file profile, plays and seeks the timeline, and exports BT.709 H.264/AAC MP4 through the system file picker. Lib-Media handles platform decoding and passes bgfx GLES composites to the MediaCodec AVC encoder surface. On a recoverable video encoder failure, export restarts from the beginning with FFmpeg and publishes the finalized MP4. Android export uses FFmpeg AAC-LC so the MP4 edit list carries exact priming and padding.

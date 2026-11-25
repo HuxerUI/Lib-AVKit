@@ -1319,7 +1319,7 @@ Switching encoders can change parameter sets, B-frame reordering, timestamps, an
 
 The shared bgfx compositor and texture lifetime code live in `src/render/bgfx/`. One shader source set is compiled for Metal, GLES and WebGL, Direct3D, Vulkan, and desktop OpenGL. Each platform selects its graphics context and provides its own texture bridge under `platform/`. `BgfxPlatformHandles` supplies optional window and display handles for context creation. Web uses the window field for the canvas selector. Platform texture leases remain valid through GPU use and keep output slots busy until the caller releases them. The scaffold sets deployment targets of macOS 12, iOS 15, and Android API 23. Verify the pinned dependencies and GPU capabilities against the deployment targets before distribution. [bgfx C++ API](../include/huxerui/avkit/bgfx.h) · [Renderer build](../cmake/AVKitBgfx.cmake) · [bgfx platform support](https://bkaradzic.github.io/bgfx/overview.html)
 
-The portable entry point accepts retained pixel rows and previous GPU output leases. It composes into reusable GPU textures, and the output surface declares the renderer's row origin. Backend-owned output uses a one-pixel staging readback to establish completion. The platform bridges wait for GPU completion with the platform renderer. Explicit full-frame readback supports the bitmap and CPU encoder paths. The macOS `--verify` entry point checks composited pixels, GPU completion, and output slot reuse. [Compositor API](../include/huxerui/avkit/bgfx.h) · [Verification entry point](../examples/preview/platform/macos/main.cpp)
+The portable entry point accepts retained pixel rows and previous GPU output leases. It composes into reusable GPU textures, and the output surface declares the renderer's row origin. Backend-owned output uses a one-pixel staging readback to establish completion. The platform bridges wait for GPU completion with the platform renderer. Explicit full-frame readback supports the bitmap and CPU encoder paths. The macOS `--verify` entry point checks composited pixels, GPU completion, and output slot reuse. [Compositor API](../include/huxerui/avkit/bgfx.h) · [Verification entry point](../examples/preview/verification/main.cpp)
 
 ## First milestone and acceptance checks
 
@@ -1331,14 +1331,14 @@ The milestone has three acceptance checks.
 - Repeatedly submit inputs in A, B, A order. When B completes, verify the pixels of the first A, which the consumer still holds. Both A outputs must agree. The texture pool reclaims resources after lease return and GPU completion.
 - Use an actual GPU completion signal to confirm the target is ready to read, then publish BGRA8 or RGBA8 through `macos::MetalTexture::Publish`. Keep the `ExternalTexture` logical size fixed across updates. Record the SDK's GPU snapshot copy and synchronization points. Use explicit test readback for pixel checks.
 
-The macOS implementation runs bgfx submission inline with one Metal frame in flight. The empty follow-up submission in `Pump` waits on the previous Metal command buffer's completion semaphore. `TryTake` returns the surface after that wait. The two-slot pool also waits for the returned surface lease before recycling an output. HuxerUI publication makes a synchronous GPU snapshot, and the verification entry point performs the explicit pixel readback. [Pinned bgfx Metal queue](https://github.com/bkaradzic/bgfx/blob/0762725e7dbf2863d68ed92bf26348a0b117c79f/src/renderer_mtl.cpp#L5929-L6000)
+The macOS implementation runs bgfx submission inline with one Metal frame in flight. The empty follow-up submission in `Pump` waits on the previous Metal command buffer's completion semaphore. `TryTake` returns the surface after that wait. The pool waits for the returned surface lease before recycling an output. The workbench's offscreen backend has three slots so a pending preview frame can coexist with both sides of a PAG transition. HuxerUI publication makes a synchronous GPU snapshot, and the verification entry point performs the explicit pixel readback. [Pinned bgfx Metal queue](https://github.com/bkaradzic/bgfx/blob/0762725e7dbf2863d68ed92bf26348a0b117c79f/src/renderer_mtl.cpp#L5929-L6000)
 
 Build, verify, and launch the preview from the repository root.
 
 ```sh
 cmake -S examples/preview -B build/first-milestone/preview -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/first-milestone/preview --target example_av_kit
-MTL_DEBUG_LAYER=1 build/first-milestone/preview/example_av_kit.app/Contents/MacOS/example_av_kit --verify
+cmake --build build/first-milestone/preview --target example_av_kit avkit_verify
+MTL_DEBUG_LAYER=1 build/first-milestone/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify --verify
 open build/first-milestone/preview/example_av_kit.app
 ```
 
@@ -1358,11 +1358,11 @@ open build/first-milestone/preview/example_av_kit.app
 
 The example selects one 8-bit SDR H.264 or HEVC picture track from MP4 or MOV. An audio track is optional. Files with audio require a 44.1 or 48 kHz AAC-LC mono or stereo track. Lib-Media's demuxer preserves the media-to-presentation edit mapping and normalizes an explicit absent-SBR sync extension to the canonical two-byte AAC AudioSpecificConfig. The FFmpeg adapter provides in-process H.264 and HEVC decode to I420, H.264 encode with `libx264` and zero B pictures, and AAC-LC encode and decode. Its AAC packets carry the encoder PTS including priming. Lib-Media writes the MP4 edit with known leading and trailing trim.
 
-The file preview and export both execute the two-layer BGRA8 bgfx plan. On macOS the video bridge fits the decoded picture and imports a Metal texture. Preview publishes the completed composite through the HuxerUI texture mailbox. The audio device clock selects due pictures. A seek retires the playback epoch and discards queued PCM and video, seeks to an earlier random-access point, and trims PCM to the target sample. The first published frame can span the target. Export converts the composite to an IOSurface-backed NV12 buffer for VideoToolbox, or reads its completed planes as I420 for FFmpeg. The example waits for the GPU conversion on the rendering sequence.
+The file-media regression's preview and export both execute the two-layer BGRA8 bgfx plan. On macOS the video bridge fits the decoded picture and imports a Metal texture. Preview publishes the completed composite through the HuxerUI texture mailbox. The audio device clock selects due pictures. A seek retires the playback epoch and discards queued PCM and video, seeks to an earlier random-access point, and trims PCM to the target sample. The first published frame can span the target. Export converts the composite to an IOSurface-backed NV12 buffer for VideoToolbox, or reads its completed planes as I420 for FFmpeg. The example waits for the GPU conversion on the rendering sequence.
 
 AVKit configures the file module and both codec provider targets for every platform. The build pins the Lib-Media Git revision and accepts an existing `HuxerUI::Media` target or a local override through `AVKIT_LIB_MEDIA_SOURCE_DIR`. Point `PKG_CONFIG_PATH` at a target FFmpeg build with `libavcodec` 60 or later, `libavutil` 58 or later, and `libswresample`. The build must enable H.264, HEVC, and AAC decoders, the AAC encoder, and the `libx264` encoder. The verification build uses FFmpeg 8.1.3 and the GPL `libx264` option. The build and OS compatibility of that dependency are part of the application's distribution configuration. [FFmpeg release archives](https://ffmpeg.org/download.html)
 
-Build the macOS workbench with the [dependencies in the README](../README.md#build). Run the commands from the repository root and use a fresh path for each MP4 destination.
+Build the macOS workbench and the `avkit_verify` target with the [dependencies in the README](../README.md#build). Run the commands from the repository root and use a fresh path for each MP4 destination.
 
 ```sh
 mkdir -p build/file-media
@@ -1374,13 +1374,12 @@ ffmpeg -f lavfi -i "color=c=blue:s=320x180:r=24:d=2.5,drawbox=x=16:y=12:w=94:h=6
   -color_primaries bt709 -color_trc bt709 -colorspace bt709 -c:a aac -ar 48000 -b:a 96k \
   -shortest build/file-media/fixture.mp4
 
-preview=build/preview/example_av_kit.app/Contents/MacOS/example_av_kit
-MTL_DEBUG_LAYER=1 "$preview" --media-verify build/file-media/fixture.mp4 build/file-media/verified.mp4
-"$preview" --media-export build/file-media/fixture.mp4 build/file-media/export.mp4
-"$preview" --media-preview build/file-media/fixture.mp4 1.025
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
+MTL_DEBUG_LAYER=1 "$verify" --media-verify build/file-media/fixture.mp4 build/file-media/verified.mp4
+"$verify" --media-export build/file-media/fixture.mp4 build/file-media/export.mp4
 ```
 
-The verification entry point compares platform and software decode timing, seeks during PCM-clocked playback, and injects resource exhaustion after eight VideoToolbox decoder frames and five encoder packets. It checks exact reimported PTS, frame durations, and PCM sample count after export restarts into a new temporary MP4. The preview window exposes `Start` and `Middle` seeks, and `--media-export` accepts `--software-only` to select both software codecs explicitly.
+The verification entry point compares platform and software decode timing, seeks during PCM-clocked playback, and injects resource exhaustion after eight VideoToolbox decoder frames and five encoder packets. It checks exact reimported PTS, frame durations, and PCM sample count after export restarts into a new temporary MP4. For a manual check, import the fixture in the workbench editor and use its timeline to seek. The `--media-export` command accepts `--software-only` to select both software codecs explicitly.
 
 ## Camera and microphone recording
 
@@ -1396,10 +1395,10 @@ The recorder requires a common capture clock on both inputs. macOS uses CoreMedi
 
 `WriteLiveMovie` supplies codec negotiation, AAC trim, and staged MP4 output. Recording and workbench export use `FileExportSettings::Sdr` for limited-range BT.709 and the platform AAC policy. On Android it selects FFmpeg for AAC to preserve the exact sample cutoff when the platform encoder omits priming and padding. The video encoder uses the platform provider with software fallback during negotiation. A failure after a live input starts does not replay consumed frames. [Camera recording API](../include/huxerui/avkit/camera_recording.h) · [File media API](../include/huxerui/avkit/file_movie.h)
 
-Build the macOS workbench and run the verification with a fresh output directory. The test checks recorded frame durations, PCM continuity, exact stop time, pause removal, and alignment between a GPU picture cue and the robot voice sidebands.
+Build the `avkit_verify` target and run the capture check with a fresh output directory. Grant camera and microphone access to AVKit Verification when macOS prompts. The test checks recorded frame durations, PCM continuity, exact stop time, pause removal, and alignment between a GPU picture cue and the robot voice sidebands.
 
 ```sh
-app="$PWD/build/preview/example_av_kit.app"
+app="$PWD/build/preview/verification/avkit_verify.app"
 open -W -n "$app" --stdout "$PWD/build/live-capture.log" \
   --stderr "$PWD/build/live-capture.log" --args --verify-live-capture "$PWD/build/live-capture"
 ```
@@ -1446,7 +1445,7 @@ The macOS timeline preview fills the available capacity of its 250 ms PCM queue 
 
 After the PCM clock first advances, preview uses steady elapsed time to pace pictures between device completion updates. The estimate stays within accepted PCM and at most 150 ms ahead of the confirmed position. It resets on seek or when playback leaves the playing state. A batched update can leave multiple pictures due. The preview tries the next picture if it still has a frame interval to compose before the 100 ms lateness threshold. It rechecks the clock after composition and discards pictures that miss the threshold. Once audio drains, the last in-range picture can still be published.
 
-Build the macOS example as in the file milestone. The verification takes a blue and a red 2.5-second fixture with audio and writes three project documents and their MP4 exports. It uses copies when simulating a missing file. Use a fresh result directory for each run.
+Build the `avkit_verify` target as in the file milestone. Open the generated `.avkit` documents from the workbench for manual editing and playback checks. The verification takes a blue and a red 2.5-second fixture with audio and writes three project documents and their MP4 exports. It uses copies when simulating a missing file. Use a fresh result directory for each run.
 
 ```sh
 work="$PWD/build/timeline-preview"
@@ -1460,12 +1459,10 @@ ffmpeg -f lavfi -i 'color=c=red:s=320x180:r=24:d=2.5' \
   -c:v libx264 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
   -c:a aac "$work/red.mp4"
 
-app="$PWD/build/file-media/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
-"$preview" --timeline-verify "$work/blue.mp4" "$work/red.mp4" "$work/results"
-open -n "$app" --args --timeline-preview "$work/results/template-a.avkit"
-"$preview" --timeline-export "$work/results/template-a.avkit" "$work/export.mp4"
-"$preview" --timeline-verify-codecs "$work/results/template-a.avkit" "$work/codec-results"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
+"$verify" --timeline-verify "$work/blue.mp4" "$work/red.mp4" "$work/results"
+"$verify" --timeline-export "$work/results/template-a.avkit" "$work/export.mp4"
+"$verify" --timeline-verify-codecs "$work/results/template-a.avkit" "$work/codec-results"
 ```
 
 Verification compares preview pixels after independent sticker edits, undo, redo, reopening, and relinking. The two template applications compare editable tracks, published pixels during normal playback and forward and backward seeks, and the decoded output of both software exports. Both output tracks start at zero and end at two seconds, with 48 video frames and 96,000 PCM samples per channel. Reimport also compares selected main, picture-in-picture, and sticker pixels against the corresponding preview samples with a tolerance for video compression.
@@ -1485,8 +1482,7 @@ During the overlap, Flecs routes each clip and its spatial children to a separat
 Run with the blue and red video fixtures from the timeline milestone and a fresh output directory.
 
 ```sh
-"$preview" --timeline-verify-transition "$work/blue.mp4" "$work/red.mp4" "$work/transition-results"
-open -n "$app" --args --timeline-preview "$work/transition-results/animated-transition.avkit"
+"$verify" --timeline-verify-transition "$work/blue.mp4" "$work/red.mp4" "$work/transition-results"
 ```
 
 The verification gives the clips a shared rectangle covering the middle 60% of the canvas in each dimension. One instance of the same sticker resource extends below the outgoing clip, and the other extends above the incoming clip. The test compares the frames on both sides of each transition boundary, then probes the overflow pixels at full and partial mask coverage. It also checks that the transition composites over a lower layer. The test moves the transition from 0.75 to 0.625 seconds, then extends its duration from 1 to 1.25 seconds. The local keys move from `0`, `0.25`, `0.5`, and `1` seconds to `0`, `0.3125`, `0.625`, and `1.25`. It verifies the transition and sticker IDs, undo, redo, and reopening. It checks the selected mask frames, feather values, and source PTS for all 60 output frames. Clocked preview crosses both transition boundaries and uses forward and backward seeks. Export compares GPU pixels against preview before encoding and checks the reimported MP4 for timing, PCM continuity, and the expected RGB compression tolerance at the overflow pixels.
@@ -1503,7 +1499,7 @@ Each video cache keeps up to 64 CPU pictures within 64 MiB, or one picture if it
 
 The example maintains one active background request and one pending viewport. A scroll, zoom, or relink advances the generation and requests cooperative cancellation. The reader wakes a cancelled codec wait, and the view checks the generation again before displaying results. The timeline retains overlapping samples while the new viewport fills. The first available picture fills unresolved cells on the same clip, and later samples replace their own project-time cells. AVKit's `OpenCanvasThumbnailSource` fits platform frames through Lib-Media. On Android, AVKit transfers the resulting GLES texture to a hardware-backed bitmap on a sampling context independent of the preview renderer. The application paints the returned thumbnail in the timeline Canvas. Thumbnail sampling prefers a platform video decoder on the worker and retries a rejected frame in software at the same source PTS. Waveform sampling uses independent audio cursors. The preview owns its own `TimelineSession` and resumes at the current project position when a relinked revision replaces its sources.
 
-Use two four-second H.264/AAC clips with 24 fps video and stereo 48 kHz audio. The second file supplies visibly different video and PCM for relinking. Run from the repository root after building the macOS file preview.
+Use two four-second H.264/AAC clips with 24 fps video and stereo 48 kHz audio. The second file supplies visibly different video and PCM for relinking. Run from the repository root after building the macOS verification tool.
 
 ```sh
 work="$PWD/build/timeline-assets"
@@ -1519,10 +1515,8 @@ ffmpeg -f lavfi -i 'testsrc2=s=320x180:r=24:d=4,negate' \
   -c:v libx264 -g 24 -bf 2 -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
   -c:a aac -b:a 192k "$work/fixtures/replacement.mp4"
 
-app="$PWD/build/file-media/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
-"$preview" --timeline-verify-assets "$work/fixtures/source.mp4" "$work/fixtures/replacement.mp4" "$work/results"
-open -n "$app" --args --timeline-assets "$work/results/trim-and-reverse.avkit" "$work/fixtures/replacement.mp4"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
+"$verify" --timeline-verify-assets "$work/fixtures/source.mp4" "$work/fixtures/replacement.mp4" "$work/results"
 ```
 
 The test checks source PTS against an independent frame grid and compares stereo peaks with decoded reference PCM. It checks both project-time directions and the first reverse frame at the source trim end. During audio-clocked preview it holds background work long enough to supersede it with a scroll, zoom, and relink. Only the newest generation delivers a strip. A second check reuses one sampler across asset revisions and verifies both cache refreshes while keeping the same project asset ID.
@@ -1537,14 +1531,12 @@ A full-frame body provider can declare an ordered stateful session with no expli
 
 A tracked sticker persists its subject part and semantic point names in project version 4. The Flecs sticker layer is a spatial child of a tracking anchor within its clip. One point supplies a position. Two points also define the local pixel scale and direction. The Metal compositor applies the resulting affine draw in the fitted video coordinates, including in clip subcompositions. [Project API](../include/huxerui/avkit/project.h) · [Timeline API](../include/huxerui/avkit/timeline.h)
 
-Run from the repository root after building the macOS file preview. Use a fresh output directory.
+Run from the repository root after building the macOS verification tool. Use a fresh output directory.
 
 ```sh
-app="$PWD/build/file-media/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
 work="$PWD/build/tracking-milestone/results"
-"$preview" --timeline-verify-tracking "$work"
-open -n "$app" --args --timeline-tracking-preview "$work/tracking.avkit"
+"$verify" --timeline-verify-tracking "$work"
 ```
 
 The verifier generates two crossing figures in a 24 fps H.264/AAC fixture. A forward clip and a reversed clip share the fixture. It checks both eye positions and both subject-side wrists on the selected figure, reopens the project, and compares plans and GPU pixels at shared source PTS. It seeks directly to frames with missing eye axes, missing body tracks, and ambiguous wrists, and verifies that the corresponding stickers disappear. It also exercises capability negotiation, strict and gap-tolerant windows, and delivery of an old completion during a new clip's pending request at the same source PTS.
@@ -1555,16 +1547,14 @@ The verifier generates two crossing figures in a 24 fps H.264/AAC fixture. A for
 
 The first valid picture fixes the reference for the session. An empty or ambiguous reference leaves the session without a subject. Later samples need one eligible face and a close match to the eye-aligned luma patch from the reference. Each comparison uses that same reference, so requesting a target in a different playback order gives the same result for the same clip trim and input format. This selection heuristic is for a single subject. It can hide the sticker when the subject changes pose or lighting significantly. Run model inference and completion on the session's worker sequence. Cancellation skips the result before or after inference.
 
-Use a Release build of the [macOS workbench](../README.md#build) and a fresh output directory.
+Use a Release build of the [macOS verification tool](../README.md#build) and a fresh output directory.
 
 ```sh
-app="$PWD/build/preview/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
 fixture="$PWD/examples/preview/fixtures/yunet-faces.mp4"
 pack="$PWD/models/yunet/2023mar"
 work="$PWD/build/yunet-check"
-"$preview" --timeline-verify-ncnn "$fixture" "$pack" "$work"
-open -n "$app" --args --timeline-ncnn-preview "$work/yunet.avkit" "$pack"
+"$verify" --timeline-verify-ncnn "$fixture" "$pack" "$work"
 ```
 
 The fixture contains the reference face, two faces together, a different face on its own, a blank frame, and the returned reference face. The verifier checks malformed model assets, an unsupported capability, cancellation, and independent model sessions. It checks the same source PTS in both directions and after explicit and clocked seeks. The output MP4 is reimported to check frame timing and the rendered glasses position.
@@ -1588,22 +1578,19 @@ If the selected hand has no usable temporal reference after the first search, Co
 The macOS verification command accepts a 640 × 480 source at 24 fps with an AAC audio track. Frame zero shows the first reference person and frame one shows the second reference person. Both clips end at the same source frame. Supply eight pixel coordinates per source frame in a text file. List the first person's left and right wrists, followed by the second person's left and right wrists. Use `0 0` for a hidden wrist. Include shared source frames with distinct wrist positions for the two people and a partial occlusion that leaves the first person's left wrist visible. Leave enough frames after a full occlusion for confirmation and sticker recovery.
 
 ```sh
-"$preview" --timeline-verify-ncnn-body "$source" "$pack" "$wrists" "$work"
-open -n "$app" --args --timeline-ncnn-preview "$work/body-hand.avkit" "$pack"
+"$verify" --timeline-verify-ncnn-body "$source" "$pack" "$wrists" "$work"
 ```
 
 The verifier checks both directions for each clip against the same source PTS and verifies that direct and clocked seeks reuse the ordered results. It also compares pre-encode pixels and reimported MP4 timing.
 
 ### Portrait mask verification
 
-Use the macOS file preview build and a fresh directory. The fixture uses two independently analyzed clips of the same file, with different crops, a mirrored picture-in-picture layer, and opposite playback directions. It also checks a 320×180 source on a 320×240 canvas with fitted, full-source, and padded imports. The verifier compares the GPU output against a source-space pixel calculation, then checks both seek directions, reversed playback, clocked preview, export before encoding, and reimported PTS and PCM. The reimport pixel check uses an unspecified output transfer so it measures the encoded SDR samples. The verifier also submits a late mask from a timed-out job during a new job for the same source PTS.
+Use the macOS verification tool and a fresh directory. The fixture uses two independently analyzed clips of the same file, with different crops, a mirrored picture-in-picture layer, and opposite playback directions. It also checks a 320×180 source on a 320×240 canvas with fitted, full-source, and padded imports. The verifier compares the GPU output against a source-space pixel calculation, then checks both seek directions, reversed playback, clocked preview, export before encoding, and reimported PTS and PCM. The reimport pixel check uses an unspecified output transfer so it measures the encoded SDR samples. The verifier also submits a late mask from a timed-out job during a new job for the same source PTS.
 
 ```sh
-app="$PWD/build/preview/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
 work="$PWD/build/portrait-mask-check"
-"$preview" --timeline-verify-masks "$work"
-open -n "$app" --args --timeline-mask-preview "$work/portrait-mask.avkit"
+"$verify" --timeline-verify-masks "$work"
 ```
 
 ### ncnn portrait segmentation
@@ -1640,14 +1627,12 @@ cp "$models/wide/pp_humansegv2_lite.ncnn.param" "$models/wide/pp_humansegv2_lite
 Use `--mixed-models` with the prepared runtime directory to select the wide model on the main clip and MediaPipe on the inset. The verifier opens the saved project, compares the selected masks at shared source PTS, and changes one clip's model in a new revision. It checks that the other clip keeps its selected coverage. For an inset that fits in one GOP, it checks for one video decoder per clip during sequential sampling and verifies that seeks within the warmed window reuse the reverse decoder. Both playback directions resume after each seek, reach the last frame, and verify zero PCM underruns and less than 100 ms of video publication lag relative to the PCM clock. The playback report includes missed frame positions between seeks and pictures discarded after rendering. Omit the option to verify the default MediaPipe path.
 
 ```sh
-app="$PWD/build/preview/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
 source="/path/to/recording.mp4"
 pack="$PWD/build/portrait-models/runtime"
 work="$PWD/build/ncnn-portrait-check"
-"$preview" --timeline-verify-ncnn-mask "$source" "$pack" "$work" --mixed-models
-open -n "$app" --args --timeline-ncnn-preview "$work/ncnn-portrait.avkit" "$pack"
-"$preview" --timeline-ncnn-export "$work/ncnn-portrait.avkit" "$pack" "$work/export.mp4"
+"$verify" --timeline-verify-ncnn-mask "$source" "$pack" "$work" --mixed-models
+"$verify" --timeline-ncnn-export "$work/ncnn-portrait.avkit" "$pack" "$work/export.mp4"
 ```
 
 ### Static template mask verification
@@ -1657,9 +1642,8 @@ Use the saved mixed-model DanceTrack project from the portrait verification. The
 ```sh
 project="$PWD/build/ncnn-portrait-check/ncnn-portrait.avkit"
 work="$PWD/build/static-template-mask-check"
-"$preview" --timeline-verify-template-masks "$project" "$work"
-open -n "$app" --args --timeline-preview "$work/static-masks.avkit"
-"$preview" --timeline-export "$work/static-masks.avkit" "$work/export.mp4" --software-only
+"$verify" --timeline-verify-template-masks "$project" "$work"
+"$verify" --timeline-export "$work/static-masks.avkit" "$work/export.mp4" --software-only
 ```
 
 ### Animated template mask verification
@@ -1669,9 +1653,8 @@ Use the same DanceTrack project or the saved project from static template mask v
 ```sh
 project="$PWD/build/ncnn-portrait-check/ncnn-portrait.avkit"
 work="$PWD/build/animated-template-mask-check"
-"$preview" --timeline-verify-animated-template-masks "$project" "$work"
-open -n "$app" --args --timeline-preview "$work/animated-masks.avkit"
-"$preview" --timeline-export "$work/animated-masks.avkit" "$work/export.mp4" --software-only
+"$verify" --timeline-verify-animated-template-masks "$project" "$work"
+"$verify" --timeline-export "$work/animated-masks.avkit" "$work/export.mp4" --software-only
 ```
 
 ### Depth occlusion verification
@@ -1681,7 +1664,7 @@ Pass the three-video-track DanceTrack project saved by animated template mask ve
 ```sh
 project="$PWD/build/animated-template-mask-check/animated-masks.avkit"
 work="$PWD/build/depth-occlusion-check"
-"$preview" --timeline-verify-depth "$project" "$work"
+"$verify" --timeline-verify-depth "$project" "$work"
 ```
 
 ### PAG sticker verification
@@ -1689,21 +1672,18 @@ work="$PWD/build/depth-occlusion-check"
 Provide the C++ headers and target library from the same libpag release. The verified SDK is v4.5.102. On macOS, use the library executable inside the selected `libpag.framework`. The workbench embeds that framework. For Android, set `AVKIT_ANDROID_PAG_AAR` so CMake can link the selected ABI and Gradle can package the Java runtime and `libffavc.so`. [libpag v4.5.102](https://github.com/Tencent/libpag/releases/tag/v4.5.102)
 
 ```sh
-app="$PWD/build/preview/example_av_kit.app"
-preview="$app/Contents/MacOS/example_av_kit"
+verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_verify"
 project="$PWD/build/animated-template-mask-check/animated-masks.avkit"
 work="$PWD/build/pag-sticker-check"
-"$preview" --timeline-verify-pag-stickers "$project" "$work"
-open -n "$app" --args --timeline-preview "$work/pag-stickers.avkit"
-"$preview" --timeline-export "$work/pag-stickers.avkit" "$work/export.mp4" --software-only
+"$verify" --timeline-verify-pag-stickers "$project" "$work"
+"$verify" --timeline-export "$work/pag-stickers.avkit" "$work/export.mp4" --software-only
 ```
 
 The verifier uses libpag's bundled `like.pag` sample, a 244 × 244 animation with 28 frames at 24 fps. It checks premultiplied source-over, retained surfaces, and the exact hold and loop boundaries before using the DanceTrack project. The main clip holds the final frame. The inset starts on project frame 12 and loops to the first frame at project frame 40. The verifier compares exact composition pixels on both seek directions and with all video sources reversed. It checks continuous PCM and exact PTS after reimporting both exports. [Upstream fixture](https://github.com/Tencent/libpag/blob/v4.5.102/assets/like.pag) · [Bundled license](../examples/preview/resources/raw/stickers/libpag-license.txt)
 
 ```sh
 work="$PWD/build/pag-replacement-check"
-"$preview" --timeline-verify-pag-replacements "$project" "$work"
-open -n "$app" --args --timeline-preview "$work/pag-replacements.avkit"
+"$verify" --timeline-verify-pag-replacements "$project" "$work"
 ```
 
 The replacement verifier attaches the same editable PAG asset to the main clip and the first inset. It changes the inset's `title` and `icon` slots independently at the same project frame and checks that pixels outside the inset stay identical. It checks empty text, undo, redo, restoration of authored values, and reopening. Both source directions use exact-time reference pictures for clocked preview, ascending and descending sampling, both seek directions, and pre-encode export. Reimport verifies video PTS and continuous PCM. [Upstream fixture](https://github.com/Tencent/libpag/blob/v4.5.102/assets/wstask_prizebaoji.pag)
@@ -1718,9 +1698,8 @@ Use the DanceTrack project from animated template mask verification. The verifie
 
 ```sh
 work="$PWD/build/pag-transition-check"
-"$preview" --timeline-verify-pag-transition "$project" "$work"
-open -n "$app" --args --timeline-preview "$work/pag-transition.avkit"
-"$preview" --timeline-export "$work/pag-transition.avkit" "$work/export.mp4" --software-only
+"$verify" --timeline-verify-pag-transition "$project" "$work"
+"$verify" --timeline-export "$work/pag-transition.avkit" "$work/export.mp4" --software-only
 ```
 
 The verifier holds one PAG output across a subsequent sample to check immutability, then releases it and checks IOSurface reuse. It records side composition, Metal input blits and wait, PAG binding and flush, GPU completion, and the final bgfx pass at 320 × 180 and 1920 × 1080. For the video-only transition it checks that the final pass enqueues zero CPU texture uploads. The timeline-and-composition total includes video decoding and import. The verifier repeats the 1080p measurement with automatic codec selection and reports how many imported frames use platform storage. The benchmark excludes audio playback and encoding.

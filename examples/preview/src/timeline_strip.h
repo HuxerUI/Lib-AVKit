@@ -2,7 +2,6 @@
 
 #include <huxerui/avkit/asset_sampling.h>
 #include <huxerui/paint.h>
-#include <huxerui/view.h>
 
 namespace avkit_preview {
 
@@ -61,18 +60,5 @@ StripViewport VisibleStrip(const huxerui::avkit::ProjectSnapshot& project, std::
 inline void DrawStripThumbnail(huxerui::PaintContext& paint, const huxerui::avkit::Thumbnail& thumbnail, huxerui::Rect rect) {
   std::visit([&](const auto& image) { paint.DrawImage(image, rect); }, thumbnail.image);
 }
-void PaintTimelineStrip(huxerui::PaintContext& paint, huxerui::Size size,
-                        const huxerui::avkit::ProjectSnapshot& project, const StripResult& strip);
-
-struct StripPreviewOptions {
-  huxerui::avkit::Project project;
-  huxerui::File replacement;
-  StripWorker worker;
-};
-
-void ConfigureTimelineStrip(std::string_view project, std::string_view replacement);
-std::shared_ptr<StripPreviewOptions> TimelineStripOptions();
-huxerui::View TimelineStripPreview(std::shared_ptr<huxerui::ExternalTexture> picture);
-void VerifyTimelineStrip(std::string_view first, std::string_view replacement, std::string_view directory);
 
 } // namespace avkit_preview

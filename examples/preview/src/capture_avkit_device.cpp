@@ -20,13 +20,6 @@ using RecordingState = CameraRecordingStatus::State;
 
 } // namespace
 
-CanvasOverlay CaptureSticker(PixelSize canvas) {
-  constexpr float width = 0.20F;
-  const float height = width * canvas.width / canvas.height;
-  return {.id = {1}, .kind = CanvasOverlayKind::Sticker, .destination = {0.69F, 0.12F, width, height},
-          .resource = {"avkit.preview", "1", "pag-spark"}};
-}
-
 CaptureDevice UseCaptureDevice(State<bool> robot, State<bool> sticker) {
   const auto application = UseApplication();
   const auto tasks = UseTaskScope();

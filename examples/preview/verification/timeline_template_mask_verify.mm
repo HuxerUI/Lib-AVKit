@@ -1,12 +1,12 @@
 #include "timeline_template_mask_verify.h"
 
 #include "bgfx_metal_texture.h"
-#include "metal_preview.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
 #include "support/media_time.h"
-#include "timeline_preview.h"
-#include "verification/codec_verification.h"
-#include "verification/tracking_fixture.h"
+#include "timeline_verify.h"
+#include "codec_verification.h"
+#include "tracking_fixture.h"
 
 #include <algorithm>
 #include <array>

@@ -1,6 +1,6 @@
 #include "movie_renderer.h"
 
-#include "metal_preview.h"
+#include "metal_verify.h"
 #include "sticker_scene.h"
 
 #include <huxerui/avkit/bgfx.h>

@@ -1,25 +1,21 @@
-#include "file_preview.h"
+#include "file_media_verify.h"
 #include "bgfx_metal_texture.h"
-#include "verification/codec_verification.h"
-#include "metal_preview.h"
+#include "codec_verification.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
 #include "sticker_scene.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iostream>
-#include <limits>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
-#include <utility>
 #include <utility>
 #include <vector>
 
@@ -94,7 +90,7 @@ using TakeSeek = std::function<std::optional<MediaTimestamp>(std::size_t publish
 
 PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture& mailbox, bool muted,
                         const MovieCodecProviders& providers, const OnCodecFallback& report, const TakeSeek& take_seek,
-                        std::stop_token stop = {}, bool cue = false) {
+                        bool cue) {
   MovieRenderer renderer(OutputSize(asset));
   MovieReader reader(asset, providers, CodecPolicy::Auto, report);
   if (at.ticks) reader.Seek(at);
@@ -110,11 +106,11 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
   std::deque<PreparedFrame> prepared;
   std::optional<AudioFrame> sound;
   bool video_finished = false, audio_finished = !asset.HasAudio();
-  bool audio_eof = false, ended_reported = false;
+  bool audio_eof = false;
   PlaybackStats stats;
   auto last_progress = std::chrono::steady_clock::now();
   std::optional<MediaTimestamp> position;
-  while (!stop.stop_requested()) {
+  for (;;) {
     @autoreleasepool {
       const auto snapshot = playback.Snapshot();
       if (snapshot.error) throw std::runtime_error(snapshot.error->message);
@@ -127,7 +123,7 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
           sound.reset();
           reader.Seek(*requested);
           Require(playback.Play());
-          video_finished = audio_eof = ended_reported = false;
+          video_finished = audio_eof = false;
           audio_finished = !asset.HasAudio();
           stats = {};
           position.reset();
@@ -137,25 +133,18 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
       }
       if (snapshot.state == PlaybackState::Ended) {
         stats.underruns = snapshot.audio_underruns;
-        if (!stop.stop_possible()) break;
-        if (!ended_reported) {
-          std::cout << "Preview published " << stats.published << " frames, dropped " << stats.dropped
-                    << ", maximum audio-clock lag " << stats.maximum_lag_ms << " ms, underruns " << stats.underruns << std::endl;
-          ended_reported = true;
-        }
-        std::this_thread::sleep_for(15ms);
-        continue;
+        break;
       }
       bool progressed = position != snapshot.position;
       position = snapshot.position;
       if (!video_finished) {
         if (!picture) {
-          picture = reader.ReadVideo(stop);
+          picture = reader.ReadVideo();
           if (picture) {
             try {
               pending_surface = renderer.ImportFrame(*picture).surface;
             } catch (const PlatformVideoImportError& error) {
-              picture = reader.RetryVideoFrame(*picture, error, stop);
+              picture = reader.RetryVideoFrame(*picture, error);
               pending_surface = renderer.ImportFrame(*picture).surface;
             }
           }
@@ -211,16 +200,6 @@ PlaybackStats PlayMovie(const MovieAsset& asset, MediaTimestamp at, MetalTexture
   return stats;
 }
 
-struct PreviewOptions {
-  MovieAsset asset;
-  MediaTimestamp start;
-};
-std::optional<PreviewOptions> preview;
-std::mutex preview_seek_mutex;
-std::optional<MediaTimestamp> preview_seek;
-MediaTimestamp preview_midpoint;
-std::jthread preview_worker;
-
 huxerui::Size LogicalSize(PixelSize size) { return {float(size.width), float(size.height)}; }
 
 void Export(const MovieAsset& asset, const File& output, const MovieCodecProviders& providers, bool software_only,
@@ -261,65 +240,14 @@ TimelineStats ReadTimeline(const MovieAsset& asset, const MovieCodecProviders& p
 
 } // namespace
 
-void ConfigureFilePreview(std::string_view input, std::string_view start_seconds) {
-  const std::string argument(start_seconds);
-  char* end = nullptr;
-  const double seconds = std::strtod(argument.c_str(), &end);
-  Check(end != argument.c_str() && end == argument.c_str() + argument.size() &&
-            std::isfinite(seconds) && seconds >= 0 &&
-            seconds < double(std::numeric_limits<std::int64_t>::max() / 1000000),
-        "Preview start must be a nonnegative number of seconds");
-  const MediaTimestamp at{std::llround(seconds * 1000000), 1000000};
-  auto asset = ImportMovie(File(input));
-  Check(at.Compare(asset.end) == -1, "Preview start is outside the file");
-  preview_midpoint = asset.end.Rescale(asset.pcm.sample_rate).value();
-  preview_midpoint.ticks /= 2;
-  preview.emplace(PreviewOptions{std::move(asset), at});
-}
-
-std::shared_ptr<ExternalTexture> CreateFilePreview() {
-  if (!preview) return {};
-  auto mailbox = std::make_shared<MetalTexture>(LogicalSize(OutputSize(preview->asset)));
-  preview_worker = std::jthread([options = std::move(*preview), mailbox](std::stop_token stop) {
-    @autoreleasepool {
-      try {
-        const auto take_seek = [](std::size_t) {
-          std::lock_guard lock(preview_seek_mutex);
-          return std::exchange(preview_seek, std::nullopt);
-        };
-        PlayMovie(options.asset, options.start, *mailbox, false, Providers(), LogFallback, take_seek, stop);
-      } catch (const std::exception& error) {
-        mailbox->Finish();
-        std::cerr << "File preview failed: " << error.what() << std::endl;
-      }
-    }
-  });
-  preview.reset();
-  return mailbox;
-}
-
-bool HasFilePreview() { return preview_worker.joinable(); }
-
-void SeekFilePreview(bool midpoint) {
-  std::lock_guard lock(preview_seek_mutex);
-  preview_seek = midpoint ? preview_midpoint : MediaTimestamp{};
-}
-
-void StopFilePreview() {
-  if (preview_worker.joinable()) {
-    preview_worker.request_stop();
-    preview_worker.join();
-  }
-}
-
-void ExportFilePreview(std::string_view input, std::string_view output, bool software_only) {
+void ExportMediaFile(std::string_view input, std::string_view output, bool software_only) {
   @autoreleasepool {
     Export(ImportMovie(File(input)), File(output), Providers(), software_only, LogFallback);
     std::cout << "Published MP4 " << output << std::endl;
   }
 }
 
-void VerifyFilePreview(std::string_view input, std::string_view output) {
+void VerifyFileMedia(std::string_view input, std::string_view output) {
   @autoreleasepool {
     const auto asset = ImportMovie(File(input));
     const auto providers = Providers();
@@ -367,7 +295,7 @@ void VerifyFilePreview(std::string_view input, std::string_view output) {
       if (published < 2 || requested) return std::nullopt;
       requested = true;
       return seek;
-    }, {}, true);
+    }, true);
     MetalTexture::Origin origin;
     auto snapshot = mailbox.AcquireFrame(origin);
     Check(snapshot != nil && origin == MetalTexture::Origin::TopLeft && requested && stats.published > 0 &&
@@ -394,7 +322,7 @@ void VerifyFilePreview(std::string_view input, std::string_view output) {
           if (published < 2 || seeks == 2) return std::nullopt;
           reject_texture = true;
           return ++seeks == 1 ? seek : MediaTimestamp{};
-        }, {}, true);
+        }, true);
     Check(seeks == 2 && texture_stats.first_audio == MediaTimestamp{} &&
               texture_stats.first_video == baseline.pictures.front().first && !texture_stats.underruns &&
               fallbacks.size() == 1 && fallbacks.front().operation == CodecOperation::VideoDecode &&

@@ -36,7 +36,4 @@ std::shared_ptr<const StripResult> UseEditorStrip(
     std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
     std::optional<WorkbenchDrag> drag);
 
-std::optional<huxerui::View> RequestedFilePreview();
-std::optional<int> RunFileMediaCommand(int argc, const char** argv);
-
 } // namespace avkit_preview

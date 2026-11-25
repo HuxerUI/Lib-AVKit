@@ -1,8 +1,8 @@
-#include "timeline_preview.h"
+#include "timeline_verify.h"
 
 #include "bgfx_metal_texture.h"
-#include "verification/codec_verification.h"
-#include "metal_preview.h"
+#include "codec_verification.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
 
 #include <algorithm>

@@ -1,9 +1,9 @@
 #include "timeline_tracking_verify.h"
 
 #include "bgfx_metal_texture.h"
-#include "metal_preview.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
-#include "timeline_preview.h"
+#include "timeline_verify.h"
 
 #include <algorithm>
 #include <array>

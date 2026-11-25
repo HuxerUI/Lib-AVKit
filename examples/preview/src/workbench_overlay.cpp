@@ -30,6 +30,13 @@ OverlayAssets LoadOverlayAssets(const Resources& resources) {
   return assets;
 }
 
+CanvasOverlay CaptureSticker(PixelSize canvas) {
+  constexpr float width = 0.20F;
+  const float height = width * canvas.width / canvas.height;
+  return {.id = {1}, .kind = CanvasOverlayKind::Sticker, .destination = {0.69F, 0.12F, width, height},
+          .resource = {"avkit.preview", "1", "pag-spark"}};
+}
+
 PagOverlayResources WorkbenchPagResources(OverlayAssets assets) {
   return {
     .point_text = assets.point_text,

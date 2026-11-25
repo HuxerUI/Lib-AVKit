@@ -1,48 +1,27 @@
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <string_view>
 
-#include "workbench_media.h"
-#include "file_preview.h"
-#include "timeline_preview.h"
+#include "capture_verify.h"
+#include "file_media_verify.h"
+#include "metal_verify.h"
+#include "timeline_verify.h"
 #include "timeline_depth_verify.h"
 #include "timeline_mask_verify.h"
-#include "timeline_strip.h"
 #include "timeline_template_mask_verify.h"
 #include "timeline_tracking_verify.h"
 #include "timeline_pag_verify.h"
 
 namespace avkit_preview {
+namespace {
 
-std::optional<huxerui::View> RequestedFilePreview() {
-  using namespace huxerui;
-  const auto timeline = HasTimelinePreview();
-  if (!timeline && !HasFilePreview()) return std::nullopt;
-  static const auto texture = timeline ? CreateTimelinePreview() : CreateFilePreview();
-  if (TimelineStripOptions()) return TimelineStripPreview(texture);
-  const auto seek = timeline ? SeekTimelinePreview : SeekFilePreview;
-  return Column {
-    Image(texture).Fit(ImageFit::Contain).With(Grow()),
-    Row {
-      Button("Start").OnClick([seek] { seek(false); }),
-      Button("Middle").OnClick([seek] { seek(true); }),
-    }.With(Spacing(8.0F), MainAlign(MainAxisAlignment::Center)),
-  }.With(Padding(8.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
-}
-
-std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
+std::optional<int> RunMediaCommand(int argc, const char** argv) {
   if (argc > 1 && std::string_view(argv[1]).starts_with("--timeline-")) {
     try {
       const std::string_view command(argv[1]);
-      if ((command == "--timeline-preview" || command == "--timeline-tracking-preview") && (argc == 3 || argc == 4)) {
-        ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
-            command == "--timeline-tracking-preview" ? CreateMockTrackingProvider() : nullptr);
-        const int result = huxerui::RunApplication();
-        StopTimelinePreview();
-        return result;
-      }
       if (command == "--timeline-export" && (argc == 4 || (argc == 5 && std::string_view(argv[4]) == "--software-only"))) {
-        ExportTimelinePreview(argv[2], argv[3], argc == 5);
+        ExportTimelineFile(argv[2], argv[3], argc == 5);
         return 0;
       }
       if (command == "--timeline-verify" && argc == 5) {
@@ -56,12 +35,6 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
       if (command == "--timeline-verify-transition" && argc == 5) {
         VerifyTimelineTransition(argv[2], argv[3], argv[4]);
         return 0;
-      }
-      if (command == "--timeline-assets" && argc == 4) {
-        ConfigureTimelineStrip(argv[2], argv[3]);
-        const auto result = huxerui::RunApplication();
-        StopTimelinePreview();
-        return result;
       }
       if (command == "--timeline-verify-assets" && argc == 5) {
         VerifyTimelineStrip(argv[2], argv[3], argv[4]);
@@ -109,28 +82,14 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
         VerifyTimelinePagOverlayBatch(argv[2], argv[3], argv[4]);
         return 0;
       }
-      if (command == "--timeline-mask-preview" && (argc == 3 || argc == 4)) {
-        ConfigureTimelinePreview(argv[2], argc == 4 ? argv[3] : "0",
-                                                CreateMockMaskProvider(), true);
-        const int result = huxerui::RunApplication();
-        StopTimelinePreview();
-        return result;
-      }
       if (command == "--timeline-verify-ncnn-mask" &&
           (argc == 5 || (argc == 6 && std::string_view(argv[5]) == "--mixed-models"))) {
         VerifyTimelineNcnnMasks(argv[2], argv[3], argv[4], argc == 6);
         return 0;
       }
       if (command == "--timeline-ncnn-export" && argc == 5) {
-        ExportTimelinePreview(argv[2], argv[4], true, CreateTimelineNcnnProvider(argv[3]));
+        ExportTimelineFile(argv[2], argv[4], true, CreateTimelineNcnnProvider(argv[3]));
         return 0;
-      }
-      if (command == "--timeline-ncnn-preview" && (argc == 4 || argc == 5)) {
-        ConfigureTimelinePreview(argv[2], argc == 5 ? argv[4] : "0",
-                                                CreateTimelineNcnnProvider(argv[3]), true);
-        const auto result = huxerui::RunApplication();
-        StopTimelinePreview();
-        return result;
       }
       if (command == "--timeline-verify-ncnn" && argc == 5) {
         VerifyTimelineNcnn(argv[2], argv[3], argv[4]);
@@ -140,25 +99,20 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
         VerifyTimelineNcnnBody(argv[2], argv[3], argv[4], argv[5]);
         return 0;
       }
-      std::cerr << "Usage: --timeline-ncnn-preview PROJECT MODEL_DIRECTORY [SECONDS]\n"
-                   "       --timeline-ncnn-export PROJECT MODEL_DIRECTORY OUTPUT\n"
+      std::cerr << "Usage: --timeline-ncnn-export PROJECT MODEL_DIRECTORY OUTPUT\n"
                    "       --timeline-verify-ncnn SOURCE MODEL_DIRECTORY DIRECTORY\n"
                    "       --timeline-verify-ncnn-mask SOURCE MODEL_DIRECTORY DIRECTORY [--mixed-models]\n"
                    "       --timeline-verify-ncnn-body SOURCE MODEL_DIRECTORY LANDMARKS DIRECTORY\n";
-      std::cerr << "Usage: --timeline-preview PROJECT [SECONDS]\n"
-                   "       --timeline-export PROJECT OUTPUT [--software-only]\n"
+      std::cerr << "Usage: --timeline-export PROJECT OUTPUT [--software-only]\n"
                    "       --timeline-verify FIRST SECOND DIRECTORY\n"
                    "       --timeline-verify-codecs TEMPLATE_PROJECT DIRECTORY\n"
                    "       --timeline-verify-transition FIRST SECOND DIRECTORY\n"
-                   "       --timeline-assets PROJECT REPLACEMENT\n"
                    "       --timeline-verify-assets FIRST REPLACEMENT DIRECTORY\n"
                    "       --timeline-verify-tracking DIRECTORY\n"
                    "       --timeline-verify-masks DIRECTORY\n"
                    "       --timeline-verify-depth PROJECT DIRECTORY\n"
                    "       --timeline-verify-template-masks PROJECT DIRECTORY\n"
-                   "       --timeline-verify-animated-template-masks PROJECT DIRECTORY\n"
-                   "       --timeline-mask-preview PROJECT [SECONDS]\n"
-                   "       --timeline-tracking-preview PROJECT [SECONDS]\n";
+                   "       --timeline-verify-animated-template-masks PROJECT DIRECTORY\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << '\n';
     }
@@ -167,22 +121,15 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
   if (argc > 1 && std::string_view(argv[1]).starts_with("--media-")) {
     try {
       const std::string_view command(argv[1]);
-      if (command == "--media-preview" && (argc == 3 || argc == 4)) {
-        ConfigureFilePreview(argv[2], argc == 4 ? argv[3] : "0");
-        const int result = huxerui::RunApplication();
-        StopFilePreview();
-        return result;
-      }
       if (command == "--media-export" && (argc == 4 || (argc == 5 && std::string_view(argv[4]) == "--software-only"))) {
-        ExportFilePreview(argv[2], argv[3], argc == 5);
+        ExportMediaFile(argv[2], argv[3], argc == 5);
         return 0;
       }
       if (command == "--media-verify" && argc == 4) {
-        VerifyFilePreview(argv[2], argv[3]);
+        VerifyFileMedia(argv[2], argv[3]);
         return 0;
       }
-      std::cerr << "Usage: --media-preview INPUT [SECONDS]\n"
-                   "       --media-export INPUT OUTPUT [--software-only]\n"
+      std::cerr << "Usage: --media-export INPUT OUTPUT [--software-only]\n"
                    "       --media-verify INPUT OUTPUT\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << '\n';
@@ -192,4 +139,18 @@ std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
   return std::nullopt;
 }
 
+} // namespace
 } // namespace avkit_preview
+
+int main(int argc, const char** argv) {
+  if (argc > 1) {
+    const std::string_view command(argv[1]);
+    if (command == "--verify" && argc == 2) return avkit_preview::VerifyMetalPreview();
+    if ((command == "--verify-camera" || command == "--verify-live-capture") && argc == 3)
+      return avkit_preview::VerifyCapture(argv[2], command == "--verify-live-capture");
+    if (const auto result = avkit_preview::RunMediaCommand(argc, argv)) return *result;
+  }
+  std::cerr << "Usage: avkit_verify --verify | --verify-camera DIRECTORY | --verify-live-capture DIRECTORY\n"
+               "       See the AVKit architecture guide for media, timeline, and export commands.\n";
+  return 1;
+}

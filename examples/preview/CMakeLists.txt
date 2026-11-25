@@ -81,10 +81,6 @@ else ()
     target_sources(example_av_kit PRIVATE src/capture_unavailable.cpp)
 endif ()
 
-if (ANDROID OR IOS OR WIN32)
-    target_sources(example_av_kit PRIVATE src/capture_commands_unavailable.cpp)
-endif ()
-
 if (IOS)
     # Include the existing resource-free static targets in the HuxerUI iOS app archive.
     get_target_property(avkit_core_target AVKit::Core ALIASED_TARGET)
@@ -92,10 +88,6 @@ if (IOS)
     set_property(TARGET ${avkit_core_target} ${avkit_flecs_target} PROPERTY HUXERUI_LIBRARY TRUE)
     huxerui_use_library(example_av_kit TARGET AVKit::Core)
     huxerui_use_library(example_av_kit TARGET flecs::flecs_static)
-endif ()
-
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    target_sources(example_av_kit PRIVATE src/workbench_commands_unavailable.cpp)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
@@ -113,47 +105,15 @@ endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     target_sources(example_av_kit PRIVATE
-            src/capture.cpp
-            src/sticker_scene.cpp
-            src/timeline_strip_view.cpp
-            src/verification/tracking_fixture.cpp
-            platform/macos/src/file_preview.mm
-            platform/macos/verification/camera_recording_verify.cpp
-            platform/macos/src/media_commands.cpp
-            platform/macos/src/metal_preview.mm
-            platform/macos/src/movie_renderer.mm
-            platform/macos/src/timeline_preview.mm
-            platform/macos/src/timeline_strip_macos.mm
             platform/macos/src/workbench_input.mm
             platform/macos/src/workbench_platform.mm
-            platform/macos/verification/timeline_depth_verify.mm
-            platform/macos/verification/timeline_mask_verify.mm
-            platform/macos/verification/timeline_ncnn_verify.mm
-            platform/macos/verification/timeline_pag_verify.mm
-            platform/macos/verification/timeline_strip_verify.mm
-            platform/macos/verification/timeline_template_mask_verify.mm
-            platform/macos/verification/timeline_tracking_verify.mm
-            platform/macos/verification/timeline_verify.mm
     )
     set_target_properties(example_av_kit PROPERTIES
             OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON OBJCXX_EXTENSIONS OFF
     )
-    target_include_directories(example_av_kit PRIVATE
-            platform/macos/src
-            platform/macos/verification
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/macos/src"
-    )
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    target_link_libraries(example_av_kit PRIVATE "-framework ImageIO")
-    if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
-        set(avkit_pag_framework "${CMAKE_MATCH_1}")
-        get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
-        set_property(TARGET example_av_kit APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
-        add_custom_command(TARGET example_av_kit POST_BUILD
-                COMMAND /usr/bin/ditto "${avkit_pag_framework}"
-                    "$<TARGET_BUNDLE_DIR:example_av_kit>/Contents/Frameworks/${avkit_pag_framework_name}"
-                VERBATIM)
-    endif ()
+    avkit_embed_macos_pag(example_av_kit)
+    add_subdirectory(verification EXCLUDE_FROM_ALL)
 elseif (ANDROID)
     target_sources(example_av_kit PRIVATE platform/android/src/workbench_platform.cpp)
     target_link_libraries(example_av_kit PRIVATE log)

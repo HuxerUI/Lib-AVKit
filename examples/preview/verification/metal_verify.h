@@ -20,7 +20,6 @@ bool HasPreviewStickerCue(id<MTLTexture> texture, huxerui::media::MediaTimestamp
 huxerui::Bytes ReadPreviewPixels(id<MTLTexture> texture);
 void PublishPreviewSurface(huxerui::macos::MetalTexture& mailbox, const huxerui::avkit::render::ColorSurface& surface);
 #endif
-std::shared_ptr<huxerui::ExternalTexture> CreateMetalPreview();
 int VerifyMetalPreview();
 
 } // namespace avkit_preview

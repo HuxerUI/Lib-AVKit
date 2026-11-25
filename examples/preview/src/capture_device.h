@@ -2,11 +2,6 @@
 
 #include <huxerui/camera.h>
 
-namespace huxerui::avkit {
-struct CanvasOverlay;
-struct PixelSize;
-}
-
 namespace avkit_preview {
 
 struct CaptureDevice {
@@ -25,7 +20,6 @@ struct CaptureDevice {
 
 huxerui::Task<void> RequestCapturePermission(huxerui::ApplicationHandle application, huxerui::Permission permission);
 void WriteCaptureFile(const huxerui::File& file, std::span<const std::byte> bytes);
-huxerui::avkit::CanvasOverlay CaptureSticker(huxerui::avkit::PixelSize canvas);
 CaptureDevice UseCaptureDevice(huxerui::State<bool> robot, huxerui::State<bool> sticker);
 
 } // namespace avkit_preview

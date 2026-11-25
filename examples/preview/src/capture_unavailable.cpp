@@ -6,8 +6,6 @@ namespace avkit_preview {
 using namespace huxerui;
 
 void InstallPreviewCapture(ApplicationContext&) {}
-std::optional<View> RequestedCapturePreview() { return std::nullopt; }
-std::optional<int> RunCaptureCommand(int, const char**) { return std::nullopt; }
 
 [[huxerui::composable]]
 View WorkbenchCapture(File, State<bool>, std::function<void(File)>, std::function<void()> import_movie) {

@@ -1,4 +1,4 @@
-#include "metal_preview.h"
+#include "metal_verify.h"
 #include <huxerui/avkit/video_texture.h>
 #include "preview_sticker.h"
 #include "bgfx_metal_texture.h"
@@ -282,18 +282,6 @@ huxerui::Bytes ReadPreviewPixels(id<MTLTexture> texture) {
 }
 
 void PublishPreviewSurface(MetalTexture& mailbox, const ColorSurface& surface) { Publish(mailbox, surface); }
-
-std::shared_ptr<huxerui::ExternalTexture> CreateMetalPreview() {
-  @autoreleasepool {
-    Fixture fixture;
-    auto& backend = *fixture.backend;
-    const auto surface = Complete(backend, Submit(backend, fixture.Request()));
-    auto mailbox = std::make_shared<MetalTexture>(kPreviewSize);
-    Publish(*mailbox, surface);
-    mailbox->Finish();
-    return mailbox;
-  }
-}
 
 int VerifyMetalPreview() {
   @autoreleasepool {

@@ -1,13 +1,13 @@
 #include "timeline_mask_verify.h"
 
 #include "bgfx_metal_texture.h"
-#include "metal_preview.h"
+#include "metal_verify.h"
 #include "movie_renderer.h"
-#include "timeline_preview.h"
-#include "verification/tracking_fixture.h"
+#include "timeline_verify.h"
+#include "tracking_fixture.h"
 
 #include "timeline_tracking_verify.h"
-#include "verification/codec_verification.h"
+#include "codec_verification.h"
 
 #include <future>
 #include <map>
