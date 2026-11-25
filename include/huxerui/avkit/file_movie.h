@@ -3,8 +3,8 @@
 /// @file
 /// @brief File import, per-track decode cursors, and staged MP4 output.
 ///
-/// Link AVKit::Media. The file profile uses one 8-bit SDR H.264 or HEVC video track and an optional
-/// AAC-LC audio track in MP4 or MOV. Movie ranges and decoded PTS use the file's presentation clock.
+/// Link AVKit::Media. The file reader selects one supported SDR video track and an optional mono or stereo
+/// audio track. Movie ranges and decoded PTS use the file's presentation clock.
 
 #include <cstdint>
 #include <functional>

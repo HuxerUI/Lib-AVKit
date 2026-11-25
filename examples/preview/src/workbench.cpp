@@ -571,7 +571,11 @@ Task<std::optional<File>> PickWorkbenchFile(
   co_return co_await ImportWorkbenchReference(context.data, *picked, std::move(directory), std::move(fallback));
 }
 
-FilePickerFilter WorkbenchMovieFilter() { return {"视频", {"mp4", "mov", "m4v"}, {"video/mp4", "video/quicktime", "video/x-m4v"}}; }
+FilePickerFilter WorkbenchMovieFilter() {
+  return {"视频", {"mp4", "mov", "m4v", "mkv", "webm", "ts", "avi"},
+          {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-matroska", "video/webm", "video/mp2t",
+           "video/x-msvideo"}};
+}
 FilePickerFilter WorkbenchAudioFilter() {
   return {"音乐", {"mp3", "m4a", "wav"}, {"audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav"}};
 }

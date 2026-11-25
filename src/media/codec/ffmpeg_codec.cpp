@@ -16,6 +16,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
@@ -124,6 +125,54 @@ bool MatchesAacLc(std::span<const std::byte> data, const AudioFormat& pcm) {
   return bits == expected;
 }
 
+AVCodecID AudioCodec(CodecId codec) {
+  using enum CodecId;
+  switch (codec) {
+    case Aac: return AV_CODEC_ID_AAC;
+    case Alac: return AV_CODEC_ID_ALAC;
+    case Opus: return AV_CODEC_ID_OPUS;
+    case Vorbis: return AV_CODEC_ID_VORBIS;
+    case Mp3: return AV_CODEC_ID_MP3;
+    case PcmU8: return AV_CODEC_ID_PCM_U8;
+    case PcmS16Le: return AV_CODEC_ID_PCM_S16LE;
+    case PcmS24Le: return AV_CODEC_ID_PCM_S24LE;
+    case PcmS32Le: return AV_CODEC_ID_PCM_S32LE;
+    case PcmF32Le: return AV_CODEC_ID_PCM_F32LE;
+    case PcmS16Be: return AV_CODEC_ID_PCM_S16BE;
+    case PcmS24Be: return AV_CODEC_ID_PCM_S24BE;
+    case PcmS32Be: return AV_CODEC_ID_PCM_S32BE;
+    case PcmF32Be: return AV_CODEC_ID_PCM_F32BE;
+    default: return AV_CODEC_ID_NONE;
+  }
+}
+
+const AVCodec* VideoCodec(CodecId codec) {
+  using enum CodecId;
+  switch (codec) {
+    case H264: return avcodec_find_decoder(AV_CODEC_ID_H264);
+    case Hevc: return avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    case Vp8: return avcodec_find_decoder(AV_CODEC_ID_VP8);
+    case Vp9: return avcodec_find_decoder(AV_CODEC_ID_VP9);
+    case ProRes: return avcodec_find_decoder(AV_CODEC_ID_PRORES);
+    case Av1:
+      if (const auto* dav1d = avcodec_find_decoder_by_name("libdav1d")) return dav1d;
+      return avcodec_find_decoder_by_name("libaom-av1");
+    default: return nullptr;
+  }
+}
+
+void SetAudioExtra(AVCodecContext& context, CodecId codec, const Bytes& bytes) {
+  if (codec == CodecId::Alac && bytes.size() == 24) {
+    Bytes atom{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{36}, std::byte{'a'}, std::byte{'l'},
+               std::byte{'a'}, std::byte{'c'}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}};
+    atom.insert(atom.end(), bytes.begin(), bytes.end());
+    SetExtra(context, atom);
+  } else if (!bytes.empty() && (codec == CodecId::Aac || codec == CodecId::Alac ||
+                               codec == CodecId::Opus || codec == CodecId::Vorbis)) {
+    SetExtra(context, bytes);
+  }
+}
+
 CodecNegotiation Negotiation(const VideoDecoderConfig& config) {
   return {CodecImplementation::Software, VideoFrameContract{config.output_storage, config.output}, true};
 }
@@ -144,11 +193,18 @@ Resampler MakeResampler(const AVChannelLayout& out, AVSampleFormat output, const
 }
 
 VideoFrame ReadPicture(const AVFrame& decoded, const VideoDecoderConfig& config) {
-  if ((decoded.format != AV_PIX_FMT_YUV420P && decoded.format != AV_PIX_FMT_YUVJ420P) ||
+  const auto layout = decoded.format;
+  const bool ten_bit = layout == AV_PIX_FMT_YUV420P10LE || layout == AV_PIX_FMT_YUV422P10LE;
+  const bool chroma_422 = layout == AV_PIX_FMT_YUV422P || layout == AV_PIX_FMT_YUV422P10LE;
+  if ((layout != AV_PIX_FMT_YUV420P && layout != AV_PIX_FMT_YUVJ420P && !ten_bit && !chroma_422) ||
       decoded.width <= 0 || decoded.height <= 0 || static_cast<unsigned>(decoded.width) > config.width ||
       static_cast<unsigned>(decoded.height) > config.height) {
-    Fail(CodecErrorCode::Unsupported, "Software H.264 output must be 8-bit 4:2:0 within the configured bounds");
+    Fail(CodecErrorCode::Unsupported, "Decoded video must be planar 4:2:0 or 4:2:2 within the configured bounds");
   }
+  if (ten_bit && (decoded.color_trc == AVCOL_TRC_SMPTE2084 || decoded.color_trc == AVCOL_TRC_ARIB_STD_B67 ||
+                  decoded.color_primaries == AVCOL_PRI_BT2020 || decoded.colorspace == AVCOL_SPC_BT2020_NCL ||
+                  decoded.colorspace == AVCOL_SPC_BT2020_CL))
+    Fail(CodecErrorCode::Unsupported, "HDR and BT.2020 video require a color conversion that is unavailable");
   const auto width = static_cast<std::uint32_t>(decoded.width);
   const auto height = static_cast<std::uint32_t>(decoded.height);
   VideoFormat format{width, height, {0, 0, width, height}, VideoPixelFormat::I420};
@@ -175,9 +231,22 @@ VideoFrame ReadPicture(const AVFrame& decoded, const VideoDecoderConfig& config)
     const auto columns = i ? (width + 1) / 2 : width;
     const auto rows = i ? (height + 1) / 2 : height;
     auto bytes = std::make_shared<Bytes>(std::size_t(columns) * rows);
-    for (std::uint32_t y = 0; y < rows; ++y)
-      std::memcpy(bytes->data() + std::size_t(y) * columns,
-                  decoded.data[i] + std::ptrdiff_t(y) * decoded.linesize[i], columns);
+    const bool downsample = i && chroma_422;
+    for (std::uint32_t y = 0; y < rows; ++y) {
+      auto* target = bytes->data() + std::size_t(y) * columns;
+      const auto source_row = downsample ? y * 2 : y;
+      const auto* source = decoded.data[i] + std::ptrdiff_t(source_row) * decoded.linesize[i];
+      if (!ten_bit && !downsample) {
+        std::memcpy(target, source, columns);
+        continue;
+      }
+      const auto* next = downsample && source_row + 1 < height ? source + decoded.linesize[i] : source;
+      for (std::uint32_t x = 0; x < columns; ++x) {
+        const auto sample = ten_bit ? (AV_RL16(source + x * 2) + AV_RL16(next + x * 2) + 4U) / 8U :
+                                      (source[x] + next[x] + 1U) / 2U;
+        target[x] = std::byte(std::min(sample, 255U));
+      }
+    }
     planes.push_back({RetainBytes(std::move(bytes)), columns, 1});
   }
   const auto& timing = GetTiming(decoded.opaque_ref);
@@ -188,7 +257,7 @@ AudioFrame ReadPcm(const AVFrame& decoded, const AudioDecoderConfig& config) {
   const auto& format = config.output;
   if (decoded.sample_rate != static_cast<int>(format.sample_rate) ||
       decoded.ch_layout.nb_channels != static_cast<int>(format.ChannelCount()) || decoded.nb_samples <= 0) {
-    Fail(CodecErrorCode::InvalidData, "AAC decoded PCM differs from the negotiated format");
+    Fail(CodecErrorCode::InvalidData, "Decoded PCM differs from the negotiated format");
   }
   auto resampler = MakeResampler(decoded.ch_layout, AV_SAMPLE_FMT_S16, decoded.ch_layout,
                                  static_cast<AVSampleFormat>(decoded.format), decoded.sample_rate);
@@ -197,8 +266,8 @@ AudioFrame ReadPcm(const AVFrame& decoded, const AudioDecoderConfig& config) {
   auto* destination = reinterpret_cast<std::uint8_t*>(bytes->data());
   const auto converted = swr_convert(resampler.get(), &destination, decoded.nb_samples,
                                      const_cast<const std::uint8_t**>(decoded.extended_data), decoded.nb_samples);
-  Check(converted, "Convert AAC PCM");
-  if (converted != decoded.nb_samples) Fail(CodecErrorCode::PlatformFailure, "AAC PCM conversion changed the sample count");
+  Check(converted, "Convert decoded PCM");
+  if (converted != decoded.nb_samples) Fail(CodecErrorCode::PlatformFailure, "PCM conversion changed the sample count");
   return {format, GetTiming(decoded.opaque_ref).pts, samples, {RetainBytes(std::move(bytes))}};
 }
 
@@ -492,16 +561,17 @@ public:
 
   CodecResult<std::unique_ptr<VideoDecoderSession>> Open(const VideoDecoderConfig& config) const override {
     return Guard<std::unique_ptr<VideoDecoderSession>>([&]() -> std::unique_ptr<VideoDecoderSession> {
-      if ((config.codec != CodecId::H264 && config.codec != CodecId::Hevc) || config.output_storage != VideoStorage::Cpu ||
+      if (config.output_storage != VideoStorage::Cpu ||
           config.output != VideoPixelFormat::I420 || !config.width || !config.height ||
           config.width > 8192 || config.height > 8192)
-        Fail(CodecErrorCode::Unsupported, "FFmpeg file video decode accepts H.264 or HEVC to CPU I420");
+        Fail(CodecErrorCode::Unsupported, "FFmpeg file video decode requires bounded CPU I420 output");
       using Session = Decoder<VideoDecoderSession, VideoDecoderConfig, VideoFrame, VideoFormat>;
-      const auto* codec = avcodec_find_decoder(config.codec == CodecId::Hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
+      const auto* codec = VideoCodec(config.codec);
       auto context = Allocate(codec);
       context->pkt_timebase = {1, Session::kClock};
       context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
-      SetExtra(*context, config.initialization_data);
+      if (!config.initialization_data.empty() && config.codec != CodecId::Vp9)
+        SetExtra(*context, config.initialization_data);
       Check(avcodec_open2(context.get(), codec, nullptr), "Open FFmpeg video decoder", CodecErrorCode::Unsupported);
       return std::make_unique<Session>(std::move(context), config);
     });
@@ -509,15 +579,19 @@ public:
 
   CodecResult<std::unique_ptr<AudioDecoderSession>> Open(const AudioDecoderConfig& config) const override {
     return Guard<std::unique_ptr<AudioDecoderSession>>([&]() -> std::unique_ptr<AudioDecoderSession> {
-      if (config.codec != CodecId::Aac || !MatchesAacLc(config.initialization_data, config.output))
-        Fail(CodecErrorCode::Unsupported, "FFmpeg file audio decode accepts AAC-LC to interleaved S16 mono or stereo");
+      if (!SupportedPcm(config.output) || (config.codec == CodecId::Aac &&
+          !MatchesAacLc(config.initialization_data, config.output)))
+        Fail(CodecErrorCode::Unsupported, "FFmpeg file audio decode requires interleaved S16 mono or stereo");
       using Session = Decoder<AudioDecoderSession, AudioDecoderConfig, AudioFrame, AudioFormat>;
-      const auto* codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+      const auto* codec = avcodec_find_decoder(AudioCodec(config.codec));
       auto context = Allocate(codec);
       context->pkt_timebase = {1, Session::kClock};
+      context->sample_rate = static_cast<int>(config.output.sample_rate);
+      av_channel_layout_default(&context->ch_layout, static_cast<int>(config.output.ChannelCount()));
       context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
-      SetExtra(*context, config.initialization_data);
-      Check(avcodec_open2(context.get(), codec, nullptr), "Open FFmpeg AAC decoder", CodecErrorCode::Unsupported);
+      if (config.codec == CodecId::Opus) context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+      SetAudioExtra(*context, config.codec, config.initialization_data);
+      Check(avcodec_open2(context.get(), codec, nullptr), "Open FFmpeg audio decoder", CodecErrorCode::Unsupported);
       return std::make_unique<Session>(std::move(context), config);
     });
   }

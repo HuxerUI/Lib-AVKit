@@ -29,7 +29,7 @@ PixelSize PreviewSize(PixelSize canvas, float display_scale) {
   const auto long_edge = std::max(canvas.width, canvas.height);
   const auto preferred_short = display_scale >= 2.0F ? 720.0 : 540.0;
   const auto scale = std::min(preferred_short / short_edge, 1280.0 / long_edge);
-  if (scale <= 1.0) return canvas;
+  if (scale >= 1.0) return canvas;
   const auto pixels = [scale](std::uint32_t edge) {
     return static_cast<std::uint32_t>(std::max(1L, std::lround(edge * scale / 2.0)) * 2);
   };

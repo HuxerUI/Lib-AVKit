@@ -16,7 +16,7 @@ Lib-AVKit is a C++20 audio and video post-processing library for HuxerUI. It pro
 | `AVKit::Capture` | Camera frame processing, synchronized microphone input, and composited recording on macOS and Android. |
 | `HuxerUI::AVKit` | HuxerUI application hook and the combined AVKit library targets. |
 
-Core and the media orchestration use public HuxerUI and Lib-Media types. The file profile accepts MP4 or MOV with 8-bit SDR H.264 or HEVC video and optional AAC-LC audio. The workbench integrates file editing on macOS and Android. The workbench uses AVKit recording on macOS and Android and Camera-managed recording on iOS and Windows. [Platform plan](docs/architecture.md#external-video-frames)
+Core and the media orchestration use public HuxerUI and Lib-Media types. The file profile accepts SDR video in MP4, MOV, Matroska, WebM, MPEG-TS, and AVI. Supported codecs depend on the container and the available decoders. The workbench integrates file editing on macOS and Android. It uses AVKit recording on macOS and Android and Camera-managed recording on iOS and Windows. [File profile](docs/architecture.md#macos-file-media-milestone) [Platform plan](docs/architecture.md#external-video-frames)
 
 ## Repository layout
 
@@ -62,9 +62,9 @@ verify="$PWD/build/preview/verification/avkit_verify.app/Contents/MacOS/avkit_ve
 "$verify" --timeline-verify-tracking "$PWD/build/tracking-check"
 ```
 
-The Android workbench imports MP4 or MOV files in the file profile, plays and seeks the timeline, and exports BT.709 H.264/AAC MP4 through the system file picker. Lib-Media handles platform decoding and passes bgfx GLES composites to the MediaCodec AVC encoder surface. On a recoverable video encoder failure, export restarts from the beginning with FFmpeg and publishes the finalized MP4. Android export uses FFmpeg AAC-LC so the MP4 edit list carries exact priming and padding.
+The Android workbench imports files in the file profile, plays and seeks the timeline, and exports BT.709 H.264/AAC MP4 through the system file picker. Lib-Media handles platform decoding and passes bgfx GLES composites to the MediaCodec AVC encoder surface. On a recoverable video encoder failure, export restarts from the beginning with FFmpeg and publishes the finalized MP4. Android export uses FFmpeg AAC-LC so the MP4 edit list carries exact priming and padding.
 
-Build static, position-independent FFmpeg for each Android ABI you run, with the H.264, HEVC, and AAC decoders and the AAC and `libx264` encoders enabled. Build static, position-independent x264 for the same ABI and API level and make its pkg-config file available when configuring FFmpeg. The `libx264` encoder requires FFmpeg's GPL build option. Put each install prefix under one directory with its Android ABI name. For example, `build/android-ffmpeg/arm64-v8a` contains `include` and `lib`, with `libavcodec.a`, `libavutil.a`, `libswresample.a`, `libx264.a`, and their pkg-config files under `lib`. [FFmpeg x264 configuration](https://ffmpeg.org/general.html#x264)
+Build static, position-independent FFmpeg for each Android ABI you run. Enable the file profile decoders and the AAC and `libx264` encoders. Build static, position-independent x264 for the same ABI and API level and make its pkg-config file available when configuring FFmpeg. The `libx264` encoder requires FFmpeg's GPL build option. Put each install prefix under one directory with its Android ABI name. For example, `build/android-ffmpeg/arm64-v8a` contains `include` and `lib`, with `libavcodec.a`, `libavutil.a`, `libswresample.a`, `libx264.a`, and their pkg-config files under `lib`. [File profile build](docs/architecture.md#macos-file-media-milestone) [FFmpeg x264 configuration](https://ffmpeg.org/general.html#x264)
 
 ```sh
 AVKIT_ANDROID_FFMPEG_ROOT="$PWD/build/android-ffmpeg" \

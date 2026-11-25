@@ -187,16 +187,23 @@ void Select(MediaDemuxer& demuxer, std::uint32_t id, MediaTimestamp time) {
   if (Before({}, time)) Require(demuxer.Seek(id, time));
 }
 
-std::optional<EncodedPacket> ReadPacket(MediaDemuxer& demuxer, std::optional<MediaTimestamp>* first_audible = nullptr) {
+struct AudioPacketTiming {
+  std::optional<MediaTimestamp> first_audible;
+  std::optional<MediaTimestamp> next_sample;
+  std::deque<std::pair<MediaTimestamp, MediaTimestamp>> discards;
+};
+
+std::optional<EncodedPacket> ReadPacket(MediaDemuxer& demuxer, AudioPacketTiming* audio = nullptr) {
   while (auto item = Require(demuxer.Read())) {
     if (auto* start = std::get_if<TrackDecodeStart>(&*item)) {
       if (start->sample_description_index != 1) throw std::runtime_error("Sample description changed during file playback");
-      if (first_audible) *first_audible = start->first_audible_pts;
+      if (audio) audio->first_audible = start->first_audible_pts;
       continue;
     }
     auto& packet = std::get<ContainerPacket>(*item);
     if (!packet.pts || packet.sample_description_index != 1)
       throw std::runtime_error("A file packet has no supported timing or sample description");
+    if (audio && packet.discard_padding) audio->discards.emplace_back(*packet.pts, *packet.discard_padding);
     return EncodedPacket{std::move(packet.data), *packet.pts, packet.dts, packet.duration, packet.sync_sample.value_or(false)};
   }
   return std::nullopt;
@@ -251,42 +258,94 @@ ContainerPacket ToContainer(const EncodedPacket& packet, std::uint32_t track) {
   return result;
 }
 
+bool IsPcm(CodecId codec) {
+  using enum CodecId;
+  switch (codec) {
+    case PcmU8: case PcmS16Le: case PcmS24Le: case PcmS32Le: case PcmF32Le:
+    case PcmS16Be: case PcmS24Be: case PcmS32Be: case PcmF32Be:
+      return true;
+    default: return false;
+  }
+}
+
+bool MovieVideo(const MediaSampleDescription& description) {
+  using enum CodecId;
+  switch (description.codec) {
+    case H264: case Hevc: case Vp8: case Vp9: case Av1: return true;
+    case ProRes:
+      return description.sample_entry == "apco" || description.sample_entry == "apcs" ||
+             description.sample_entry == "apcn" || description.sample_entry == "apch";
+    default: return false;
+  }
+}
+
+bool MovieAudio(const MediaSampleDescription& description) {
+  if ((description.sample_rate != 44100 && description.sample_rate != 48000) ||
+      (description.channel_count != 1 && description.channel_count != 2)) return false;
+  using enum CodecId;
+  switch (description.codec) {
+    case Aac:
+      return description.initialization_data.size() == 2 &&
+             (std::to_integer<unsigned>(description.initialization_data.front()) >> 3) == 2;
+    case Alac: case Opus: case Vorbis: case Mp3: return true;
+    default: return IsPcm(description.codec);
+  }
+}
+
+bool HasSegmentClock(const MediaDemuxer& demuxer) {
+  return demuxer.Format() == ContainerFormat::Matroska || demuxer.Format() == ContainerFormat::WebM;
+}
+
+std::optional<MediaPresentationRange> MovieTrackRange(const MediaDemuxer& demuxer, const MediaTrack& track) {
+  if (const auto range = demuxer.PresentationRange(track.id)) return range;
+  // Ordinary Matroska tracks share the segment clock and may only declare a segment duration.
+  if (HasSegmentClock(demuxer)) {
+    if (const auto duration = demuxer.Duration()) return MediaPresentationRange{{}, *duration};
+  }
+  return std::nullopt;
+}
+
+bool SizeVideoQueues(VideoDecoderConfig& config) {
+  // Match the decoder's coded-frame charge, including the minimum output reservations for reorder.
+  constexpr std::uint64_t minimum_output = 34;
+  const std::uint64_t luma = std::uint64_t(config.width) * config.height;
+  const std::uint64_t chroma = std::uint64_t((config.width + 1) / 2) * ((config.height + 1) / 2);
+  const auto bytes = config.output == VideoPixelFormat::Opaque ? 4 * luma : luma + 2 * chroma;
+  if (bytes > std::numeric_limits<std::size_t>::max() / minimum_output) return false;
+  config.limits.input_bytes = std::max(config.limits.input_bytes,
+      static_cast<std::size_t>(std::min<std::uint64_t>(bytes, 64 * 1024 * 1024)));
+  config.limits.output_bytes = std::max(config.limits.output_bytes, static_cast<std::size_t>(bytes * minimum_output));
+  return true;
+}
+
 MovieAsset InspectMovie(const File& file, MediaDemuxer& demuxer) {
-  if (demuxer.Format() != ContainerFormat::Mp4 && demuxer.Format() != ContainerFormat::Mov)
-    throw std::runtime_error("The video container must be MP4 or MOV");
+  using enum ContainerFormat;
+  switch (demuxer.Format()) {
+    case Mp4: case Mov: case Matroska: case WebM: case MpegTs: case Avi: break;
+    default: throw std::runtime_error("The video container must be MP4, MOV, MKV, WebM, MPEG-TS or AVI");
+  }
   std::optional<MediaTrack> video, audio;
   bool has_audio = false;
   for (const auto& track : demuxer.Tracks()) {
     has_audio |= track.kind == TrackKind::Audio;
     if (track.descriptions.size() != 1) continue;
     const auto& description = track.descriptions.front();
-    if (!video && track.kind == TrackKind::Video &&
-        (description.codec == CodecId::H264 || description.codec == CodecId::Hevc)) video = track;
-    if (!audio && track.kind == TrackKind::Audio && description.codec == CodecId::Aac &&
-        (description.sample_rate == 44100 || description.sample_rate == 48000) &&
-        (description.channel_count == 1 || description.channel_count == 2) &&
-        description.initialization_data.size() == 2 &&
-        (std::to_integer<unsigned>(description.initialization_data[0]) >> 3) == 2) audio = track;
+    if (!video && track.kind == TrackKind::Video && MovieVideo(description)) video = track;
+    if (!audio && track.kind == TrackKind::Audio && MovieAudio(description)) audio = track;
   }
-  if (!video) throw std::runtime_error("The file needs a video track with one H.264 or HEVC configuration");
-  const auto vrange = demuxer.PresentationRange(video->id);
+  if (!video) throw std::runtime_error("No supported H.264, HEVC, VP8, VP9, AV1 or ProRes 422 video track");
+  const auto vrange = MovieTrackRange(demuxer, *video);
   const auto& picture = video->descriptions.front();
   if (!vrange || !Before(vrange->start, vrange->end) || Before(vrange->start, {}) ||
-      !picture.coded_width || !picture.coded_height || *picture.coded_width > 8192 || *picture.coded_height > 8192)
+      !picture.coded_width.value_or(0) || !picture.coded_height.value_or(0) ||
+      *picture.coded_width > 8192 || *picture.coded_height > 8192)
     throw std::runtime_error("The video presentation range or frame size is unsupported");
-  if (picture.codec == CodecId::Hevc) {
-    const auto& hvcc = picture.initialization_data;
-    // hvcC stores chroma_format and both bit depths before the parameter-set arrays.
-    if (hvcc.size() < 23 || (std::to_integer<unsigned>(hvcc[16]) & 3U) != 1U ||
-        ((std::to_integer<unsigned>(hvcc[17]) | std::to_integer<unsigned>(hvcc[18])) & 7U))
-      throw std::runtime_error("HEVC import requires 8-bit 4:2:0 video");
-  }
   if (!has_audio) {
     const AudioFormat pcm{48000, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Mono};
     return {file, std::move(*video), {}, *vrange, {}, vrange->end, pcm};
   }
-  if (!audio) throw std::runtime_error("The audio track must be mono or stereo AAC-LC at 44.1 or 48 kHz");
-  const auto arange = demuxer.PresentationRange(audio->id);
+  if (!audio) throw std::runtime_error("No supported mono or stereo audio track at 44.1 or 48 kHz");
+  const auto arange = MovieTrackRange(demuxer, *audio);
   if (!arange || !Before(arange->start, arange->end) || Before(arange->start, {}))
     throw std::runtime_error("The audio presentation range is unsupported");
   const auto& sound = audio->descriptions.front();
@@ -354,39 +413,50 @@ struct MovieReader::Impl {
       config.width = (config.width + 15) & ~15u;
       config.height = (config.height + 15) & ~15u;
     }
-    config.output = kPlatformVideoLayout;
-    config.output_storage = VideoStorage::Platform;
+    const bool platform_texture = config.codec != CodecId::Av1 && config.codec != CodecId::ProRes;
+    config.output = platform_texture ? kPlatformVideoLayout : VideoPixelFormat::I420;
+    config.output_storage = platform_texture ? VideoStorage::Platform : VideoStorage::Cpu;
+    if (config.codec == CodecId::ProRes) config.prores_sample_entry = description.sample_entry;
     auto cpu = config;
     cpu.output_storage = VideoStorage::Cpu;
     cpu.output = VideoPixelFormat::I420;
+    const auto platform_fits = SizeVideoQueues(config);
+    if (!SizeVideoQueues(cpu)) throw std::runtime_error("Decoded video frames exceed the addressable queue size");
     video = std::make_unique<Pump<VideoDecoderSession>>(
-        OpenSelected<VideoDecoderSession>(providers, CodecOperation::VideoDecode, software, config, cpu, report),
+        OpenSelected<VideoDecoderSession>(providers, CodecOperation::VideoDecode, software || !platform_fits, config, cpu, report),
         CodecOperation::VideoDecode, [this] { return ReadPacket(*video_packets); });
   }
 
   void OpenAudio(MediaTimestamp at, bool software) {
     audio.reset();
     pending_audio.clear();
+    audio_timing = {};
+    segment_audio_end.reset();
     audio_end = !asset.HasAudio() || !Before(at, asset.audio_range.end);
     if (audio_end) {
       audio_packets.reset();
       return;
     }
     audio_packets.emplace(OpenDemuxer(asset.file));
-    if (asset.audio.descriptions.front().codec == CodecId::PcmS16Le) {
+    if (HasSegmentClock(*audio_packets) && !audio_packets->PresentationRange(asset.audio.id))
+      segment_audio_end = AtScale(asset.audio_range.end, asset.pcm.sample_rate);
+    const auto& description = asset.audio.descriptions.front();
+    if (description.codec == CodecId::PcmS16Le) {
       Select(*audio_packets, asset.audio.id, at);
       return;
     }
     const auto seek = AtScale(at, asset.pcm.sample_rate);
-    const MediaTimestamp preroll{std::max<std::int64_t>(0, seek.ticks - 4096), seek.timescale};
+    const auto preroll_samples = asset.audio.seek_preroll ? AtScale(*asset.audio.seek_preroll, seek.timescale).ticks : 4096;
+    const MediaTimestamp preroll{std::max<std::int64_t>(0, seek.ticks - preroll_samples), seek.timescale};
     Select(*audio_packets, asset.audio.id, preroll);
     AudioDecoderConfig config;
     config.output = asset.pcm;
-    config.initialization_data = asset.audio.descriptions.front().initialization_data;
-    audio_audible.reset();
+    config.codec = description.codec;
+    config.initialization_data = description.initialization_data;
     audio = std::make_unique<Pump<AudioDecoderSession>>(
-        OpenSelected<AudioDecoderSession>(providers, CodecOperation::AudioDecode, software, config, config, report),
-        CodecOperation::AudioDecode, [this] { return ReadPacket(*audio_packets, &audio_audible); });
+        OpenSelected<AudioDecoderSession>(providers, CodecOperation::AudioDecode, software || IsPcm(config.codec),
+                                         config, config, report),
+        CodecOperation::AudioDecode, [this] { return ReadPacket(*audio_packets, &audio_timing); });
   }
 
   void Seek(MediaTimestamp at) {
@@ -465,21 +535,64 @@ struct MovieReader::Impl {
     return replacement;
   }
 
+  void QueueAudio(const AudioFrame& frame) {
+    if (frame.format != asset.pcm || !frame.Validate()) throw std::runtime_error("Audio decoder changed the negotiated PCM");
+    const auto rate = asset.pcm.sample_rate;
+    auto media_pts = AtScale(frame.pts, rate);
+    // A Matroska segment may round packet timestamps to milliseconds while the decoded PCM is sample-exact.
+    if (audio_packets && HasSegmentClock(*audio_packets) && audio_timing.next_sample) {
+      const auto difference = Difference(media_pts, *audio_timing.next_sample).ticks;
+      if (difference >= -std::int64_t(rate / 1000) && difference <= rate / 1000) media_pts = *audio_timing.next_sample;
+    }
+    auto start = media_pts;
+    auto end = Add(media_pts, frame.Duration());
+    audio_timing.next_sample = end;
+    auto& discards = audio_timing.discards;
+    while (!discards.empty() && Before(discards.front().first, frame.pts)) discards.pop_front();
+    if (!discards.empty() && discards.front().first == frame.pts) {
+      const auto trim = AtScale(discards.front().second, rate).ticks;
+      discards.pop_front();
+      if (trim < -std::int64_t(frame.sample_count) || trim > frame.sample_count)
+        throw std::runtime_error("Packet trim exceeds its audio duration");
+      start.ticks -= std::min<std::int64_t>(0, trim);
+      end.ticks -= std::max<std::int64_t>(0, trim);
+    }
+    if (audio_timing.first_audible && Before(start, *audio_timing.first_audible)) start = *audio_timing.first_audible;
+    if (!Before(start, end)) return;
+    std::vector<MediaPresentationSlice> slices;
+    Require(MapToPresentation(asset.audio.edits, start, end, slices));
+    const auto range_start = AtScale(asset.audio_range.start, rate).ticks;
+    const auto range_end = AtScale(asset.audio_range.end, rate).ticks;
+    for (const auto& slice : slices) {
+      auto pts = AtScale(slice.presentation.start, rate);
+      const auto stop = std::min(AtScale(slice.presentation.end, rate).ticks, range_end);
+      const auto begin = std::max(pts.ticks, range_start);
+      if (stop <= begin) continue;
+      const auto offset = AtScale(slice.media_start, rate).ticks - media_pts.ticks + (begin - pts.ticks);
+      if (offset < 0 || offset > frame.sample_count || stop - begin > frame.sample_count - offset)
+        throw std::runtime_error("Invalid PCM edit interval");
+      pts.ticks = begin;
+      pending_audio.push_back(SliceAudio(frame, offset, stop - begin, pts));
+    }
+  }
+
   std::optional<AudioFrame> ReadAudio(std::stop_token stop) {
     if (selected == TrackKind::Video) throw std::logic_error("The movie reader selected only the video track");
     if (!ready) throw std::runtime_error("Seek has not opened the selected movie tracks");
     const auto rate = asset.pcm.sample_rate;
     for (;;) {
       CheckCancelled(stop);
+      const auto silence_until = !pending_audio.empty() ? std::optional{pending_audio.front().pts} :
+                                 audio_end ? segment_audio_end : std::nullopt;
+      // A segment duration can extend past the last packet of one track.
+      if (silence_until && next_audio.ticks < silence_until->ticks) {
+        const auto count = static_cast<std::uint32_t>(std::min<std::int64_t>(1024, silence_until->ticks - next_audio.ticks));
+        auto bytes = std::make_shared<Bytes>(std::size_t(count) * asset.pcm.ChannelCount() * sizeof(std::int16_t));
+        const auto pts = next_audio;
+        next_audio.ticks += count;
+        return AudioFrame{asset.pcm, pts, count, {BufferReference(*bytes, bytes)}};
+      }
       if (!pending_audio.empty()) {
-        const auto& frame = pending_audio.front();
-        if (next_audio.ticks < frame.pts.ticks) {
-          const auto count = static_cast<std::uint32_t>(std::min<std::int64_t>(1024, frame.pts.ticks - next_audio.ticks));
-          auto bytes = std::make_shared<Bytes>(std::size_t(count) * asset.pcm.ChannelCount() * sizeof(std::int16_t));
-          auto pts = next_audio;
-          next_audio.ticks += count;
-          return AudioFrame{asset.pcm, pts, count, {BufferReference(*bytes, bytes)}};
-        }
         auto frame_copy = std::move(pending_audio.front());
         pending_audio.pop_front();
         const auto skip = next_audio.ticks - frame_copy.pts.ticks;
@@ -491,40 +604,20 @@ struct MovieReader::Impl {
       }
       if (audio_end) return std::nullopt;
       if (asset.audio.descriptions.front().codec == CodecId::PcmS16Le) {
-        const auto packet = ReadPacket(*audio_packets);
+        const auto packet = ReadPacket(*audio_packets, &audio_timing);
         if (!packet) { audio_end = true; continue; }
         const auto bytes_per_sample = asset.pcm.ChannelCount() * sizeof(std::int16_t);
         const auto size = packet->data.AsBytes().size();
         if (!size || size % bytes_per_sample || size / bytes_per_sample > std::numeric_limits<std::uint32_t>::max())
           throw std::runtime_error("Invalid PCM packet size");
-        pending_audio.push_back({asset.pcm, AtScale(packet->pts, rate),
-                                 static_cast<std::uint32_t>(size / bytes_per_sample), {packet->data}});
+        QueueAudio({asset.pcm, packet->pts, static_cast<std::uint32_t>(size / bytes_per_sample), {packet->data}});
         continue;
       }
       if (!audio) throw std::runtime_error("Seek to reopen the audio decoder");
       try {
         auto output = audio->Pull(stop);
         if (std::holds_alternative<EndOfStream>(output)) audio_end = true;
-        auto* frame = std::get_if<AudioFrame>(&output);
-        if (!frame) continue;
-        if (frame->format != asset.pcm || !frame->Validate()) throw std::runtime_error("Audio decoder changed the negotiated PCM");
-        const auto media_pts = AtScale(frame->pts, rate);
-        const auto media_end = Add(media_pts, frame->Duration());
-        auto media_start = media_pts;
-        if (audio_audible && Before(media_start, *audio_audible)) media_start = *audio_audible;
-        if (!Before(media_start, media_end)) continue;
-        std::vector<MediaPresentationSlice> slices;
-        Require(MapToPresentation(asset.audio.edits, media_start, media_end, slices));
-        for (const auto& slice : slices) {
-          const auto pts = AtScale(slice.presentation.start, rate);
-          const auto end = AtScale(slice.presentation.end, rate);
-          const auto offset = AtScale(slice.media_start, rate).ticks - media_pts.ticks;
-          if (offset < 0 || offset > frame->sample_count || end.ticks < pts.ticks ||
-              end.ticks - pts.ticks > frame->sample_count - offset)
-            throw std::runtime_error("Invalid PCM edit interval");
-          if (end.ticks != pts.ticks)
-            pending_audio.push_back(SliceAudio(*frame, offset, end.ticks - pts.ticks, pts));
-        }
+        if (const auto* frame = std::get_if<AudioFrame>(&output)) QueueAudio(*frame);
       } catch (const CodecFailure& failure) {
         if (failure.software || !Recoverable(failure.error)) throw;
         const auto from = audio->Provider();
@@ -542,7 +635,8 @@ struct MovieReader::Impl {
   std::optional<MediaDemuxer> video_packets, audio_packets;
   std::unique_ptr<Pump<VideoDecoderSession>> video;
   std::unique_ptr<Pump<AudioDecoderSession>> audio;
-  std::optional<MediaTimestamp> audio_audible, last_video;
+  AudioPacketTiming audio_timing;
+  std::optional<MediaTimestamp> last_video, segment_audio_end;
   std::deque<VideoFrame> pending_video;
   std::deque<AudioFrame> pending_audio;
   MediaTimestamp target, next_audio;
@@ -610,7 +704,7 @@ struct MuxLane {
 };
 
 void EncodeMp4(const File& destination, const MovieCodecProviders& providers, const FileExportSettings& settings,
-               const AudioFormat& pcm, std::uint32_t video_timescale, const ReadRecordingVideo& read_video,
+               const AudioFormat& pcm, std::optional<std::uint32_t> video_timescale, const ReadRecordingVideo& read_video,
                const ReadRecordingAudio& read_audio, const OnCodecFallback& report, bool software_only) {
   auto platform = settings.video;
   platform.input_storage = VideoStorage::Platform;
@@ -649,18 +743,40 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
   }
 
   const auto picture = ReadFormat<VideoEncodeFormat>(video);
-  std::vector tracks{VideoTrack(picture, bound, video_timescale)};
+  const auto video_grid = video_timescale.value_or(1'000'000);
+  std::vector tracks{VideoTrack(picture, bound, video_grid)};
   if (audio) tracks.push_back(AudioTrack(ReadFormat<AudioEncodeFormat>(*audio)));
   Require(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, tracks));
   StagedOutput stage(destination);
   auto muxer = Require(MediaMuxer::Open(stage.TakeStream(), ContainerFormat::Mp4, tracks));
   std::optional<AudioEncodeSummary> summary;
-  const auto next_video = [&]() -> std::optional<ContainerPacket> {
+  const auto read_video_packet = [&]() -> std::optional<ContainerPacket> {
     auto event = video.Pull();
     if (auto* packet = std::get_if<EncodedPacket>(&event)) return ToContainer(*packet, 1);
     if (!std::holds_alternative<EndOfStream>(event)) throw std::runtime_error("Unexpected video encode event");
-    Require(muxer.EndTrack(1));
     return std::nullopt;
+  };
+  std::optional<ContainerPacket> video_lookahead;
+  bool video_drained = false;
+  const auto next_video = [&]() -> std::optional<ContainerPacket> {
+    if (!video_drained && !video_lookahead) video_lookahead = read_video_packet();
+    auto packet = std::exchange(video_lookahead, std::nullopt);
+    if (!packet) {
+      Require(muxer.EndTrack(1));
+      return std::nullopt;
+    }
+    if (!video_timescale) {
+      // Rebuild the continuous MP4 decode grid from adjacent timestamps when the source uses a coarse segment clock.
+      video_lookahead = read_video_packet();
+      video_drained = !video_lookahead;
+      if (!packet->dts || !packet->pts || !packet->duration)
+        throw std::runtime_error("Encoded video packet is missing its timing");
+      const auto next = video_lookahead ? *video_lookahead->dts : Add(*packet->dts, *packet->duration);
+      packet->pts = AtScale(*packet->pts, video_grid);
+      packet->dts = AtScale(*packet->dts, video_grid);
+      packet->duration = Difference(AtScale(next, video_grid), *packet->dts);
+    }
+    return packet;
   };
   const auto next_audio = [&]() -> std::optional<ContainerPacket> {
     if (!audio) return std::nullopt;
@@ -712,7 +828,7 @@ void ExportAttempt(const MovieAsset& asset, const File& destination, const Movie
   MovieReader source(asset, providers, settings.policy, report);
   ReadRecordingAudio read_audio;
   if (asset.HasAudio()) read_audio = [&] { return source.ReadAudio(); };
-  EncodeMp4(destination, providers, settings, asset.pcm, asset.video.timescale.value_or(90000),
+  EncodeMp4(destination, providers, settings, asset.pcm, asset.video.timescale,
       [&](const VideoEncoderConfig& bound) -> std::optional<VideoFrame> {
         auto input = source.ReadVideo();
         if (!input) return std::nullopt;
