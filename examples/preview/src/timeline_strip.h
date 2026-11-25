@@ -35,6 +35,9 @@ struct StripResult {
   std::string error;
 };
 
+bool SameStripInputs(const huxerui::avkit::ProjectSnapshot& before, const huxerui::avkit::ProjectSnapshot& after);
+std::shared_ptr<const StripResult> RetainStripSamples(const StripResult& displayed,
+    const huxerui::avkit::ProjectSnapshot& before, const huxerui::avkit::ProjectSnapshot& after);
 std::shared_ptr<const StripResult> UpdateStripSamples(std::shared_ptr<const StripResult> current,
     std::shared_ptr<const StripResult> incoming, bool complete);
 

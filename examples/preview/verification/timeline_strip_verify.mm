@@ -62,6 +62,29 @@ void CheckStripHandoff(const std::shared_ptr<const StripResult>& current) {
   Check(UpdateStripSamples(display, relinked, false) == relinked, "A relink carried stale samples into the new project revision");
 }
 
+void CheckStripEdits(const StripResult& displayed, const ProjectSnapshot& project) {
+  auto changed = project;
+  ++changed.revision;
+  changed.tracks.front().clips.front().destination.x += 0.1F;
+  changed.tracks.front().clips.front().rotation_degrees += 45.0F;
+  changed.overlays.emplace_back();
+  Check(SameStripInputs(project, changed), "A canvas edit invalidated timeline thumbnails or waveforms");
+
+  auto& trim = changed.tracks.front().clips.front();
+  trim.placement.timeline.end = Tick(46);
+  trim.placement.source.range.end = Tick(52);
+  Check(!SameStripInputs(project, changed), "The sampler ignored a changed clip placement");
+  auto retained = RetainStripSamples(displayed, project, changed);
+  Check(retained->revision == changed.revision && !retained->thumbnails.empty() &&
+        std::ranges::none_of(retained->thumbnails, [&](const auto& cell) { return cell.clip == trim.id; }) &&
+        retained->waveform.size() == displayed.waveform.size() && !retained->waveform.empty(),
+        "Trimming one clip invalidated cached lanes or retained thumbnails at the old placement");
+
+  ++changed.assets.front().content_revision;
+  retained = RetainStripSamples(displayed, project, changed);
+  Check(retained->thumbnails.empty() && retained->waveform.empty(), "Relinking reused samples for the replaced asset");
+}
+
 void CheckInitialProject(const File& directory, const AssetReference& video, const MovieCodecProviders& providers) {
   const File photo_file(directory, "initial-photo.mp4");
   auto photo_image = Bitmap::FromRgba8(97, 55, Bytes(97 * 55 * 4, std::byte{240}));
@@ -298,6 +321,7 @@ void VerifyTimelineStrip(std::string_view first, std::string_view next, std::str
       Check(strip->thumbnails.size() == 8 && strip->thumbnails[0].source_time == Tick(12) &&
             strip->thumbnails[4].source_time == Tick(48), "Unexpected sampling grid across both clips");
       CheckStripHandoff(strip);
+      CheckStripEdits(*strip, *base);
     }
     CheckInitialProject(directory, InspectTimelineMovie(original.file), providers);
 

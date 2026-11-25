@@ -6,8 +6,10 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <ranges>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include "support/cancellation.h"
@@ -97,6 +99,46 @@ void ReadStrip(AssetSampler& sampler, TrackKind kind, const ProjectSnapshot& pro
 }
 
 } // namespace
+
+bool SameStripInputs(const ProjectSnapshot& before, const ProjectSnapshot& after) {
+  const auto sampled = [](const TrackInfo& track) {
+    return track.kind == TrackKind::Video || track.kind == TrackKind::Audio;
+  };
+  return before.assets == after.assets &&
+      std::ranges::equal(before.tracks | std::views::filter(sampled), after.tracks | std::views::filter(sampled),
+          [](const TrackInfo& a, const TrackInfo& b) {
+            return a.id == b.id && a.kind == b.kind && std::ranges::equal(a.clips, b.clips,
+                [](const ClipInfo& first, const ClipInfo& second) {
+                  return first.id == second.id && first.placement == second.placement;
+                });
+          });
+}
+
+std::shared_ptr<const StripResult> RetainStripSamples(const StripResult& displayed,
+    const ProjectSnapshot& before, const ProjectSnapshot& after) {
+  std::unordered_set<std::uint64_t> unchanged;
+  for (const auto& previous_track : before.tracks) {
+    if (previous_track.kind != TrackKind::Video && previous_track.kind != TrackKind::Audio) continue;
+    const auto track = std::ranges::find(after.tracks, previous_track.id, &TrackInfo::id);
+    if (track == after.tracks.end() || track->kind != previous_track.kind) continue;
+    for (const auto& previous : previous_track.clips) {
+      const auto clip = std::ranges::find(track->clips, previous.id, &ClipInfo::id);
+      if (clip == track->clips.end() || clip->placement != previous.placement) continue;
+      const auto asset_id = clip->placement.source.asset;
+      const auto old_asset = std::ranges::find(before.assets, asset_id, &AssetInfo::id);
+      const auto new_asset = std::ranges::find(after.assets, asset_id, &AssetInfo::id);
+      if (old_asset != before.assets.end() && new_asset != after.assets.end() && *old_asset == *new_asset)
+        unchanged.insert(clip->id.value);
+    }
+  }
+  const auto stale = [&](const auto& item) { return !unchanged.contains(item.clip.value); };
+  auto retained = std::make_shared<StripResult>(displayed);
+  std::erase_if(retained->thumbnails, stale);
+  std::erase_if(retained->waveform, stale);
+  retained->revision = after.revision;
+  retained->error.clear();
+  return retained;
+}
 
 std::shared_ptr<const StripResult> UpdateStripSamples(std::shared_ptr<const StripResult> current,
     std::shared_ptr<const StripResult> incoming, bool complete) {

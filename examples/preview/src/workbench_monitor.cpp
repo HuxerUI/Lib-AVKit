@@ -171,7 +171,7 @@ AssetReference ReadWorkbenchMovie(const File& file) { return InspectTimelineMovi
 [[huxerui::composable]]
 View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapshot> project, EditorTransport timeline, bool wide,
                        std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
-                       std::optional<WorkbenchDrag> drag) {
+                       std::function<std::optional<WorkbenchDrag>()> preview_drag) {
   const auto& theme = UseTheme();
   const auto tasks = UseTaskScope();
   const bool has_media = project && project->Range().end.ticks > 0;
@@ -244,6 +244,7 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
     prepared = PreparedPicture{project, std::move(picture)};
   }, project, size);
   const auto picture = prepared->first == project ? prepared->second : nullptr;
+  const auto drag = preview_drag();
   Lifecycle([active, picture, timeline, drag] {
     if (active && picture) active->Show(picture, timeline.position.Get(), false, drag);
   }, active, picture, drag);
@@ -510,9 +511,13 @@ std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectS
     worker = std::make_shared<StripWorker>(TimelineProviders(), OpenCanvasThumbnailSource());
   });
   const auto sampler = worker.Get();
+  const auto [previous, cached] = result.Get();
+  if (project && previous && project != previous && SameStripInputs(*previous, *project)) project = previous;
+  const auto displayed = project == previous ? cached :
+      project && cached ? RetainStripSamples(*cached, *previous, *project) : nullptr;
   Lifecycle([=] {
     std::uint64_t request{};
-    if (result->first != project) result = Sample{};
+    if (result->first != project) result = Sample{project, displayed};
     if (sampler && project && visible.range.start.Compare(visible.range.end) == -1) {
       auto pending = std::make_shared<PendingStrip>();
       const auto deliver = [tasks, generation, result, project, pending](std::shared_ptr<const StripResult> strip, bool complete) {
@@ -543,8 +548,7 @@ std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectS
     generation = request;
     return [sampler, request] { if (request) sampler->Cancel(request); };
   }, sampler, project, visible);
-  const auto sample = result.Get();
-  return sample.first == project ? sample.second : nullptr;
+  return displayed;
 }
 
 } // namespace avkit_preview

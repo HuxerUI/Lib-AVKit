@@ -7,6 +7,8 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <limits>
+#include <numbers>
 #include <numeric>
 #include <utility>
 #include <variant>
@@ -142,6 +144,7 @@ struct CanvasItem {
   Rect artwork{0, 0, 1, 1};
   float degrees{};
   bool text{};
+  CanvasGuides guides;
   Rect Visible() const { return ArtworkBounds(bounds, artwork); }
   bool operator==(const CanvasItem&) const = default;
 };
@@ -163,9 +166,14 @@ enum class CanvasCorner { Delete, Edit, Transform, Duplicate };
 constexpr float kCanvasButtonSize = 18.0F;
 constexpr float kCanvasButtonHitRadius = 16.0F;
 
-std::array<Point, 4> CanvasCorners(const CanvasItem& item, Rect area, PixelSize canvas) {
+Point CanvasCenter(const CanvasItem& item, Rect area) {
+  return {area.x + (item.bounds.x + item.bounds.width / 2) * area.width,
+          area.y + (item.bounds.y + item.bounds.height / 2) * area.height};
+}
+
+std::array<Point, 4> CanvasCorners(const CanvasItem& item, Rect area, PixelSize canvas, bool pad_text = true) {
   auto rect = item.Visible();
-  if (item.text) {
+  if (pad_text && item.text) {
     constexpr float padding = 6.0F;
     const auto horizontal = padding / area.width, vertical = padding / area.height;
     rect = {rect.x - horizontal, rect.y - vertical, rect.width + 2 * horizontal, rect.height + 2 * vertical};
@@ -178,6 +186,33 @@ std::array<Point, 4> CanvasCorners(const CanvasItem& item, Rect area, PixelSize 
     point = {area.x + point.x * area.width, area.y + point.y * area.height};
   }
   return points;
+}
+
+std::optional<float> SnapCanvasAxis(float artwork_start, float artwork_end, float origin, float extent,
+                                   std::optional<float> latched, float& offset, float size) {
+  constexpr std::array guides{0.0F, 0.5F, 1.0F};
+  const std::array anchors{artwork_start, (artwork_start + artwork_end) / 2.0F, artwork_end};
+  std::optional<float> snapped;
+  auto nearest = 6.0F;
+  auto position = offset;
+  for (std::size_t index = 0; index < guides.size(); ++index) {
+    const auto guide = guides[index];
+    const auto delta = origin + guide * extent - anchors[index];
+    const auto distance = std::abs(delta);
+    const auto candidate = offset + delta / extent;
+    if (candidate < -0.0001F || candidate + size > 1.0001F) continue;
+    if (latched == guide && distance <= 10.0F) {
+      offset = std::clamp(candidate, 0.0F, 1.0F - size);
+      return guide;
+    }
+    if (distance <= nearest) {
+      nearest = distance;
+      snapped = guide;
+      position = candidate;
+    }
+  }
+  if (snapped) offset = std::clamp(position, 0.0F, 1.0F - size);
+  return snapped;
 }
 
 struct CanvasPointer {
@@ -233,7 +268,8 @@ public:
       return PointerResult::Handled;
     }
     if (changed_) {
-      update_(*current_, TrimPhase::Commit);
+      const bool edited = current_->bounds != initial_bounds_ || current_->degrees != initial_degrees_;
+      update_(*current_, edited ? TrimPhase::Commit : TrimPhase::Cancel);
     } else if (button_ && *button_ != CanvasCorner::Transform &&
                std::hypot(event.position.x - origin_.x, event.position.y - origin_.y) <= kCanvasButtonHitRadius) {
       config_.action(*button_);
@@ -246,11 +282,6 @@ public:
 
 private:
   static Point Midpoint(Point first, Point second) { return {(first.x + second.x) / 2, (first.y + second.y) / 2}; }
-
-  static Point Center(const CanvasItem& item, Rect area) {
-    return {area.x + (item.bounds.x + item.bounds.width / 2) * area.width,
-            area.y + (item.bounds.y + item.bounds.height / 2) * area.height};
-  }
 
   PointerResult Begin(const PointerEvent& event, Rect area) {
     if (event.changed_button == PointerButton::Secondary) return PointerResult::Ignored;
@@ -302,6 +333,8 @@ private:
       }
     }
     current_ = base_;
+    initial_bounds_ = base_->bounds;
+    initial_degrees_ = base_->degrees;
     update_ = config_.update;
     first_ = event.pointer_id;
     origin_ = first_point_ = event.position;
@@ -319,7 +352,7 @@ private:
       before = span_;
       after = {second_point_.x - first_point_.x, second_point_.y - first_point_.y};
     } else if (button_ == CanvasCorner::Transform) {
-      const auto center = Center(*base_, area);
+      const auto center = CanvasCenter(*base_, area);
       before = {origin_.x - center.x, origin_.y - center.y};
       after = {first_point_.x - center.x, first_point_.y - center.y};
     } else {
@@ -329,17 +362,40 @@ private:
     const bool transform = distance >= 4.0F;
     const auto scale = transform ? std::hypot(after.x, after.y) / distance : 1.0F;
     const auto angle = transform ? std::remainder(
-        (std::atan2(after.y, after.x) - std::atan2(before.y, before.x)) * 57.2957795131F, 360.0F) : 0.0F;
+        (std::atan2(after.y, after.x) - std::atan2(before.y, before.x)) * (180.0F / std::numbers::pi_v<float>),
+        360.0F) : 0.0F;
     if (!changed_ && std::hypot(translation.x, translation.y) < 2.0F && std::abs(scale - 1.0F) < 0.01F && std::abs(angle) < 1.0F)
       return;
     auto next = *base_;
+    next.guides = {};
     const auto rect = next.Visible();
     const auto maximum = 1.0F / std::max(rect.width, rect.height);
     const auto bounded = std::clamp(scale, 0.025F * maximum, maximum);
-    const auto placed = PlaceCanvasItem(rect, rect.x + (1 - bounded) * rect.width / 2 + translation.x / area.width,
+    auto placed = PlaceCanvasItem(rect, rect.x + (1 - bounded) * rect.width / 2 + translation.x / area.width,
         rect.y + (1 - bounded) * rect.height / 2 + translation.y / area.height, bounded);
     next.bounds = FrameFromArtwork(placed, next.artwork);
     next.degrees = std::remainder(next.degrees + angle, 360.0F);
+    next.guides.rotating = transform && (current_->guides.rotating || std::abs(angle) >= 1.0F);
+    if (next.guides.rotating) {
+      constexpr float angle_step = 45.0F;
+      const auto nearest = std::round(next.degrees / angle_step) * angle_step;
+      if (current_->guides.angle_snapped &&
+          std::abs(std::remainder(next.degrees - current_->degrees, 360.0F)) <= 7.0F) {
+        next.degrees = current_->degrees;
+        next.guides.angle_snapped = true;
+      } else if (std::abs(next.degrees - nearest) <= 4.0F) {
+        next.degrees = nearest;
+        next.guides.angle_snapped = true;
+      }
+    }
+    if (second_ ? (translation.x != 0.0F || translation.y != 0.0F) : move_body_) {
+      const auto corners = CanvasCorners(next, area, config_.canvas, false);
+      const auto [left, right] = std::ranges::minmax_element(corners, {}, &Point::x);
+      const auto [top, bottom] = std::ranges::minmax_element(corners, {}, &Point::y);
+      next.guides.x = SnapCanvasAxis(left->x, right->x, area.x, area.width, current_->guides.x, placed.x, placed.width);
+      next.guides.y = SnapCanvasAxis(top->y, bottom->y, area.y, area.height, current_->guides.y, placed.y, placed.height);
+      next.bounds = FrameFromArtwork(placed, next.artwork);
+    }
     if (current_ == next) return;
     current_ = next;
     changed_ = true;
@@ -361,12 +417,101 @@ private:
   CanvasPointer config_;
   std::optional<std::int64_t> first_, second_;
   Point origin_, first_point_, second_point_, span_;
+  Rect initial_bounds_;
+  float initial_degrees_{};
   std::optional<CanvasItem> base_, current_;
   std::optional<CanvasCorner> button_;
   std::optional<CanvasTarget> tap_target_;
   std::function<void(CanvasItem, TrimPhase)> update_;
   bool changed_{}, background_{}, move_body_{}, multi_{};
 };
+
+std::optional<std::pair<float, float>> GuideInterval(Point origin, Point direction, Rect bounds) {
+  auto first = -std::numeric_limits<float>::infinity();
+  auto last = std::numeric_limits<float>::infinity();
+  const auto intersect = [&](float value, float slope, float low, float high) {
+    if (std::abs(slope) < 0.0001F) return value >= low && value <= high;
+    const auto a = (low - value) / slope, b = (high - value) / slope;
+    first = std::max(first, std::min(a, b));
+    last = std::min(last, std::max(a, b));
+    return first < last;
+  };
+  if (!intersect(origin.x, direction.x, bounds.x, bounds.x + bounds.width) ||
+      !intersect(origin.y, direction.y, bounds.y, bounds.y + bounds.height)) return std::nullopt;
+  return std::pair{first, last};
+}
+
+void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasItem& item, PixelSize canvas,
+                       const CanvasGuides& guides) {
+  if (area.width < 2.0F || area.height < 2.0F || (!guides.x && !guides.y && !guides.rotating)) return;
+  constexpr float clearance = kCanvasButtonSize / 2 + 3.0F;
+  const auto corners = CanvasCorners(item, area, canvas);
+  const auto [left, right] = std::ranges::minmax_element(corners, {}, &Point::x);
+  const auto [top, bottom] = std::ranges::minmax_element(corners, {}, &Point::y);
+  const Rect excluded{left->x - clearance, top->y - clearance,
+                      right->x - left->x + 2 * clearance, bottom->y - top->y + 2 * clearance};
+  const StrokeStyle dashed{.width = 1.0F, .dash_pattern = {4.0F, 4.0F}};
+  const auto ink = Color::Rgb(235, 236, 239, 0.84F);
+  const auto stroke = [&](Point from, Point to, Color tint) {
+    paint.StrokePath(Path{}.MoveTo(from).LineTo(to), tint, dashed);
+  };
+  const auto align = [&](Point origin, Point direction) {
+    const auto visible = GuideInterval(origin, direction, area);
+    if (!visible) return;
+    const auto [start, end] = *visible;
+    const auto segment = [&](float first, float last) {
+      if (last - first >= 2.0F) stroke(origin + direction * first, origin + direction * last, ink);
+    };
+    if (const auto gap = GuideInterval(origin, direction, excluded)) {
+      const auto [first, last] = *gap;
+      segment(start, std::min(end, first));
+      segment(std::max(start, last), end);
+    } else {
+      segment(start, end);
+    }
+  };
+  if (guides.x) {
+    const auto x = area.x + std::clamp(*guides.x * area.width, 0.75F, area.width - 0.75F);
+    align({x, area.y}, {0, 1});
+  }
+  if (guides.y) {
+    const auto y = area.y + std::clamp(*guides.y * area.height, 0.75F, area.height - 0.75F);
+    align({area.x, y}, {1, 0});
+  }
+  if (guides.rotating) {
+    const auto first = (corners[0] + corners[3]) / 2.0F;
+    const auto last = (corners[1] + corners[2]) / 2.0F;
+    const auto axis = last - first;
+    const auto length = std::hypot(axis.x, axis.y);
+    if (length < 1.0F) return;
+    const auto direction = axis / length;
+    const auto center = (first + last) / 2.0F;
+    const auto angle_ink = guides.angle_snapped ? Color::White() : ink;
+    constexpr float angle_tail = 20.0F;
+    paint.PushClip({0, 0, size.width, size.height});
+    stroke(first - direction * clearance, first - direction * (clearance + angle_tail), angle_ink);
+    stroke(last + direction * clearance, last + direction * (clearance + angle_tail), angle_ink);
+    paint.PopClip();
+
+    constexpr float label_width = 36.0F, label_height = 18.0F, label_gap = 3.0F;
+    if (size.width < label_width + 2 * label_gap || size.height < label_height + 2 * label_gap) return;
+    const auto x = std::clamp(center.x - label_width / 2, label_gap, size.width - label_width - label_gap);
+    const auto y = std::clamp(center.y - label_height / 2, label_gap, size.height - label_height - label_gap);
+    const std::array positions{Point{x, excluded.y - label_height - label_gap},
+        Point{x, excluded.y + excluded.height + label_gap},
+        Point{excluded.x + excluded.width + label_gap, y}, Point{excluded.x - label_width - label_gap, y}};
+    const auto position = std::ranges::find_if(positions, [&](Point at) {
+      return at.x >= label_gap && at.y >= label_gap &&
+             at.x + label_width + label_gap <= size.width && at.y + label_height + label_gap <= size.height;
+    });
+    if (position == positions.end()) return;
+    const Rect label{position->x, position->y, label_width, label_height};
+    paint.DrawRect(label, Color::Rgb(24, 25, 28, 0.86F), CornerRadii{4.0F});
+    paint.DrawText({label.x, label.y + 2.0F, label.width, label.height - 2.0F},
+                   std::to_string(std::lround(item.degrees)) + "°",
+                   TextStyle{.font = Font::Monospace(10.5F), .foreground = angle_ink}, {.align = TextAlign::Center});
+  }
+}
 
 void PaintCanvasSelection(PaintContext& paint, Rect area, const CanvasItem& item, PixelSize canvas,
                           bool show_controls, std::optional<CanvasCorner> pressed, const VectorAsset& plate_icon,
@@ -1487,13 +1632,14 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       return true;
     });
   };
-  const auto drag = dragging.Get();
-  std::optional<WorkbenchDrag> preview_drag;
-  if (drag && canvas_item && drag->target == canvas_item->target) {
+  const auto preview_drag = [dragging, canvas_item, canvas = project ? project->canvas : PixelSize{}]()
+      -> std::optional<WorkbenchDrag> {
+    const auto drag = dragging.Get();
+    if (!drag || !canvas_item || drag->target != canvas_item->target) return std::nullopt;
     const auto basis = canvas_item->bounds;
     const auto destination = drag->bounds;
     const auto scale = destination.width / basis.width;
-    auto transform = CanvasRotation(basis, project->canvas, drag->degrees - canvas_item->degrees);
+    auto transform = CanvasRotation(basis, canvas, drag->degrees - canvas_item->degrees);
     const auto old_center = Point{basis.x + basis.width / 2, basis.y + basis.height / 2};
     transform.m11 *= scale;
     transform.m12 *= scale;
@@ -1501,8 +1647,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     transform.m22 *= scale;
     transform.translate_x = destination.x + destination.width / 2 - transform.m11 * old_center.x - transform.m21 * old_center.y;
     transform.translate_y = destination.y + destination.height / 2 - transform.m12 * old_center.x - transform.m22 * old_center.y;
-    preview_drag = WorkbenchDrag{{drag->target, transform}, destination, drag->degrees};
-  }
+    return WorkbenchDrag{{drag->target, transform}, destination, drag->degrees, drag->guides};
+  };
   const auto zoom_by = [timeline_zoom, timeline_left, transport, base_span, duration, wide](double steps) {
     const auto current = timeline_zoom.Get();
     const auto next = std::clamp(current + steps, 0.0, kMaxZoom);
@@ -2031,8 +2177,9 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     const std::array action_icons{
         UseVectorImage(app::images::icons_corner_delete), UseVectorImage(app::images::icons_corner_edit),
         UseVectorImage(app::images::icons_corner_transform), UseVectorImage(app::images::icons_corner_duplicate)};
-    canvas_controls = [=, pressed = pressed_corner.Get()](const WorkbenchFrame& frame, bool current) {
+    canvas_controls = [=](const WorkbenchFrame& frame, bool current) {
       const auto canvas = frame.project->canvas;
+      const auto pressed = pressed_corner.Get();
       auto items = canvas_items_at(*frame.project, frame.playing ? position : frame.seconds, true);
       if (frame.drag) {
         const auto item = std::ranges::find(items, frame.drag->layout.target, &CanvasItem::target);
@@ -2042,9 +2189,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
         }
       }
       const auto item = find_canvas_item(items);
+      const auto guides = item && frame.drag && frame.drag->layout.target == item->target && dragging.Get()
+          ? frame.drag->guides : CanvasGuides{};
       return Canvas([=](PaintContext& paint, Size size) {
-        if (item) PaintCanvasSelection(paint, CanvasArea(size, canvas), *item, canvas, !dock_open, pressed,
-                                       plate_icon, pressed_plate_icon, action_icons);
+        if (!item) return;
+        const auto area = CanvasArea(size, canvas);
+        PaintCanvasGuides(paint, size, area, *item, canvas, guides);
+        PaintCanvasSelection(paint, area, *item, canvas, !dock_open, pressed, plate_icon, pressed_plate_icon, action_icons);
       }).With(CanvasPointer{canvas, std::move(items), item, pressed_corner, choose_canvas, change_canvas, canvas_action, current},
               Enabled(allowed && !dock_open), Semantics{.label = "画布对象编辑区"});
     };

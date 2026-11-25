@@ -34,6 +34,6 @@ std::shared_ptr<const StripResult> UseEditorStrip(
 [[huxerui::composable]] huxerui::View EditorMonitor(WorkbenchContext context,
     std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, EditorTransport transport, bool wide,
     std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
-    std::optional<WorkbenchDrag> drag);
+    std::function<std::optional<WorkbenchDrag>()> preview_drag);
 
 } // namespace avkit_preview

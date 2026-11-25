@@ -40,7 +40,7 @@ std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectS
 
 [[huxerui::composable]]
 View EditorMonitor(WorkbenchContext, std::shared_ptr<const ProjectSnapshot>, EditorTransport, bool wide, std::function<void()> back, std::function<void()>,
-                   EditorMonitorViews, std::optional<WorkbenchDrag>) {
+                   EditorMonitorViews, std::function<std::optional<WorkbenchDrag>()>) {
   const auto& theme = UseTheme();
   return WorkbenchPanel(Column{
       wide ? View{} : WorkbenchCompactAction(Row{

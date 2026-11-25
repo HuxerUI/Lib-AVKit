@@ -21,10 +21,17 @@ struct WorkbenchPlayback {
   bool operator==(const WorkbenchPlayback&) const = default;
 };
 
+struct CanvasGuides {
+  std::optional<float> x, y;
+  bool rotating{}, angle_snapped{};
+  bool operator==(const CanvasGuides&) const = default;
+};
+
 struct WorkbenchDrag {
   huxerui::avkit::VisualTransformOverride layout;
   huxerui::Rect bounds;
   float degrees;
+  CanvasGuides guides;
   bool operator==(const WorkbenchDrag&) const = default;
 };
 
