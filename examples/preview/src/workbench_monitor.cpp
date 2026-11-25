@@ -10,6 +10,8 @@
 #include <utility>
 
 #include "timeline_playback.h"
+#include "timeline_resources.h"
+#include "workbench_platform.h"
 #include "workbench_player.h"
 #include "app_resources.h"
 #include <huxerui/avkit/file_movie.h>
@@ -162,10 +164,14 @@ AssetReference ReadWorkbenchMusic(const File& file, const File& prepared, const 
   return InspectTimelineAudio(prepared);
 }
 
+bool HasWorkbenchMedia() { return true; }
+
+AssetReference ReadWorkbenchMovie(const File& file) { return InspectTimelineMovie(file); }
+
 [[huxerui::composable]]
-View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapshot> project, EditorTransport timeline, bool wide,
+View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapshot> project, EditorTransport timeline, bool wide,
                        std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
-                       std::optional<VisualTransformOverride> layout, WorkbenchExport export_movie) {
+                       std::optional<WorkbenchDrag> drag) {
   const auto& theme = UseTheme();
   const auto tasks = UseTaskScope();
   const bool has_media = project && project->Range().end.ticks > 0;
@@ -177,15 +183,51 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
   using PreviewSession = std::pair<PixelSize, std::shared_ptr<WorkbenchPlayer>>;
   const auto player = UseState(PreviewSession{});
   const auto playback = UseState(WorkbenchPlayback{});
+  const auto presented = UseState(std::optional<WorkbenchFrame>{});
   const auto exporting = context.exporting;
   const auto resource_pack = views.assets;
   const auto display_scale = UseService<Resources>()->Configuration().display_scale;
   const auto size = has_media ? PreviewSize(project->canvas, display_scale) : PixelSize{};
   const auto canvas = has_media && !exporting.Get() && resource_pack ? std::optional(size) : std::nullopt;
-  Lifecycle([player, playback, canvas, resource_pack, timeline] {
-    auto active = canvas ? std::make_shared<WorkbenchPlayer>(*canvas, *resource_pack) : nullptr;
+  Lifecycle([player, playback, presented, canvas, resource_pack, timeline, tasks] {
+    struct Presentation {
+      WorkbenchFrame frame;
+      std::stop_token stop;
+      render::PreviewFrameCommit commit;
+    };
+    struct PendingPresentation {
+      std::mutex mutex;
+      std::optional<Presentation> latest;
+      bool posted{};
+    };
+    auto pending = std::make_shared<PendingPresentation>();
+    auto present = [tasks, presented, pending](WorkbenchFrame frame, std::stop_token stop, render::PreviewFrameCommit commit) {
+      {
+        std::scoped_lock lock(pending->mutex);
+        pending->latest.emplace(std::move(frame), stop, std::move(commit));
+        if (std::exchange(pending->posted, true)) return;
+      }
+      tasks.Post([presented, pending] {
+        std::optional<WorkbenchFrame> shown;
+        try {
+          std::scoped_lock lock(pending->mutex);
+          auto latest = std::exchange(pending->latest, std::nullopt);
+          pending->posted = false;
+          if (latest && !latest->stop.stop_requested()) {
+            // Publish the picture and advance its selection geometry on the same UI turn.
+            if (latest->commit) latest->commit();
+            shown.emplace(std::move(latest->frame));
+          }
+        } catch (const std::exception& error) {
+          LogWorkbench(WorkbenchLogLevel::Error, "Cannot present the preview frame: %s", error.what());
+        }
+        if (shown) presented = std::move(shown);
+      });
+    };
+    auto active = canvas ? std::make_shared<WorkbenchPlayer>(*canvas, *resource_pack, std::move(present)) : nullptr;
     player = PreviewSession{canvas.value_or(PixelSize{}), active};
     playback = WorkbenchPlayback{timeline.position.Get()};
+    presented = std::nullopt;
     return [active] { if (active) active->Close(); };
   }, canvas);
   const auto session = player.Get();
@@ -202,9 +244,9 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
     prepared = PreparedPicture{project, std::move(picture)};
   }, project, size);
   const auto picture = prepared->first == project ? prepared->second : nullptr;
-  Lifecycle([active, picture, timeline, layout] {
-    if (active && picture) active->Show(picture, timeline.position.Get(), false, layout);
-  }, active, picture, layout);
+  Lifecycle([active, picture, timeline, drag] {
+    if (active && picture) active->Show(picture, timeline.position.Get(), false, drag);
+  }, active, picture, drag);
   const auto seek = timeline.seek.Get();
   Lifecycle([active, picture, timeline, playback, seek] {
     if (!active || !picture || !seek || active->Closed()) return;
@@ -228,9 +270,12 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
   }, active);
   const auto duration = has_media ? Seconds(project->Range().end) : 0.0;
   const auto status = playback.Get();
+  const auto shown = presented.Get();
+  View canvas_controls;
   if (has_media) {
-    if (active) {
-      preview = WorkbenchVideoPicture(active->Texture()).With(Grow());
+    if (active && shown) {
+      preview = WorkbenchVideoPicture(shown->texture).With(Grow());
+      if (views.canvas) canvas_controls = views.canvas(*shown, shown->project == picture);
     } else if (exporting.Get()) preview = {};
     else preview = Text("正在准备预览…");
   }
@@ -335,11 +380,11 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
       exporting = true;
       try {
         if (auto current = player.Get().second) current->Close();
-        auto encoded = co_await RunWorker([cache = context.cache, export_movie, revision, resource_pack, resolution, duration, work] {
+        auto encoded = co_await RunWorker([cache = context.cache, revision, resource_pack, resolution, duration, work] {
           const auto output = std::make_shared<ExportFile>(WorkbenchOutput(cache, "Exports", "成片.mp4"));
           auto render_revision = std::make_shared<ProjectSnapshot>(*revision);
           render_revision->canvas = resolution;
-          export_movie(PrepareWorkbenchPicture(std::move(render_revision)), output->path, *resource_pack,
+          ExportWorkbenchMovie(PrepareWorkbenchPicture(std::move(render_revision)), output->path, *resource_pack,
               [work, duration](media::MediaTimestamp pts) {
                 if (work->stop.stop_requested()) throw std::runtime_error("Export cancelled");
                 work->progress.store(std::clamp(float(Seconds(pts) / duration), 0.0F, 0.99F), std::memory_order_relaxed);
@@ -397,7 +442,7 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
   auto stage = Column{
     Stack{
       std::move(preview),
-      active ? std::move(views.canvas) : View{},
+      std::move(canvas_controls),
       feedback.empty() ? View{} : View(Row{
         Text(feedback, TextRole::Label).LineLimit(2).With(Padding(EdgeInsets::Symmetric(10.0F, 5.0F)),
             Foreground(status.error.empty() ? theme.colors.on_surface : theme.colors.error),
@@ -449,8 +494,7 @@ View WorkbenchMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSna
   return monitor;
 }
 
-std::shared_ptr<const StripResult> UseWorkbenchStrip(std::shared_ptr<const ProjectSnapshot> project,
-                                                       StripViewport visible, CreateStripWorker create_worker) {
+std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectSnapshot> project, StripViewport visible) {
   const auto tasks = UseTaskScope();
   const auto worker = UseState(std::shared_ptr<StripWorker>{});
   const auto generation = UseState(std::uint64_t{});
@@ -462,7 +506,9 @@ std::shared_ptr<const StripResult> UseWorkbenchStrip(std::shared_ptr<const Proje
     bool queued{};
   };
   const auto result = UseState(Sample{});
-  Lifecycle([worker, create_worker] { worker = create_worker(); }, create_worker);
+  Lifecycle([worker] {
+    worker = std::make_shared<StripWorker>(TimelineProviders(), OpenCanvasThumbnailSource());
+  });
   const auto sampler = worker.Get();
   Lifecycle([=] {
     std::uint64_t request{};

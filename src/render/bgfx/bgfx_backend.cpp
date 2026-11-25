@@ -317,8 +317,10 @@ public:
     return input;
   }
 
+  bool HasCompletedOutput(const ColorSurface& surface) const { return FindTarget(surface.pixels) != nullptr; }
+
   detail::PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp pts) {
-    if (!FindTarget(surface.pixels)) {
+    if (!HasCompletedOutput(surface)) {
       return detail::PublishedTexture::Failure({RenderErrorCode::InvalidFrame, "Expected a completed output lease"});
     }
     if (bridge_) return bridge_->Publish(surface, pts);
@@ -737,6 +739,54 @@ ImageSurface RetainBgfxPixels(ImageDesc image, BufferReference bytes, std::size_
 Result<BufferReference, RenderError> ReadBgfxPixels(RenderBackend& backend, const ColorSurface& surface) {
   if (auto* bgfx = dynamic_cast<BgfxBackend*>(&backend)) return bgfx->ReadPixels(surface);
   return Result<BufferReference, RenderError>::Failure({RenderErrorCode::Unsupported, "Expected a bgfx backend"});
+}
+
+Result<std::unique_ptr<BgfxPreviewTexture>, RenderError> OpenBgfxPreviewTexture(PixelSize size) {
+  using R = Result<std::unique_ptr<BgfxPreviewTexture>, RenderError>;
+  if (!size.width || !size.height) return R::Failure({RenderErrorCode::InvalidFrame, "Invalid preview texture size"});
+  try {
+    if (auto preview = detail::OpenPlatformBgfxPreviewTexture(size)) return R::Success(std::move(preview));
+    return R::Failure({RenderErrorCode::Unsupported, "The platform cannot open a reusable bgfx preview texture"});
+  } catch (const std::exception& error) {
+    return R::Failure({RenderErrorCode::Unsupported, error.what()});
+  }
+}
+
+namespace {
+
+std::optional<RenderError> ValidatePreviewOutput(RenderBackend& backend, const ColorSurface& surface, Size size) {
+  const auto* bgfx = dynamic_cast<const BgfxBackend*>(&backend);
+  if (!bgfx || !bgfx->HasCompletedOutput(surface)) {
+    return RenderError{RenderErrorCode::InvalidFrame, "Expected a completed bgfx output lease"};
+  }
+  const auto output = surface.pixels.image.size;
+  if (size != Size{float(output.width), float(output.height)}) {
+    return RenderError{RenderErrorCode::InvalidFrame, "The composite does not match the preview texture size"};
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+Result<PreviewFrameCommit, RenderError> BgfxPreviewTexture::Prepare(RenderBackend& backend, const ColorSurface& surface) {
+  using R = Result<PreviewFrameCommit, RenderError>;
+  if (auto error = ValidatePreviewOutput(backend, surface, Texture()->IntrinsicSize())) return R::Failure(std::move(*error));
+  try {
+    return R::Success(PrepareFrame(surface));
+  } catch (const std::exception& error) {
+    return R::Failure({RenderErrorCode::Unsupported, error.what()});
+  }
+}
+
+Result<void, RenderError> BgfxPreviewTexture::Publish(RenderBackend& backend, const ColorSurface& surface) {
+  using R = Result<void, RenderError>;
+  if (auto error = ValidatePreviewOutput(backend, surface, Texture()->IntrinsicSize())) return R::Failure(std::move(*error));
+  try {
+    PublishFrame(surface);
+    return R::Success();
+  } catch (const std::exception& error) {
+    return R::Failure({RenderErrorCode::Unsupported, error.what()});
+  }
 }
 
 detail::ImportedTexture detail::AcquireBgfxTexture(RenderBackend& backend, const ExternalTexture& texture,

@@ -18,6 +18,15 @@ OverlayAssets LoadOverlayAssets(const Resources& resources) {
   assets.editable = load(app::raw::stickers_editable_pag);
   assets.point_text = load(app::raw::stickers_point_text_pag);
   assets.font = load(app::raw::stickers_preview_sans_ttf);
+  assets.replacement_image = load(app::raw::stickers_replacement_png);
+  assets.transition = load(app::raw::transitions_crossfade_pag);
+  const std::array wipe{app::raw::masks_wipe_0_png, app::raw::masks_wipe_1_png, app::raw::masks_wipe_2_png,
+                        app::raw::masks_wipe_3_png, app::raw::masks_wipe_4_png, app::raw::masks_wipe_5_png,
+                        app::raw::masks_wipe_6_png, app::raw::masks_wipe_7_png};
+  static_assert(wipe.size() == kPreviewWipeFrameCount);
+  for (std::size_t index = 0; index < wipe.size(); ++index) assets.wipe_masks[index] = load(wipe[index]);
+  assets.clip_masks = {load(app::raw::masks_static_window_png), load(app::raw::masks_static_offset_png),
+                       load(app::raw::masks_sequence_corner_png)};
   return assets;
 }
 

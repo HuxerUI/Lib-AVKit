@@ -14,12 +14,7 @@
 
 namespace huxerui::avkit::render {
 
-namespace {
-
-constexpr RenderErrorCode kUnsupported = RenderErrorCode::Unsupported;
-constexpr RenderErrorCode kInvalidFrame = RenderErrorCode::InvalidFrame;
-
-Result<Bitmap, RenderError> ReadBitmap(RenderBackend& backend, const ColorSurface& surface) {
+Result<Bitmap, RenderError> detail::ReadBgfxBitmap(RenderBackend& backend, const ColorSurface& surface) {
   using R = Result<Bitmap, RenderError>;
   auto read = ReadBgfxPixels(backend, surface);
   if (!read.Succeeded()) return R::Failure(read.Error());
@@ -43,6 +38,11 @@ Result<Bitmap, RenderError> ReadBitmap(RenderBackend& backend, const ColorSurfac
   }
   return R::Success(Bitmap::FromRgba8(width, height, std::move(pixels)));
 }
+
+namespace {
+
+constexpr RenderErrorCode kUnsupported = RenderErrorCode::Unsupported;
+constexpr RenderErrorCode kInvalidFrame = RenderErrorCode::InvalidFrame;
 
 struct Yuv {
   float y, u, v;
@@ -323,20 +323,21 @@ Task<Result<ColorSurface, RenderError>> ImportBgfxTexture(
 
 Task<Result<ColorSurface, RenderError>> ImportBgfxVideoFrame(
     RenderBackend& backend, media::VideoFrame frame, media::VideoTextureOptions options, TextureTransferPolicy policy) {
-  auto result = detail::ImportDecodedBgfxFrame(backend, frame, options, policy);
+  auto result = ImportDecodedBgfxFrame(backend, frame, options, policy);
   return CompleteImport(result.Succeeded() ? detail::ImportedTexture::Success(std::move(result).Value().surface)
                                            : detail::ImportedTexture::Failure(result.Error()));
 }
 
-detail::ImportedFrame detail::ImportDecodedBgfxFrame(RenderBackend& backend, const media::VideoFrame& frame,
-                                                     media::VideoTextureOptions options, TextureTransferPolicy policy) {
-  using R = ImportedFrame;
+Result<ImportedVideoFrame, RenderError> ImportDecodedBgfxFrame(
+    RenderBackend& backend, const media::VideoFrame& frame, media::VideoTextureOptions options,
+    TextureTransferPolicy policy) {
+  using R = Result<ImportedVideoFrame, RenderError>;
   if (!frame.Validate() || !options.width || !options.height || options.width > 8192 || options.height > 8192 ||
       (options.fit != ImageFit::Contain && options.fit != ImageFit::Cover)) {
     return R::Failure({kInvalidFrame, "Invalid video frame or texture options"});
   }
   const auto fit = avkit::detail::FitVideoTexture(frame.format, options);
-  const auto wrap = [&](ImportedTexture surface) {
+  const auto wrap = [&](detail::ImportedTexture surface) {
     if (!surface.Succeeded()) return R::Failure(surface.Error());
     return R::Success({std::move(surface).Value(), fit.SourceToTextureUv(options)});
   };
@@ -363,7 +364,7 @@ Result<VideoPreviewImage, RenderError> MakeBgfxPreviewImage(
   if (policy == TextureTransferPolicy::GpuOnly || published.Error().code != kUnsupported) {
     return R::Failure(published.Error());
   }
-  auto bitmap = ReadBitmap(backend, surface);
+  auto bitmap = detail::ReadBgfxBitmap(backend, surface);
   if (!bitmap.Succeeded()) return R::Failure(bitmap.Error());
   return R::Success(std::move(bitmap).Value());
 }

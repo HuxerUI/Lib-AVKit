@@ -179,16 +179,35 @@ public:
 
   void CopyInputs(id<MTLTexture> outgoing, id<MTLTexture> incoming) {
     auto* commands = [queue_ commandBuffer];
-    auto* blit = [commands blitCommandEncoder];
-    Check(blit != nil, "Cannot prepare the PAG Metal texture copies");
-    const auto copy = [&](id<MTLTexture> source, id<MTLTexture> destination) {
-      [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                sourceSize:MTLSizeMake(source.width, source.height, 1)
-                 toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    };
-    copy(outgoing, from.metal);
-    copy(incoming, to.metal);
-    [blit endEncoding];
+    if (outgoing.pixelFormat == MTLPixelFormatBGRA8Unorm && incoming.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+      auto* blit = [commands blitCommandEncoder];
+      Check(blit != nil, "Cannot prepare the PAG Metal texture copies");
+      const auto copy = [&](id<MTLTexture> source, id<MTLTexture> destination) {
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                  sourceSize:MTLSizeMake(source.width, source.height, 1)
+                   toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+      };
+      copy(outgoing, from.metal);
+      copy(incoming, to.metal);
+      [blit endEncoding];
+    } else {
+      if (!conversion_) conversion_ = CreateConversionPipeline();
+      const auto stage = [&](id<MTLTexture> source, id<MTLTexture> destination) {
+        auto* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        auto* color = pass.colorAttachments[0];
+        color.texture = destination;
+        color.loadAction = MTLLoadActionDontCare;
+        color.storeAction = MTLStoreActionStore;
+        auto* encoder = [commands renderCommandEncoderWithDescriptor:pass];
+        Check(encoder != nil, "Cannot stage the PAG transition input on the GPU");
+        [encoder setRenderPipelineState:conversion_];
+        [encoder setFragmentTexture:source atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+      };
+      stage(outgoing, from.metal);
+      stage(incoming, to.metal);
+    }
     [commands commit];
     [commands waitUntilCompleted];
     Check(commands.status == MTLCommandBufferStatusCompleted, "The PAG Metal texture copies failed");
@@ -204,7 +223,36 @@ public:
   id<MTLDevice> device;
 
 private:
+  id<MTLRenderPipelineState> CreateConversionPipeline() const {
+    // Metal preserves logical RGBA channels when writing the OpenGL-compatible BGRA IOSurface.
+    constexpr auto source = R"(
+      #include <metal_stdlib>
+      using namespace metal;
+
+      vertex float4 stage_vertex(uint index [[vertex_id]]) {
+        return float4(index == 1 ? 3.0 : -1.0, index == 2 ? 3.0 : -1.0, 0.0, 1.0);
+      }
+
+      fragment float4 stage_fragment(float4 position [[position]], texture2d<float, access::read> pixels [[texture(0)]]) {
+        return pixels.read(uint2(position.xy));
+      }
+    )";
+    NSError* error = nil;
+    auto* library = [device newLibraryWithSource:[NSString stringWithUTF8String:source] options:nil error:&error];
+    if (!library) throw std::runtime_error(error ? error.localizedDescription.UTF8String :
+                                                   "Cannot compile the PAG Metal input conversion");
+    auto* config = [[MTLRenderPipelineDescriptor alloc] init];
+    config.vertexFunction = [library newFunctionWithName:@"stage_vertex"];
+    config.fragmentFunction = [library newFunctionWithName:@"stage_fragment"];
+    config.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    auto* pipeline = [device newRenderPipelineStateWithDescriptor:config error:&error];
+    if (!pipeline) throw std::runtime_error(error ? error.localizedDescription.UTF8String :
+                                                    "Cannot create the PAG Metal input conversion pipeline");
+    return pipeline;
+  }
+
   id<MTLCommandQueue> queue_;
+  id<MTLRenderPipelineState> conversion_ = nil;
 
 public:
   SharedTexture from, to;
@@ -215,10 +263,14 @@ private:
 
 id<MTLTexture> TextureFor(const ColorSurface& surface, PixelSize size) {
   auto texture = macos::GetMetalTexture(surface);
-  if (!texture || surface.pixels.image != ImageDesc{size, PixelFormat::Bgra8Unorm} ||
-      texture.pixelFormat != MTLPixelFormatBGRA8Unorm || texture.width != size.width || texture.height != size.height ||
-      surface.pixels.origin != RowOrigin::TopLeft || surface.alpha != AlphaMode::Premultiplied)
-    throw std::invalid_argument("PAG transition requires a completed top-left premultiplied BGRA8 Metal texture");
+  const auto format = surface.pixels.image.format;
+  const bool matches_format = texture &&
+      ((format == PixelFormat::Bgra8Unorm && texture.pixelFormat == MTLPixelFormatBGRA8Unorm) ||
+       (format == PixelFormat::Rgba8Unorm && texture.pixelFormat == MTLPixelFormatRGBA8Unorm));
+  if (!matches_format || surface.pixels.image.size != size || texture.width != size.width ||
+      texture.height != size.height || surface.pixels.origin != RowOrigin::TopLeft ||
+      surface.alpha != AlphaMode::Premultiplied)
+    throw std::invalid_argument("PAG transition requires completed top-left premultiplied RGBA8 or BGRA8 Metal textures");
   return texture;
 }
 

@@ -5,13 +5,17 @@
 #include "movie_renderer.h"
 #include "timeline_preview.h"
 #include "verification/tracking_fixture.h"
+#include "workbench_player.h"
 
+#include <huxerui/avkit/bgfx.h>
 #include <huxerui/avkit/pag.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 
 namespace avkit_preview {
@@ -44,8 +48,114 @@ Bytes Pixels(const ColorSurface& surface) {
   return ReadPreviewPixels(avkit::macos::GetMetalTexture(surface));
 }
 
+void VerifyWorkbenchPreview(const std::shared_ptr<const ProjectSnapshot>& project) {
+  auto* package = [NSBundle.mainBundle.resourceURL URLByAppendingPathComponent:@"HuxerUI" isDirectory:YES];
+  auto assets = LoadOverlayAssets(Resources::OpenPackage(File(package.fileSystemRepresentation)));
+  struct Frame {
+    WorkbenchFrame state;
+    std::uint64_t revision{};
+    Bytes pixels;
+  };
+  struct Pending {
+    WorkbenchFrame state;
+    PreviewFrameCommit commit;
+    std::uint64_t previous_revision;
+  };
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::optional<Pending> pending;
+  WorkbenchPlayer player(project->canvas, std::move(assets), [&](WorkbenchFrame frame, std::stop_token token,
+                                                               PreviewFrameCommit commit) {
+    const auto revision = frame.texture->Revision();
+    {
+      const std::lock_guard lock(mutex);
+      if (token.stop_requested()) return;
+      pending.emplace(std::move(frame), std::move(commit), revision);
+    }
+    ready.notify_one();
+  });
+  const auto prepare = [&](int at, std::optional<WorkbenchDrag> drag) {
+    const auto seconds = double(at) / kTimelinePreviewRate;
+    std::unique_lock lock(mutex);
+    player.Show(project, seconds, false, drag);
+    Check(ready.wait_for(lock, std::chrono::seconds(5), [&] { return pending.has_value(); }),
+          "The workbench did not prepare a paused frame");
+    auto frame = std::move(*std::exchange(pending, std::nullopt));
+    Check(frame.state.seconds == seconds && frame.state.drag == drag && !frame.state.playing,
+          "The prepared frame reported the wrong seek or drag state");
+    return frame;
+  };
+  const auto show = [&](int at, std::optional<WorkbenchDrag> drag = {}) {
+    auto frame = prepare(at, drag);
+    const auto texture = std::dynamic_pointer_cast<MetalTexture>(frame.state.texture);
+    Check(texture && frame.commit && texture->Revision() == frame.previous_revision,
+          "The workbench changed the texture before the application accepted the frame");
+    frame.commit();
+    Check(texture->Revision() == frame.previous_revision + 1, "The application commit did not publish the prepared frame");
+    MetalTexture::Origin origin{};
+    auto image = texture->AcquireFrame(origin);
+    Check(image != nil && origin == MetalTexture::Origin::TopLeft, "Cannot acquire the published workbench frame");
+    return Frame{std::move(frame.state), texture->Revision(), ReadPreviewPixels(image)};
+  };
+  const auto first = show(8);
+  {
+    const auto skipped = prepare(12, {});
+    Check(skipped.commit && skipped.previous_revision == first.revision, "Preparing a skipped frame changed the preview");
+  }
+  const auto forward = show(21);
+  Check(forward.revision == first.revision + 1, "A skipped frame reached the preview texture");
+  const auto backward = show(8);
+  const auto& sticker = project->overlays.at(1);
+  auto destination = sticker.destination;
+  destination.x -= 0.20F;
+  const auto moved = show(8, WorkbenchDrag{{sticker.id, {.translate_x = -0.20F}}, destination, sticker.rotation_degrees});
+  const auto restored = show(8);
+  std::uint64_t revision = first.revision;
+  for (const auto* frame : {&forward, &backward, &moved, &restored}) {
+    Check(frame->state.texture == first.state.texture && frame->revision > revision,
+          "The workbench replaced its texture or skipped a paused publication");
+    revision = frame->revision;
+  }
+  Check(first.pixels != forward.pixels && first.pixels == backward.pixels && first.pixels != moved.pixels &&
+            first.pixels == restored.pixels, "The published frame did not match a paused seek or sticker move");
+  std::cout << "Workbench preview kept one texture through forward and backward seek and paused PAG sticker movement\n";
+}
+
 std::shared_ptr<RenderPlan> FlatPlan(PixelSize size) {
   return std::make_shared<RenderPlan>(RenderPlan{{size, PixelFormat::Bgra8Unorm}, {{0, Blend::Replace}}});
+}
+
+void CheckPagTransitionFormats() {
+  const auto sample = [](PixelFormat format) {
+    const ImageDesc target{kTransitionCanvas, format};
+    TimelineRenderer renderer(target, CreateBgfxBackend(target));
+    auto plan = FlatPlan(target.size);
+    plan->target = target;
+    const auto picture = [&](bool incoming) {
+      // Distinct rows and unequal channels reveal a flipped image or an incorrect channel order.
+      auto pixels = std::make_shared<Bytes>();
+      for (std::uint32_t y = 0; y < target.size.height; ++y) {
+        for (std::uint32_t x = 0; x < target.size.width; ++x) {
+          pixels->push_back(std::byte(incoming ? 29 + x % 69 : 112 + x % 91));
+          pixels->push_back(std::byte(35 + y % 66));
+          pixels->push_back(std::byte(incoming ? 101 + y % 71 : 22 + y % 31));
+          pixels->push_back(std::byte{227});
+        }
+      }
+      const ColorSurface texture{RetainImagePixels({target.size, PixelFormat::Rgba8Unorm},
+          {BufferReference(*pixels, pixels), target.size.width * 4})};
+      return renderer.Render({plan, {texture}});
+    };
+    const auto from = picture(false), to = picture(true);
+    auto transition = OpenPreviewPagTransition(target.size);
+    const auto duration = Tick(kTransitionEnd - kTransitionStart);
+    return std::array{Pixels(transition->Sample(Tick(0), duration, from, to)),
+                      Pixels(transition->Sample(Tick(5), duration, from, to)),
+                      Pixels(transition->Sample(Tick(duration.ticks - 1), duration, from, to))};
+  };
+  Check(sample(PixelFormat::Bgra8Unorm) == sample(PixelFormat::Rgba8Unorm),
+        "The RGBA8 PAG transition changed the Metal input colors, alpha, or row order");
+  std::cout << "PAG transitions match for BGRA8 and RGBA8 inputs\n";
 }
 
 void CheckPagAlpha() {
@@ -350,9 +460,20 @@ std::vector<Bytes> VerifyTransitionPreview(const std::shared_ptr<const ProjectSn
   const auto next_out = flat_pixels(following.inputs[video_slot(following, next.outgoing_pass)]);
   const auto next_in = flat_pixels(following.inputs[video_slot(following, next.incoming_pass)]);
   {
-    const auto held = renderer.Draw(original);
-    Check(Pixels(renderer.Draw(following)) == expected.at(middle + 1) && Pixels(held) == expected.at(middle),
-          "A retained composite starved or changed during the following PAG transition frame");
+    auto preview = OpenBgfxPreviewTexture(project->canvas);
+    Check(preview.Succeeded(), "Could not open the PAG transition preview texture");
+    const auto texture = std::dynamic_pointer_cast<MetalTexture>(preview.Value()->Texture());
+    Check(texture != nullptr, "Expected a Metal preview texture");
+    const auto revision = texture->Revision();
+    auto pending = preview.Value()->Prepare(renderer.Timeline().Backend(), renderer.Draw(original));
+    Check(pending.Succeeded() && pending.Value(), "Could not defer presentation of the PAG frame");
+    Check(Pixels(renderer.Draw(following)) == expected.at(middle + 1) && texture->Revision() == revision,
+          "A pending preview starved the next PAG frame or was published early");
+    pending.Value()();
+    MetalTexture::Origin origin{};
+    const auto image = texture->AcquireFrame(origin);
+    Check(image != nil && origin == MetalTexture::Origin::TopLeft && texture->Revision() == revision + 1 &&
+              ReadPreviewPixels(image) == expected.at(middle), "The pending PAG frame changed before publication");
   }
   {
     auto pag = OpenPreviewPagTransition(project->canvas);
@@ -407,7 +528,7 @@ void ReportTransitionTiming(const std::shared_ptr<const ProjectSnapshot>& projec
             platform_frames += picture.Storage() == VideoStorage::Platform;
             return renderer.ImportFrame(picture);
           });
-      PreviewPagTransitionTiming timing;
+      PagTransitionRenderTiming timing;
       const auto start = std::chrono::steady_clock::now();
       renderer.Draw(frame, &timing);
       const auto finished = std::chrono::steady_clock::now();
@@ -629,6 +750,7 @@ void VerifyTimelinePagTransition(std::string_view document, std::string_view dir
 
 void VerifyTimelinePagOverlayBatch(std::string_view first, std::string_view second, std::string_view directory) {
   @autoreleasepool {
+    CheckPagTransitionFormats();
     CheckPointTextRendering();
     const File output(directory);
     Check(output.CreateDirectories(), "Cannot create the PAG overlay verification directory");
@@ -657,6 +779,7 @@ void VerifyTimelinePagOverlayBatch(std::string_view first, std::string_view seco
     const File saved(output, "overlay-batch.avkit");
     project.Save(saved);
     const auto snapshot = Project::Open(saved).Snapshot();
+    VerifyWorkbenchPreview(snapshot);
     const auto codecs = TimelineProviders();
     const auto sample = [](TimelineSession& session, MovieRenderer& renderer, int index) {
       return session.SampleVideo(Tick(index), PixelFormat::Bgra8Unorm, {},

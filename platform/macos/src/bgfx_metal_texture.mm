@@ -123,6 +123,30 @@ ImageSurface RetainTexture(id<MTLTexture> texture, PixelFormat format, RowOrigin
   return {image, origin, std::make_shared<MetalStorage>(texture)};
 }
 
+class MetalPreviewTexture final : public BgfxPreviewTexture {
+public:
+  explicit MetalPreviewTexture(PixelSize size)
+      : texture_(std::make_shared<MetalTexture>(Size{float(size.width), float(size.height)})) {}
+
+  std::shared_ptr<ExternalTexture> Texture() const override { return texture_; }
+  void Finish() noexcept override { texture_->Finish(); }
+
+  void PublishFrame(const ColorSurface& surface) override { Publish(*texture_, surface); }
+
+private:
+  PreviewFrameCommit PrepareFrame(const ColorSurface& surface) override {
+    return [texture = texture_, surface] { Publish(*texture, surface); };
+  }
+
+  static void Publish(MetalTexture& texture, const ColorSurface& surface) {
+    texture.Publish({.texture = TextureFromSurface(surface.pixels),
+        .origin = surface.pixels.origin == RowOrigin::TopLeft ? MetalTexture::Origin::TopLeft : MetalTexture::Origin::BottomLeft,
+        .alpha = MetalTexture::Alpha::Premultiplied});
+  }
+
+  std::shared_ptr<MetalTexture> texture_;
+};
+
 class MetalTextureBridge final : public detail::BgfxTextureBridge {
 public:
   explicit MetalTextureBridge(id<MTLDevice> device) : device_(device) {}
@@ -204,13 +228,10 @@ public:
   detail::PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp) override {
     using R = detail::PublishedTexture;
     try {
-      const auto [width, height] = surface.pixels.image.size;
-      auto mailbox = std::make_shared<MetalTexture>(Size{float(width), float(height)});
-      mailbox->Publish({.texture = TextureFromSurface(surface.pixels),
-                        .origin = surface.pixels.origin == RowOrigin::TopLeft
-                                      ? MetalTexture::Origin::TopLeft : MetalTexture::Origin::BottomLeft});
-      mailbox->Finish();
-      return R::Success(std::move(mailbox));
+      MetalPreviewTexture preview(surface.pixels.image.size);
+      preview.PublishFrame(surface);
+      preview.Finish();
+      return R::Success(preview.Texture());
     } catch (const std::exception& error) {
       return R::Failure({RenderErrorCode::Unsupported, error.what()});
     }
@@ -316,13 +337,19 @@ id<MTLTexture> GetMetalTexture(const render::ColorSurface& surface) {
 
 namespace huxerui::avkit::render::detail {
 
+std::unique_ptr<BgfxPreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize size) {
+  return std::make_unique<macos::MetalPreviewTexture>(size);
+}
+
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
   if (init.swapChain.nwh) {
     init.type = bgfx::RendererType::Metal;
     return CreateBgfxBackend(target, init);
   }
   @autoreleasepool {
-    return macos::CreateBgfxBackend(MTLCreateSystemDefaultDevice(), target);
+    // PAG needs both clip surfaces while the previous composite may still await presentation.
+    constexpr std::size_t kOutputSlots = 3;
+    return macos::CreateBgfxBackend(MTLCreateSystemDefaultDevice(), target, kOutputSlots);
   }
 }
 

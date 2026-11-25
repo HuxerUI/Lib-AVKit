@@ -103,6 +103,10 @@ android {
     }
 }
 
+androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { variant ->
+    variant.packaging.jniLibs.useLegacyPackaging.set(true)
+}
+
 androidComponents.onVariants(androidComponents.selector().all()) { variant ->
     def integrationRoot = layout.buildDirectory.dir("generated/huxerui/integration/${variant.name}").get().asFile
     variant.externalNativeBuild.arguments.add("-DHUXERUI_ANDROID_APP_INTEGRATION_ROOT=${integrationRoot.absolutePath}")

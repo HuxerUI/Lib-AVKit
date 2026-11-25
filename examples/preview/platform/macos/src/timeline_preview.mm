@@ -2,6 +2,7 @@
 
 #include "metal_preview.h"
 #include "movie_renderer.h"
+#include "workbench_platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,8 +44,6 @@ render::ColorSurface DrawTimelineSample(TimelineSession& session, MovieRenderer&
 }
 
 } // namespace
-
-MovieCodecProviders TimelineProviders() { return {CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()}; }
 
 void RenderTimelineSample(TimelineSession& session, MovieRenderer& renderer, MediaTimestamp at, MetalTexture& mailbox,
                           std::stop_token stop) {
@@ -136,13 +135,8 @@ void ExportComposedTimeline(std::shared_ptr<const ProjectSnapshot> project, cons
   settings.policy = policy;
   settings.video = PreviewVideoConfig(project->canvas);
   settings.video.frame_rate_numerator = kTimelinePreviewRate;
-  ExportTimeline(std::move(project), file, providers, settings,
-      [&](const TimelineFrame& frame, const VideoEncoderConfig& bound, MediaTimestamp duration) {
-        @autoreleasepool {
-          if (on_frame) on_frame(frame.pts);
-          return renderer.EncoderFrame(renderer.Draw(frame), bound, frame.pts, duration);
-        }
-      }, std::move(on_fallback), std::move(analyzer), [&](const auto& video) { return renderer.ImportFrame(video); });
+  ExportRenderedTimeline(std::move(project), file, providers, renderer.Timeline(), settings,
+                         std::move(on_fallback), std::move(analyzer), on_frame);
 }
 
 void ExportTimelinePreview(std::string_view path, std::string_view destination, bool software_only,

@@ -68,10 +68,21 @@ endif ()
 
 target_include_directories(example_av_kit PRIVATE src "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
 
-if (IOS OR ANDROID OR WIN32)
-    target_sources(example_av_kit PRIVATE src/capture_camera.cpp)
-elseif (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        enable_language(OBJCXX)
+    endif ()
+    avkit_add_capture_target()
+    target_link_libraries(example_av_kit PRIVATE AVKit::Capture)
+    target_sources(example_av_kit PRIVATE src/capture_camera.cpp src/capture_avkit_device.cpp)
+elseif (IOS OR WIN32)
+    target_sources(example_av_kit PRIVATE src/capture_camera.cpp src/capture_camera_device.cpp)
+else ()
     target_sources(example_av_kit PRIVATE src/capture_unavailable.cpp)
+endif ()
+
+if (ANDROID OR IOS OR WIN32)
+    target_sources(example_av_kit PRIVATE src/capture_commands_unavailable.cpp)
 endif ()
 
 if (IOS)
@@ -83,30 +94,38 @@ if (IOS)
     huxerui_use_library(example_av_kit TARGET flecs::flecs_static)
 endif ()
 
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_sources(example_av_kit PRIVATE src/workbench_commands_unavailable.cpp)
+endif ()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
-    target_sources(example_av_kit PRIVATE src/workbench_overlay.cpp src/workbench_photo.cpp)
+    target_sources(example_av_kit PRIVATE
+            src/timeline_playback.cpp
+            src/timeline_resources.cpp
+            src/timeline_strip.cpp
+            src/workbench_monitor.cpp
+            src/workbench_overlay.cpp
+            src/workbench_photo.cpp
+            src/workbench_player.cpp
+    )
+    target_link_libraries(example_av_kit PRIVATE bimg_decode bimg)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    enable_language(OBJCXX)
     target_sources(example_av_kit PRIVATE
             src/capture.cpp
             src/sticker_scene.cpp
-            src/timeline_playback.cpp
-            src/timeline_strip.cpp
             src/timeline_strip_view.cpp
             src/verification/tracking_fixture.cpp
-            src/workbench_monitor.cpp
             platform/macos/src/file_preview.mm
-            platform/macos/src/live_capture.mm
+            platform/macos/verification/camera_recording_verify.cpp
             platform/macos/src/media_commands.cpp
             platform/macos/src/metal_preview.mm
             platform/macos/src/movie_renderer.mm
             platform/macos/src/timeline_preview.mm
             platform/macos/src/timeline_strip_macos.mm
-            platform/macos/src/workbench_media.cpp
             platform/macos/src/workbench_input.mm
-            platform/macos/src/workbench_player.mm
+            platform/macos/src/workbench_platform.mm
             platform/macos/verification/timeline_depth_verify.mm
             platform/macos/verification/timeline_mask_verify.mm
             platform/macos/verification/timeline_ncnn_verify.mm
@@ -125,7 +144,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/macos/src"
     )
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
-    target_link_libraries(example_av_kit PRIVATE "-framework CoreImage" "-framework ImageIO")
+    target_link_libraries(example_av_kit PRIVATE "-framework ImageIO")
     if (AVKIT_PAG_LIBRARY MATCHES "^(.*\\.framework)/")
         set(avkit_pag_framework "${CMAKE_MATCH_1}")
         get_filename_component(avkit_pag_framework_name "${avkit_pag_framework}" NAME)
@@ -136,18 +155,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
                 VERBATIM)
     endif ()
 elseif (ANDROID)
-    target_sources(example_av_kit PRIVATE
-            src/timeline_playback.cpp
-            src/timeline_strip.cpp
-            src/workbench_monitor.cpp
-            platform/android/src/workbench_media.cpp
-            platform/android/src/workbench_player.cpp
-            platform/android/src/workbench_thumbnail.cpp
-    )
-    target_include_directories(example_av_kit PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../platform/android/src"
-    )
-    target_link_libraries(example_av_kit PRIVATE android EGL GLESv3 log)
+    target_sources(example_av_kit PRIVATE platform/android/src/workbench_platform.cpp)
+    target_link_libraries(example_av_kit PRIVATE log)
 else ()
     target_sources(example_av_kit PRIVATE
             src/workbench_media_unavailable.cpp

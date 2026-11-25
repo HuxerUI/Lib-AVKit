@@ -14,6 +14,22 @@
 
 namespace avkit_preview {
 
+std::optional<huxerui::View> RequestedFilePreview() {
+  using namespace huxerui;
+  const auto timeline = HasTimelinePreview();
+  if (!timeline && !HasFilePreview()) return std::nullopt;
+  static const auto texture = timeline ? CreateTimelinePreview() : CreateFilePreview();
+  if (TimelineStripOptions()) return TimelineStripPreview(texture);
+  const auto seek = timeline ? SeekTimelinePreview : SeekFilePreview;
+  return Column {
+    Image(texture).Fit(ImageFit::Contain).With(Grow()),
+    Row {
+      Button("Start").OnClick([seek] { seek(false); }),
+      Button("Middle").OnClick([seek] { seek(true); }),
+    }.With(Spacing(8.0F), MainAlign(MainAxisAlignment::Center)),
+  }.With(Padding(8.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
 std::optional<int> RunFileMediaCommand(int argc, const char** argv) {
   if (argc > 1 && std::string_view(argv[1]).starts_with("--timeline-")) {
     try {

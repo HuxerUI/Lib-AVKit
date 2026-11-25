@@ -12,9 +12,11 @@ Lib-AVKit is a C++20 audio and video post-processing library for HuxerUI. It pro
 | `AVKit::Bgfx` | Shared GPU compositor with platform shader binaries and SDK texture transfer. |
 | `AVKit::NCNN` | Cross-platform CPU provider for face, body, and hand landmarks and portrait segmentation. |
 | `AVKit::PAG` | PAG animation, editable text and image slots, and platform transition interop. |
+| `AVKit::Render` | Timeline compositing, versioned effect resource resolution, and texture transfer for preview and export. |
+| `AVKit::Capture` | Camera frame processing, synchronized microphone input, and composited recording on macOS and Android. |
 | `HuxerUI::AVKit` | HuxerUI application hook and the combined AVKit library targets. |
 
-Core and the media orchestration use public HuxerUI and Lib-Media types. The file profile accepts MP4 or MOV with 8-bit SDR H.264 or HEVC video and optional AAC-LC audio. The workbench integrates file editing on macOS and Android. Camera capture is wired on macOS, iOS, Android, and Windows. [Platform plan](docs/architecture.md#external-video-frames)
+Core and the media orchestration use public HuxerUI and Lib-Media types. The file profile accepts MP4 or MOV with 8-bit SDR H.264 or HEVC video and optional AAC-LC audio. The workbench integrates file editing on macOS and Android. The workbench uses AVKit recording on macOS and Android and Camera-managed recording on iOS and Windows. [Platform plan](docs/architecture.md#external-video-frames)
 
 ## Repository layout
 
@@ -75,6 +77,10 @@ The AAR must contain `libpag.so` and its runtime libraries for every selected AB
 All supported platforms build the bgfx compositor. Cross builds compile the pinned `shaderc` for the host with the host C++ toolchain. Set `AVKIT_BGFX_SHADERC` to reuse an existing host executable built from the same revision. The compositor uses Metal on macOS and iOS, OpenGL ES 3 on Android, WebGL 2 on Web, and D3D11 for Windows builds hosted on Windows. Other Windows builds use Vulkan. Linux uses OpenGL for a current compatible GDK/EGL context and Vulkan for independent rendering. Linux builds use GTK, epoxy, EGL, X11, and XCB development headers. [Compositor API](include/huxerui/avkit/bgfx.h)
 
 The [video texture API](include/huxerui/avkit/video_texture.h) accepts HuxerUI capture textures, Lib-Media platform decoder textures, and FFmpeg-decoded CPU planes. File preview and export retry a rejected decoder texture in FFmpeg at the same source PTS. Timeline rendering applies the same retry to the affected clip when supplied with an input importer. File and timeline export can restart with a CPU encoder when platform encoder transfer fails.
+
+Use [`TimelineRenderer`](include/huxerui/avkit/timeline_renderer.h) to resolve and execute a sampled timeline frame. Supply resource callbacks for stickers, mask sequences, and PAG compositions. The renderer owns the texture and composition caches. Bind an existing render plan with `Render` for a live scene, and call `EncoderFrame` to preserve the output timestamp through encoder transfer. The host application controls presentation and editing state.
+
+Applications with `HuxerUI::Camera` resolved can call `avkit_add_capture_target()` and link `AVKit::Capture` on macOS and Android. Use [`CameraRecording`](include/huxerui/avkit/camera_recording.h) to connect Camera's frame processor and give the recorder an AudioCapture reader. The application owns permissions, preview layout, and destination selection.
 
 The ncnn provider accepts verified [YuNet](models/yunet/2023mar) and [MediaPipe body and hand](models/mediapipe/body-hand) model packs through the [C++ factories](include/huxerui/avkit/ncnn.h). See the [tracking verification](docs/architecture.md#ncnn-body-and-hand-provider) for the macOS preview, seek, and export commands.
 

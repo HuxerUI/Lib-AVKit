@@ -56,5 +56,6 @@ std::unique_ptr<RenderBackend> CreateBgfxBackend(ImageDesc target, const bgfx::I
 
 /// @brief Configures platform-specific context and texture sharing for the compositor.
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init);
+std::unique_ptr<BgfxPreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize size);
 
 } // namespace huxerui::avkit::render::detail

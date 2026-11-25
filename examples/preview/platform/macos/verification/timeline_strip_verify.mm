@@ -183,7 +183,7 @@ void VerifySourceCaches(const ProjectSnapshot& project, const ProjectSnapshot& r
                         const std::vector<std::int16_t>& pcm, const std::vector<std::int16_t>& replacement_pcm) {
   verification::DecoderUsage usage;
   const MovieCodecProviders counted{providers.platform, std::make_shared<verification::ObservedCodecProvider>(providers.software, &usage)};
-  AssetSampler sampler(counted, MakeStripThumbnail, kSoftware);
+  AssetSampler sampler(counted, OpenCanvasThumbnailSource(), kSoftware);
   const auto id = project.assets.front().id;
   ThumbnailRequest request{id, movie.video.id, {Tick(12), {1001, 1000}, {1501, 1000}}, {96, 54}};
   const auto pictures = sampler.ReadThumbnails(project, request);
@@ -228,7 +228,7 @@ public:
       if (index <= 3 && !changed_.wait_for(lock, 6s, [&] { return released_ >= index; }))
         throw std::runtime_error("Timed out waiting for a newer viewport");
     }
-    return MakeStripThumbnail(frame, size);
+    return thumbnail_(frame, size);
   }
 
   unsigned Entered() {
@@ -243,6 +243,7 @@ public:
   }
 
 private:
+  const MakeThumbnail thumbnail_ = OpenCanvasThumbnailSource();
   const std::thread::id playback_ = std::this_thread::get_id();
   std::mutex mutex_;
   std::condition_variable changed_;
@@ -276,7 +277,7 @@ void VerifyTimelineStrip(std::string_view first, std::string_view next, std::str
       std::condition_variable changed;
       std::shared_ptr<const StripResult> strip;
       std::shared_ptr<const StripResult> first_picture;
-      StripWorker worker(providers, MakeStripThumbnail);
+      StripWorker worker(providers, OpenCanvasThumbnailSource());
       worker.Schedule(base, VisibleStrip(*base, 0, 0), [&](std::shared_ptr<const StripResult> result) {
         std::scoped_lock lock(mutex);
         strip = std::move(result);

@@ -10,9 +10,13 @@
 
 namespace avkit_preview {
 
+inline constexpr std::size_t kPreviewWipeFrameCount = 8;
+
 struct OverlayAssets {
   std::array<huxerui::BufferReference, 4> stickers;
-  huxerui::BufferReference editable, point_text, font;
+  huxerui::BufferReference editable, point_text, font, replacement_image, transition;
+  std::array<huxerui::BufferReference, kPreviewWipeFrameCount> wipe_masks;
+  std::array<huxerui::BufferReference, 3> clip_masks;
 };
 
 struct WorkbenchSticker {

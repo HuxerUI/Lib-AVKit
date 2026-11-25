@@ -9,7 +9,6 @@ namespace avkit_preview {
 using namespace huxerui;
 using namespace huxerui::avkit;
 
-void InstallWorkbenchMedia(ApplicationContext&) {}
 
 bool HasWorkbenchMedia() { return false; }
 
@@ -35,16 +34,13 @@ AssetReference PrepareWorkbenchPhoto(Bitmap, const File&) {
   throw std::logic_error("Photo import is unavailable in this build");
 }
 
-std::optional<View> RequestedFilePreview() { return std::nullopt; }
-std::optional<int> RunFileMediaCommand(int, const char**) { return std::nullopt; }
-
 std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectSnapshot>, StripViewport) {
   return {};
 }
 
 [[huxerui::composable]]
 View EditorMonitor(WorkbenchContext, std::shared_ptr<const ProjectSnapshot>, EditorTransport, bool wide, std::function<void()> back, std::function<void()>,
-                   EditorMonitorViews, std::optional<VisualTransformOverride>) {
+                   EditorMonitorViews, std::optional<WorkbenchDrag>) {
   const auto& theme = UseTheme();
   return WorkbenchPanel(Column{
       wide ? View{} : WorkbenchCompactAction(Row{

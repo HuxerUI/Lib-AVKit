@@ -2,9 +2,12 @@
 
 #include <functional>
 #include <memory>
+#include <stop_token>
 #include <string>
 
 #include <huxerui/avkit/project.h>
+#include <huxerui/avkit/timeline.h>
+#include <huxerui/avkit/video_texture.h>
 #include <huxerui/external_texture.h>
 
 #include "workbench_overlay.h"
@@ -18,16 +21,32 @@ struct WorkbenchPlayback {
   bool operator==(const WorkbenchPlayback&) const = default;
 };
 
+struct WorkbenchDrag {
+  huxerui::avkit::VisualTransformOverride layout;
+  huxerui::Rect bounds;
+  float degrees;
+  bool operator==(const WorkbenchDrag&) const = default;
+};
+
+struct WorkbenchFrame {
+  std::shared_ptr<huxerui::ExternalTexture> texture;
+  std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project;
+  std::optional<WorkbenchDrag> drag;
+  double seconds;
+  bool playing;
+  bool operator==(const WorkbenchFrame&) const = default;
+};
+
 class WorkbenchPlayer {
 public:
-  WorkbenchPlayer(huxerui::avkit::PixelSize canvas, OverlayAssets assets);
+  using Present = std::function<void(WorkbenchFrame, std::stop_token, huxerui::avkit::render::PreviewFrameCommit)>;
+  WorkbenchPlayer(huxerui::avkit::PixelSize canvas, OverlayAssets assets, Present present);
   ~WorkbenchPlayer();
-  std::shared_ptr<huxerui::ExternalTexture> Texture() const;
   WorkbenchPlayback Status() const;
   bool Closed() const;
   void Close();
   void Show(std::shared_ptr<const huxerui::avkit::ProjectSnapshot> revision, double seconds, bool play,
-            std::optional<huxerui::avkit::VisualTransformOverride> layout = {});
+            std::optional<WorkbenchDrag> drag = {});
 
 private:
   struct Impl;

@@ -83,4 +83,16 @@ include(cmake/AVKitBgfx.cmake)
 include(cmake/AVKitMedia.cmake)
 include(cmake/AVKitNCNN.cmake)
 include(cmake/AVKitPAG.cmake)
-target_link_libraries(huxerui_avkit PUBLIC AVKit::Bgfx AVKit::FFmpeg AVKit::NCNN AVKit::PAG)
+
+add_library(avkit_render STATIC src/render/thumbnail_source.cpp src/render/timeline_renderer.cpp)
+add_library(AVKit::Render ALIAS avkit_render)
+target_include_directories(avkit_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if (ANDROID)
+    target_include_directories(avkit_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/src")
+endif ()
+target_link_libraries(avkit_render PUBLIC AVKit::Bgfx AVKit::Media AVKit::PAG)
+set_target_properties(avkit_render PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries(huxerui_avkit PUBLIC AVKit::Render AVKit::FFmpeg AVKit::NCNN)
+
+include(cmake/AVKitCapture.cmake)

@@ -15,6 +15,7 @@
 #include <string>
 
 #include <huxerui/avkit/codec.h>
+#include <huxerui/avkit/render.h>
 #include <huxerui/file.h>
 #include <huxerui/media_container.h>
 
@@ -119,6 +120,9 @@ private:
 
 /// @brief Requested video output, AAC bitrate in bits per second, and provider policy.
 struct FileExportSettings {
+  /// @brief Builds limited-range BT.709 settings with the exact-trim AAC policy for this platform.
+  static FileExportSettings Sdr(PixelSize size);
+
   media::VideoEncoderConfig video;
   std::uint32_t audio_bitrate{128000};
   CodecPolicy policy{CodecPolicy::Auto};

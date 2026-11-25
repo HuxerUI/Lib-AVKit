@@ -1,19 +1,14 @@
 #include "capture_preview.h"
+
+#include "capture_device.h"
 #include "workbench_media.h"
 
-#include <atomic>
-#include <cmath>
-#include <numbers>
 #include <stdexcept>
 #include <utility>
 
-#include <huxerui/camera.h>
-
 namespace avkit_preview {
-namespace {
 
 using namespace huxerui;
-using namespace std::chrono_literals;
 
 Task<void> RequestCapturePermission(ApplicationHandle application, Permission permission) {
   if (co_await application.CheckPermissionAsync(permission) != PermissionStatus::Granted &&
@@ -21,58 +16,6 @@ Task<void> RequestCapturePermission(ApplicationHandle application, Permission pe
     throw std::runtime_error(permission == Permission::Camera ? "需要相机权限" : "需要麦克风权限");
   }
 }
-
-class VoiceProcessor final : public audio::PcmProcessor {
-public:
-  VoiceProcessor(media::AudioFormat format, std::shared_ptr<std::atomic_bool> enabled)
-      : format_(format), enabled_(std::move(enabled)) {}
-
-  audio::PcmTiming Timing() const noexcept override { return audio::PcmTiming::CaptureTime; }
-
-  audio::CaptureResult<void> Process(std::span<const std::int16_t> pcm) override {
-    output_.emplace(pcm.begin(), pcm.end());
-    const auto channels = format_.ChannelCount();
-    const auto rate = format_.sample_rate;
-    const auto frames = pcm.size() / channels;
-    if (enabled_->load(std::memory_order_relaxed)) {
-      for (std::size_t frame = 0; frame < frames; ++frame) {
-        const auto position = (sample_ + frame) % rate;
-        const auto gain = 0.15 + 0.85 * std::sin(2 * std::numbers::pi * 68 * position / rate);
-        for (std::size_t channel = 0; channel < channels; ++channel) {
-          auto& sample = (*output_)[frame * channels + channel];
-          sample = static_cast<std::int16_t>(std::lround(sample * gain));
-        }
-      }
-    }
-    sample_ = (sample_ + frames) % rate;
-    return audio::CaptureResult<void>::Success();
-  }
-
-  audio::CaptureResult<std::optional<audio::PcmBlock>> TryRead() override {
-    return audio::CaptureResult<std::optional<audio::PcmBlock>>::Success(std::exchange(output_, std::nullopt));
-  }
-
-  audio::CaptureResult<void> Finish() override { return audio::CaptureResult<void>::Success(); }
-
-private:
-  media::AudioFormat format_;
-  std::shared_ptr<std::atomic_bool> enabled_;
-  std::optional<audio::PcmBlock> output_;
-  std::size_t sample_{};
-};
-
-struct CaptureDevice {
-  huxerui::View preview;
-  bool ready{};
-  bool recording{};
-  bool paused{};
-  double seconds{};
-  std::string error;
-  std::function<huxerui::Task<void>(huxerui::File)> photo;
-  std::function<huxerui::Task<void>(huxerui::File)> record;
-  std::function<void(bool)> pause;
-  std::function<void()> stop;
-};
 
 void WriteCaptureFile(const File& file, std::span<const std::byte> bytes) {
   if (bytes.empty()) throw std::runtime_error("Capture returned an empty file");
@@ -87,92 +30,10 @@ void WriteCaptureFile(const File& file, std::span<const std::byte> bytes) {
   }
 }
 
-CaptureDevice UseCaptureDevice(State<bool> robot_voice) {
-  const auto application = UseApplication();
-  const auto tasks = UseTaskScope();
-  const auto camera_active = UseState(false);
-  const auto microphone_active = UseState(false);
-  const auto permission_error = UseState(std::string{});
-  const auto seconds = UseState(0.0);
-  const auto enabled = UseState(std::make_shared<std::atomic_bool>(false)).Get();
-  const auto voice = UseState(std::make_shared<const audio::PcmProcessorFactory>([enabled](const auto& format) {
-    return std::make_unique<VoiceProcessor>(format, enabled);
-  })).Get();
-  const bool robot = robot_voice.Get();
-  Lifecycle([enabled, robot] { enabled->store(robot, std::memory_order_relaxed); }, robot);
-  const auto microphone = audio::UseAudioCapture({.active = microphone_active,
-      .sample_rate = 48'000, .channel_layout = media::AudioChannelLayout::Mono, .pcm_processor = voice});
-  const auto camera = camera::UseCamera({.active = camera_active, .preferred_capture_pixel_width = 1280,
-      .preferred_capture_pixel_height = 720, .preferred_capture_fps = 30});
-  const auto status = camera.Status();
-  Lifecycle([application, tasks, camera_active, permission_error] {
-    tasks.Launch([=]() -> Task<void> {
-      try {
-        co_await RequestCapturePermission(application, Permission::Camera);
-        camera_active = true;
-      } catch (const std::exception& error) { permission_error = std::string(error.what()); }
-    });
-  });
-  Lifecycle([camera, tasks, seconds, recording = status.recording_video] {
-    if (!recording) return;
-    tasks.Launch([=]() -> Task<void> {
-      while (camera.Status().recording_video) {
-        seconds = std::chrono::duration<double>(camera.RecordedDuration()).count();
-        co_await Delay(80ms);
-      }
-    });
-  }, status.recording_video);
-
-  return {
-    .preview = camera::CameraPreview(camera, {.fit = ImageFit::Contain, .mirror = camera::MirrorMode::Off}).With(Grow()),
-    .ready = status.state == camera::SessionState::Running && status.preview.has_value(),
-    .recording = status.recording_video,
-    .paused = status.recording_paused,
-    .seconds = seconds.Get(),
-    .error = status.error ? status.error->message : permission_error.Get(),
-    .photo = [camera](File destination) -> Task<void> {
-      const auto photo = co_await camera.CapturePhotoAsync();
-      if (!photo.Succeeded()) throw std::runtime_error(photo.Error().message);
-      WriteCaptureFile(destination, photo.Value().EncodedBytes());
-    },
-    .record = [=](File destination) -> Task<void> {
-      seconds = 0.0;
-      co_await RequestCapturePermission(application, Permission::Microphone);
-      microphone_active = true;
-      try {
-        const auto deadline = std::chrono::steady_clock::now() + 10s;
-        for (;;) {
-          const auto capture = microphone.Status();
-          if (capture.error) throw std::runtime_error(capture.error->message);
-          if (capture.state == audio::SessionState::Running && capture.format) break;
-          if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("麦克风未返回音频");
-          co_await Delay(40ms);
-        }
-        const auto result = co_await camera.RecordVideoAsync(destination, microphone);
-        if (!result.Succeeded()) {
-          (void)destination.Delete();
-          throw std::runtime_error(result.Error().message);
-        }
-      } catch (...) {
-        microphone_active = false;
-        throw;
-      }
-      microphone_active = false;
-    },
-    .pause = [camera](bool paused) { if (paused) camera.PauseRecording(); else camera.ResumeRecording(); },
-    .stop = [camera] { camera.StopRecording(); },
-  };
-}
-
-} // namespace
-
 void InstallPreviewCapture(ApplicationContext& context) {
   camera::Install(context);
   audio::Install(context);
 }
-
-std::optional<View> RequestedCapturePreview() { return std::nullopt; }
-std::optional<int> RunCaptureCommand(int, const char**) { return std::nullopt; }
 
 [[huxerui::composable]]
 View WorkbenchCapture(File data, State<bool> occupied, std::function<void(File)> add_movie,
@@ -182,11 +43,12 @@ View WorkbenchCapture(File data, State<bool> occupied, std::function<void(File)>
   const auto picker = UseService<FilePicker>();
   const auto photo_mode = UseState(false);
   const auto robot = UseState(false);
+  const auto sticker = UseState(true);
   const auto stopping = UseState(false);
   const auto photo = UseState(std::optional<File>{});
   const auto movie = UseState(std::optional<File>{});
   const auto message = UseState(std::string{});
-  auto device = UseCaptureDevice(robot);
+  auto device = UseCaptureDevice(robot, sticker);
   const bool taking_photo = photo_mode.Get();
   const bool busy = occupied.Get();
   const auto latest = taking_photo ? photo.Get() : movie.Get();
@@ -228,7 +90,11 @@ View WorkbenchCapture(File data, State<bool> occupied, std::function<void(File)>
   View overlay = Column{
     Row{WorkbenchControl(Button(robot.Get() ? "机器人变声" : "原声").OnClick([robot] { robot = !robot.Get(); })
         .With(Enabled(!taking_photo)), theme, WorkbenchActionTone::Surface, true),
-        View(Spacer()).With(Grow())}.With(Padding(10.0F)),
+        View(Spacer()).With(Grow()),
+        device.sticker_available ? WorkbenchControl(Button(sticker.Get() ? "贴纸已开启" : "开启贴纸")
+            .OnClick([sticker] { sticker = !sticker.Get(); }).With(Enabled(!taking_photo)),
+            theme, WorkbenchActionTone::Surface, true) : View{},
+    }.With(Padding(10.0F)),
     View(Spacer()).With(Grow()),
     busy && !taking_photo ? View(Row{
         Text(status + std::string("  ") + WorkbenchTimelineTime(device.seconds, true)).Style(

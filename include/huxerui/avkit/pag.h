@@ -141,7 +141,7 @@ public:
   PagTransition(const PagTransition&) = delete;
   PagTransition& operator=(const PagTransition&) = delete;
 
-  /// @brief Samples the half-open overlap with two completed, premultiplied BGRA8 textures.
+  /// @brief Samples the half-open overlap with two completed, premultiplied RGBA8 or BGRA8 textures.
   /// Inputs use the declared size and top-left origin on one GPU device. The returned premultiplied
   /// GPU surface remains immutable while leased. Both images are rebound on every sample.
   render::ColorSurface Sample(media::MediaTimestamp offset, media::MediaTimestamp duration,

@@ -1,7 +1,7 @@
 #include <GLES3/gl3.h>
 #include <huxerui/android/external_texture.h>
 
-#include "bgfx_gles_texture.h"
+#include "android_canvas_texture.h"
 #include "gl_texture_bridge.h"
 
 namespace huxerui::avkit::render::detail {
@@ -30,9 +30,13 @@ void CopyIntoPublicationTexture(GLuint source, GLuint destination, PixelSize siz
   if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot copy the composite for EGL publication");
 }
 
-void PublishGlFrame(android::GlTexture& mailbox, GLuint name, PixelSize size) {
+void PublishGlFrame(android::GlTexture& mailbox, GLuint name, const ColorSurface& surface) {
+  const auto size = surface.pixels.image.size;
+  using Origin = android::GlTexture::Origin;
   android::GlTexture::Frame frame{.texture_name = name, .pixel_width = static_cast<int>(size.width),
-                                 .pixel_height = static_cast<int>(size.height)};
+      .pixel_height = static_cast<int>(size.height),
+      .origin = surface.pixels.origin == RowOrigin::TopLeft ? Origin::TopLeft : Origin::BottomLeft,
+      .alpha = android::GlTexture::Alpha::Premultiplied};
   try {
     mailbox.PublishCurrent(frame);
   } catch (const std::runtime_error&) {
@@ -43,6 +47,50 @@ void PublishGlFrame(android::GlTexture& mailbox, GLuint name, PixelSize size) {
     mailbox.PublishCurrent(frame);
   }
 }
+
+class GlPreviewTexture final : public BgfxPreviewTexture {
+public:
+  explicit GlPreviewTexture(PixelSize size)
+      : texture_(std::make_shared<android::GlTexture>(Size{float(size.width), float(size.height)})) {}
+
+  std::shared_ptr<ExternalTexture> Texture() const override { return texture_; }
+  void Finish() noexcept override { texture_->Finish(); }
+
+  void PublishFrame(const ColorSurface& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+    if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
+    PublishGlFrame(*texture_, storage->name->texture, surface);
+  }
+
+private:
+  std::shared_ptr<android::GlTexture> texture_;
+};
+
+class CanvasPreviewTexture final : public BgfxPreviewTexture {
+public:
+  CanvasPreviewTexture(PixelSize size, JavaVM* vm)
+      : texture_(std::make_shared<android::BitmapTexture>(Size{float(size.width), float(size.height)})), vm_(vm) {}
+
+  std::shared_ptr<ExternalTexture> Texture() const override { return texture_; }
+  void Finish() noexcept override { texture_->Finish(); }
+
+private:
+  PreviewFrameCommit PrepareFrame(const ColorSurface& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+    if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
+    return PrepareAndroidCanvasTexture(texture_, vm_, storage->name->texture, surface.pixels.image.size,
+                                       surface.pixels.origin);
+  }
+
+  void PublishFrame(const ColorSurface& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+    if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
+    PublishAndroidCanvasTexture(*texture_, vm_, storage->name->texture, surface.pixels.image.size, surface.pixels.origin);
+  }
+
+  std::shared_ptr<android::BitmapTexture> texture_;
+  JavaVM* vm_;
+};
 
 class GlesTextureBridge final : public GlTextureBridge {
 public:
@@ -81,12 +129,11 @@ public:
     using R = PublishedTexture;
     const auto name = static_cast<GLuint>(GetTexture(surface.pixels));
     if (!name) return R::Failure({RenderErrorCode::Unsupported, "Expected a completed GL render target"});
-    const auto [width, height] = surface.pixels.image.size;
     try {
-      auto mailbox = std::make_shared<android::GlTexture>(Size{float(width), float(height)});
-      PublishGlFrame(*mailbox, name, {width, height});
-      mailbox->Finish();
-      return R::Success(std::move(mailbox));
+      GlPreviewTexture preview(surface.pixels.image.size);
+      preview.PublishFrame(surface);
+      preview.Finish();
+      return R::Success(preview.Texture());
     } catch (const std::exception& error) {
       return R::Failure({RenderErrorCode::Unsupported, error.what()});
     }
@@ -95,11 +142,14 @@ public:
 
 } // namespace
 
-void PublishBgfxGlTexture(android::GlTexture& mailbox, const ColorSurface& surface) {
-  const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
-  if (!storage || storage->image != surface.pixels.image || storage->origin != surface.pixels.origin)
-    throw std::invalid_argument("Expected a completed GLES render target");
-  PublishGlFrame(mailbox, storage->name->texture, storage->image.size);
+std::unique_ptr<BgfxPreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize size) {
+  JavaVM* vm = nullptr;
+  try { vm = OpenAndroidCanvasTextureVm(); }
+  catch (const std::logic_error&) {
+    // A standalone compositor can publish GLES frames without a registered HuxerUI runtime.
+  }
+  if (vm && SupportsAndroidCanvasTexture(vm)) return std::make_unique<CanvasPreviewTexture>(size, vm);
+  return std::make_unique<GlPreviewTexture>(size);
 }
 
 std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {

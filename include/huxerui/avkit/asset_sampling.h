@@ -47,6 +47,11 @@ using EncodeThumbnail = std::function<ImageAsset(const media::VideoFrame&, Pixel
 /// @brief Produces an oriented thumbnail at the requested physical size on the sampling sequence.
 using MakeThumbnail = std::function<ThumbnailImage(const media::VideoFrame&, PixelSize)>;
 
+/// @brief Opens a thumbnail adapter for images drawn in a HuxerUI Canvas. Link AVKit::Render.
+/// Open from the application sequence after AVKit installation on Android. Call the returned adapter on
+/// the sampling sequence. A platform transfer failure can be retried through the software decoder at the same PTS.
+MakeThumbnail OpenCanvasThumbnailSource();
+
 /// @brief Requested source interval and bucket resolution for one audio track.
 struct WaveformRequest {
   AssetId asset;

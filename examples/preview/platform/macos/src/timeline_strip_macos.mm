@@ -13,7 +13,8 @@ std::shared_ptr<StripPreviewOptions> options;
 
 void ConfigureTimelineStrip(std::string_view path, std::string_view replacement) {
   ConfigureTimelinePreview(path, "0");
-  options.reset(new StripPreviewOptions{Project::Open(File(path)), File(replacement), {TimelineProviders(), MakeStripThumbnail}});
+  options.reset(new StripPreviewOptions{Project::Open(File(path)), File(replacement),
+                                         {TimelineProviders(), OpenCanvasThumbnailSource()}});
 }
 
 std::shared_ptr<StripPreviewOptions> TimelineStripOptions() { return options; }

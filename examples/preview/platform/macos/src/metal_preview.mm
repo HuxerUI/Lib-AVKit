@@ -1,4 +1,6 @@
 #include "metal_preview.h"
+#include <huxerui/avkit/video_texture.h>
+#include "preview_sticker.h"
 #include "bgfx_metal_texture.h"
 #include "sticker_scene.h"
 
@@ -20,29 +22,16 @@ using namespace huxerui::avkit::render;
 using huxerui::macos::MetalTexture;
 namespace metal = huxerui::avkit::macos;
 
-constexpr PixelSize kSize{320, 180};
+constexpr auto kSize = kPreviewStickerSize;
 constexpr huxerui::Size kPreviewSize{640.0F, 360.0F};
 
-struct Pixel {
-  std::uint8_t r, g, b, a;
-  bool operator==(const Pixel&) const = default;
-};
-static_assert(sizeof(Pixel) == 4);
+using Pixel = PreviewPixel;
 
 Pixel Background(int x, int y, bool alternate) {
   const auto red = static_cast<std::uint8_t>(20 + x / 8);
   const auto green = static_cast<std::uint8_t>(48 + y / 2);
   const auto blue = static_cast<std::uint8_t>(168 - y / 2);
   return alternate ? Pixel{blue, red, green, 208} : Pixel{red, green, blue, 208};
-}
-
-Pixel Sticker(int x, int y) {
-  const int dx = x - 196;
-  const int dy = y - 80;
-  const int distance = dx * dx + dy * dy;
-  if (distance < 43 * 43) return {120, 59, 19, 128};
-  if (distance < 46 * 46) return {88, 72, 43, 96};
-  return {};
 }
 
 void Require(bool condition, const std::string& message) {
@@ -163,7 +152,7 @@ std::vector<Pixel> ReadPixels(id<MTLTexture> texture) {
 
 Pixel Expected(int x, int y, bool alternate) {
   const auto base = Background(x, y, alternate);
-  const auto sticker = Sticker(x, y);
+  const auto sticker = PreviewStickerPixel(x, y);
   const int remainder = 255 - sticker.a;
   const auto over = [remainder](int source, int destination) {
     return static_cast<std::uint8_t>(source + (destination * remainder + 127) / 255);
@@ -218,9 +207,13 @@ void Verify(PixelFormat format) {
   const auto first = Complete(backend, ticket);
   CheckSurface(first, fixture.target);
   CheckPixels(metal::GetMetalTexture(first), false, "A");
-  MetalTexture mailbox(kPreviewSize);
-  Publish(mailbox, first);
-  id<MTLTexture> first_snapshot = Acquire(mailbox);
+  auto opened = OpenBgfxPreviewTexture(fixture.target.size);
+  Require(opened.Succeeded(), "Cannot open a reusable bgfx preview texture");
+  auto preview = std::move(opened).Value();
+  const auto mailbox = std::dynamic_pointer_cast<MetalTexture>(preview->Texture());
+  Require(mailbox && mailbox->Revision() == 0, "Expected an empty Metal preview texture");
+  Require(preview->Publish(backend, first).Succeeded() && mailbox->Revision() == 1, "Cannot publish preview A");
+  id<MTLTexture> first_snapshot = Acquire(*mailbox);
   Require(first_snapshot != metal::GetMetalTexture(first), "Publication did not produce an independent snapshot");
   CheckPixels(first_snapshot, false, "published A");
 
@@ -231,8 +224,9 @@ void Verify(PixelFormat format) {
     Require(first.pixels.storage != second.pixels.storage, "A leased target was reused for B");
     CheckPixels(metal::GetMetalTexture(second), true, "B");
     CheckPixels(metal::GetMetalTexture(first), false, "leased A after B");
-    Publish(mailbox, second);
-    CheckPixels(Acquire(mailbox), true, "published B");
+    Require(preview->Publish(backend, second).Succeeded() && preview->Texture() == mailbox && mailbox->Revision() == 2,
+            "Preview B did not update the same texture");
+    CheckPixels(Acquire(*mailbox), true, "published B");
     const auto blocked = backend.TrySubmit(request_a);
     Require(blocked.Succeeded() && !blocked.Value(), "The pool accepted a request with both targets leased");
     reusable_slot = second.pixels.storage.get();
@@ -243,10 +237,13 @@ void Verify(PixelFormat format) {
   Require(third.pixels.storage.get() == reusable_slot, "The pool did not reuse B's released target");
   CheckPixels(metal::GetMetalTexture(third), false, "A after reuse");
   CheckPixels(metal::GetMetalTexture(first), false, "leased A after reuse");
-  Publish(mailbox, third);
-  CheckPixels(Acquire(mailbox), false, "republished A");
+  Require(preview->Publish(backend, third).Succeeded() && preview->Texture() == mailbox && mailbox->Revision() == 3,
+          "Republishing A did not update the same texture");
+  CheckPixels(Acquire(*mailbox), false, "republished A");
   CheckPixels(first_snapshot, false, "retained HuxerUI snapshot");
-  mailbox.Finish();
+  preview->Finish();
+  Require(!preview->Publish(backend, third).Succeeded() && mailbox->Revision() == 3, "A finished preview accepted a frame");
+  CheckPixels(Acquire(*mailbox), false, "last frame after finish");
 }
 
 void VerifyAnimatedSticker() {
@@ -267,26 +264,7 @@ void VerifyAnimatedSticker() {
 } // namespace
 
 ColorSurface CreatePreviewSticker(id<MTLDevice> device, bool cue) {
-  if (cue) return Upload(device, [](int x, int y) {
-    if (std::abs(x - 196) < 15 && std::abs(y - 80) < 15) return Pixel{16, 250, 32, 255};
-    return Sticker(x, y);
-  });
-  return Upload(device, Sticker);
-}
-
-ColorSurface CreateTrackingSticker(id<MTLDevice> device, analysis::TrackedPart part) {
-  using enum analysis::TrackedPart;
-  return Upload(device, [part](int x, int y) {
-    const float u = (x + 0.5F) / kSize.width, v = (y + 0.5F) / kSize.height;
-    if (part == Face) {
-      const auto radius = std::hypot((u - (u < 0.5F ? 0.25F : 0.75F)) / 0.20F, (v - 0.5F) / 0.36F);
-      if ((radius > 0.65F && radius < 1) || (std::abs(u - 0.5F) < 0.08F && std::abs(v - 0.5F) < 0.07F))
-        return Pixel{252, 235, 30, 255};
-      return Pixel{};
-    }
-    if (std::abs(u - 0.5F) + std::abs(v - 0.5F) > 0.46F) return Pixel{};
-    return part == LeftHand ? Pixel{35, 244, 255, 255} : Pixel{254, 72, 192, 255};
-  });
+  return Upload(device, [cue](int x, int y) { return PreviewStickerPixel(x, y, cue); });
 }
 
 bool HasPreviewStickerCue(id<MTLTexture> texture, huxerui::media::MediaTimestamp time) {

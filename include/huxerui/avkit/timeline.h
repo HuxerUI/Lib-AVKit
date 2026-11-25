@@ -4,7 +4,7 @@
 /// @brief Exact sampling of immutable timeline revisions for preview and MP4 export.
 ///
 /// Link AVKit::Media. The session works in project time and retains the decoded pictures and render
-/// plan needed by a compositor. Rendering and resource resolution belong to the caller.
+/// plan needed by a compositor. The caller can bind resources and render with AVKit::Render.
 
 #include <chrono>
 #include <cstdint>

@@ -749,6 +749,18 @@ void ExportWithRestart(const MovieCodecProviders& providers, CodecPolicy policy,
 
 } // namespace
 
+FileExportSettings FileExportSettings::Sdr(PixelSize size) {
+  FileExportSettings settings;
+  settings.video.input = {.width = size.width, .height = size.height, .visible = {0, 0, size.width, size.height},
+      .primaries = ColorPrimaries::BT709, .transfer = ColorTransfer::BT709,
+      .matrix = ColorMatrix::BT709, .range = ColorRange::Limited};
+#if defined(__ANDROID__)
+  // Android AAC encoders may omit the priming and padding required for an exact MP4 edit list.
+  settings.audio_policy = CodecPolicy::SoftwareOnly;
+#endif
+  return settings;
+}
+
 void ExportMovie(const MovieAsset& asset, const File& destination, const MovieCodecProviders& providers,
                  const FileExportSettings& settings, const ComposeMovieFrame& compose, OnCodecFallback report) {
   if (!compose || destination == asset.file) throw std::invalid_argument("Export requires a compositor and a new destination");

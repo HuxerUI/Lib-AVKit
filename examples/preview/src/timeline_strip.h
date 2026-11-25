@@ -58,7 +58,6 @@ private:
 
 inline constexpr std::uint32_t kStripClock = 192;
 StripViewport VisibleStrip(const huxerui::avkit::ProjectSnapshot& project, std::int64_t left, unsigned zoom);
-huxerui::avkit::ThumbnailImage MakeStripThumbnail(const huxerui::media::VideoFrame& frame, huxerui::avkit::PixelSize size);
 inline void DrawStripThumbnail(huxerui::PaintContext& paint, const huxerui::avkit::Thumbnail& thumbnail, huxerui::Rect rect) {
   std::visit([&](const auto& image) { paint.DrawImage(image, rect); }, thumbnail.image);
 }

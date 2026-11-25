@@ -12,7 +12,6 @@
 
 #include "support/cancellation.h"
 #include "support/media_time.h"
-#include "render/bgfx/video_texture_internal.h"
 
 namespace avkit_preview {
 namespace {
@@ -131,19 +130,6 @@ std::shared_ptr<const StripResult> UpdateStripSamples(std::shared_ptr<const Stri
     });
   }
   return result;
-}
-
-ThumbnailImage MakeStripThumbnail(const VideoFrame& frame, PixelSize size) {
-  const VideoTextureOptions options{size.width, size.height, ImageFit::Cover};
-  if (frame.Storage() == VideoStorage::Platform) {
-    auto texture = MakeExternalTexture(frame, options);
-    if (!texture.Succeeded()) throw PlatformVideoImportError(texture.Error().message);
-    return std::move(texture).Value();
-  }
-  const auto fitted = render::detail::FitCpuVideoFrame(frame, options);
-  if (!fitted.Succeeded()) throw std::runtime_error(fitted.Error().message);
-  const auto pixels = render::GetImagePixels(fitted.Value().pixels).value();
-  return Bitmap::CopyPixels(size.width, size.height, pixels.bytes.AsBytes(), pixels.row_bytes, Bitmap::PixelFormat::Rgba8888);
 }
 
 struct StripWorker::Impl {

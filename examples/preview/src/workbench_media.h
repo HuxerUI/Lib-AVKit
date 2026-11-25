@@ -7,7 +7,6 @@
 
 namespace avkit_preview {
 
-void InstallWorkbenchMedia(huxerui::ApplicationContext& context);
 bool HasWorkbenchMedia();
 huxerui::avkit::AssetReference ReadWorkbenchMovie(const huxerui::File& file);
 huxerui::avkit::AssetReference PrepareWorkbenchPhoto(huxerui::Bitmap image, const huxerui::File& destination);
@@ -24,7 +23,7 @@ struct EditorTransport {
 
 struct OverlayAssets;
 struct EditorMonitorViews {
-  huxerui::View canvas;
+  std::function<huxerui::View(const WorkbenchFrame&, bool current)> canvas;
   huxerui::View media;
   huxerui::View inspector;
   std::shared_ptr<const OverlayAssets> assets;
@@ -35,17 +34,7 @@ std::shared_ptr<const StripResult> UseEditorStrip(
 [[huxerui::composable]] huxerui::View EditorMonitor(WorkbenchContext context,
     std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, EditorTransport transport, bool wide,
     std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
-    std::optional<huxerui::avkit::VisualTransformOverride> layout);
-
-using WorkbenchExport = decltype(&ExportWorkbenchMovie);
-[[huxerui::composable]] huxerui::View WorkbenchMonitor(WorkbenchContext context,
-    std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, EditorTransport transport, bool wide,
-    std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
-    std::optional<huxerui::avkit::VisualTransformOverride> layout, WorkbenchExport export_movie);
-
-using CreateStripWorker = std::shared_ptr<StripWorker> (*)();
-std::shared_ptr<const StripResult> UseWorkbenchStrip(
-    std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project, StripViewport visible, CreateStripWorker create_worker);
+    std::optional<WorkbenchDrag> drag);
 
 std::optional<huxerui::View> RequestedFilePreview();
 std::optional<int> RunFileMediaCommand(int argc, const char** argv);
