@@ -11,7 +11,7 @@ namespace huxerui::avkit::analysis::detail {
 namespace {
 
 using namespace media;
-using Detections = std::vector<TrackingDetection>;
+using Detections = std::vector<LandmarkDetection>;
 using DetectionResult = Result<std::optional<Detections>, std::string>;
 
 constexpr int kInputSize = 640;
@@ -138,8 +138,8 @@ std::optional<FacePatch> Describe(const VideoFrame& frame, const Face& face) {
   return patch;
 }
 
-TrackingDetection Landmarks(const Face& face) {
-  TrackingDetection result{{1, {}}, {}};
+LandmarkDetection Landmarks(const Face& face) {
+  LandmarkDetection result{{1, {}}, {}};
   result.landmarks.points.reserve(face.points.size() + 1);
   result.landmarks.points.push_back({"face_center", {face.bounds.x + face.bounds.width / 2,
                                                     face.bounds.y + face.bounds.height / 2}, {}});

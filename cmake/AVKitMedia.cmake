@@ -1,8 +1,23 @@
 add_library(avkit_media STATIC
+        src/ecs/project_scene.cpp
+        src/ecs/system/audio_system.cpp
+        src/ecs/system/camera_layout_system.cpp
+        src/ecs/system/clip_sampling_system.cpp
+        src/ecs/system/coverage_system.cpp
+        src/ecs/system/scene_systems.cpp
+        src/ecs/system/timeline_system.cpp
+        src/ecs/system/tracking_system.cpp
+        src/ecs/system/transition_system.cpp
+        src/ecs/system/video_source_system.cpp
         src/media/asset_sampling.cpp
         src/media/codec/lib_media_codec.cpp
         src/media/file_movie.cpp
+        src/media/image_asset.cpp
         src/media/timeline.cpp
+        src/media/timeline_playback.cpp
+        src/media/timeline_audio_source.cpp
+        src/media/timeline_video_source.cpp
+        src/media/video_texture.cpp
 )
 add_library(AVKit::Media ALIAS avkit_media)
 target_include_directories(avkit_media PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

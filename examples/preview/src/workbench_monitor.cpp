@@ -9,7 +9,7 @@
 #include <stop_token>
 #include <utility>
 
-#include "timeline_playback.h"
+#include <huxerui/avkit/timeline.h>
 #include "timeline_resources.h"
 #include "workbench_platform.h"
 #include "workbench_player.h"
@@ -24,38 +24,35 @@ using namespace huxerui::avkit;
 
 double Seconds(media::MediaTimestamp time) { return double(time.ticks) / time.timescale; }
 
-PixelSize PreviewSize(PixelSize canvas, float display_scale) {
-  const auto short_edge = std::min(canvas.width, canvas.height);
-  const auto long_edge = std::max(canvas.width, canvas.height);
+PixelSize ChoosePreviewTextureSize(PixelSize project_canvas_size, float display_scale) {
+  const auto short_edge = std::min(project_canvas_size.width, project_canvas_size.height);
+  const auto long_edge = std::max(project_canvas_size.width, project_canvas_size.height);
   const auto preferred_short = display_scale >= 2.0F ? 720.0 : 540.0;
   const auto scale = std::min(preferred_short / short_edge, 1280.0 / long_edge);
-  if (scale >= 1.0) return canvas;
+  if (scale >= 1.0) return project_canvas_size;
   const auto pixels = [scale](std::uint32_t edge) {
     return static_cast<std::uint32_t>(std::max(1L, std::lround(edge * scale / 2.0)) * 2);
   };
-  return {pixels(canvas.width), pixels(canvas.height)};
+  return {pixels(project_canvas_size.width), pixels(project_canvas_size.height)};
 }
 
-PixelSize ExportSize(PixelSize canvas, unsigned short_edge) {
-  const auto scale = double(short_edge) / std::min(canvas.width, canvas.height);
+PixelSize ExportSize(PixelSize project_canvas_size, unsigned short_edge) {
+  const auto scale = double(short_edge) / std::min(project_canvas_size.width, project_canvas_size.height);
   const auto even = [scale](unsigned size) {
     return static_cast<unsigned>(std::clamp(std::round(size * scale / 2.0), 1.0, 8192.0) * 2.0);
   };
-  return {even(canvas.width), even(canvas.height)};
+  return {even(project_canvas_size.width), even(project_canvas_size.height)};
 }
 
 std::string ResolutionLabel(unsigned short_edge) { return short_edge == 2160 ? "4K" : std::to_string(short_edge) + "p"; }
 
+constexpr std::uint32_t kWorkbenchExportFrameRate = 24;
+
 bool ProbeExportSize(PixelSize size) {
   if (size.width > 8192 || size.height > 8192) return false;
-  media::VideoEncoderConfig config;
-  config.input = {size.width, size.height, {0, 0, size.width, size.height}, media::VideoPixelFormat::I420};
-  config.input.primaries = media::ColorPrimaries::BT709;
-  config.input.transfer = media::ColorTransfer::BT709;
-  config.input.matrix = media::ColorMatrix::BT709;
-  config.input.range = media::ColorRange::Limited;
-  config.frame_rate_numerator = kTimelinePreviewRate;
-  return CreateFFmpegCodecProvider()->Probe(config).Succeeded();
+  auto settings = FileExportSettings::Sdr(size);
+  settings.video.frame_rate_numerator = kWorkbenchExportFrameRate;
+  return ProbeVideoExport(TimelineProviders(), settings).Succeeded();
 }
 
 enum class ExportStage { Rendering, Cancelling, Generated, Saving, Saved, Failed };
@@ -67,6 +64,7 @@ struct ExportWork {
 
 struct ExportFile {
   explicit ExportFile(File location) : path(std::move(location)) {}
+
   ~ExportFile() {
     if (path.Delete()) {
       if (const auto directory = path.Parent()) (void)directory->Delete();
@@ -83,6 +81,7 @@ struct ExportStatus {
   std::shared_ptr<ExportWork> work;
   std::shared_ptr<ExportFile> file;
   std::string error;
+
   bool operator==(const ExportStatus&) const = default;
 };
 
@@ -131,7 +130,7 @@ View ExportPanel(const ThemeSpec& theme, const ExportStatus& status, float progr
       break;
   }
   const auto spec = "MP4  ·  " + std::to_string(status.resolution.width) + " × " + std::to_string(status.resolution.height) +
-      "  ·  " + std::to_string(kTimelinePreviewRate) + " fps";
+      "  ·  " + std::to_string(kWorkbenchExportFrameRate) + " fps";
   return Column{
     Text(title, TextRole::Title),
     Column{
@@ -150,27 +149,16 @@ View ExportPanel(const ThemeSpec& theme, const ExportStatus& status, float progr
 
 } // namespace
 
-AssetReference ReadWorkbenchMusic(const File& file, const File& prepared, const ProjectSnapshot& project) {
-  media::AudioFormat format{48000, media::AudioSampleFormat::S16, media::AudioPacking::Interleaved,
-                            media::AudioChannelLayout::Stereo};
-  const auto lane = std::ranges::find_if(project.tracks, [](const TrackInfo& track) {
-    return track.kind == media::TrackKind::Audio && !track.clips.empty();
-  });
-  if (lane != project.tracks.end()) {
-    const auto asset = std::ranges::find(project.assets, lane->clips.front().placement.source.asset, &AssetInfo::id);
-    format = ImportMovieAudio(asset->source.file).pcm;
-  }
-  PrepareTimelineAudio(file, prepared, format);
-  return InspectTimelineAudio(prepared);
-}
+AssetSource ReadWorkbenchMusic(const File& file) { return InspectTimelineAudio(file); }
 
 bool HasWorkbenchMedia() { return true; }
 
-AssetReference ReadWorkbenchMovie(const File& file) { return InspectTimelineMovie(file); }
+AssetSource ReadWorkbenchVisual(const File& file) { return InspectTimelineVisual(file); }
 
 [[huxerui::composable]]
 View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapshot> project, EditorTransport timeline, bool wide,
                        std::function<void()> back, std::function<void()> project_menu, EditorMonitorViews views,
+                       State<std::optional<WorkbenchFrame>> presented,
                        std::function<std::optional<WorkbenchDrag>()> preview_drag) {
   const auto& theme = UseTheme();
   const auto tasks = UseTaskScope();
@@ -183,28 +171,22 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
   using PreviewSession = std::pair<PixelSize, std::shared_ptr<WorkbenchPlayer>>;
   const auto player = UseState(PreviewSession{});
   const auto playback = UseState(WorkbenchPlayback{});
-  const auto presented = UseState(std::optional<WorkbenchFrame>{});
   const auto exporting = context.exporting;
-  const auto resource_pack = views.assets;
+  const auto resource_pack = views.resources;
   const auto display_scale = UseService<Resources>()->Configuration().display_scale;
-  const auto size = has_media ? PreviewSize(project->canvas, display_scale) : PixelSize{};
-  const auto canvas = has_media && !exporting.Get() && resource_pack ? std::optional(size) : std::nullopt;
-  Lifecycle([player, playback, presented, canvas, resource_pack, timeline, tasks] {
-    struct Presentation {
-      WorkbenchFrame frame;
-      std::stop_token stop;
-      render::PreviewFrameCommit commit;
-    };
+  const auto preview_texture_size = has_media && resource_pack
+      ? std::optional(ChoosePreviewTextureSize(project->canvas_size, display_scale)) : std::nullopt;
+  Lifecycle([player, playback, presented, preview_texture_size, resource_pack, timeline, tasks] {
     struct PendingPresentation {
       std::mutex mutex;
-      std::optional<Presentation> latest;
+      std::optional<WorkbenchFrame> latest;
       bool posted{};
     };
     auto pending = std::make_shared<PendingPresentation>();
-    auto present = [tasks, presented, pending](WorkbenchFrame frame, std::stop_token stop, render::PreviewFrameCommit commit) {
+    auto present = [tasks, presented, pending](WorkbenchFrame frame) {
       {
         std::scoped_lock lock(pending->mutex);
-        pending->latest.emplace(std::move(frame), stop, std::move(commit));
+        pending->latest.emplace(std::move(frame));
         if (std::exchange(pending->posted, true)) return;
       }
       tasks.Post([presented, pending] {
@@ -213,10 +195,10 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
           std::scoped_lock lock(pending->mutex);
           auto latest = std::exchange(pending->latest, std::nullopt);
           pending->posted = false;
-          if (latest && !latest->stop.stop_requested()) {
-            // Publish the picture and advance its selection geometry on the same UI turn.
-            if (latest->commit) latest->commit();
-            shown.emplace(std::move(latest->frame));
+          if (latest && !latest->preview.stop.stop_requested()) {
+            // Publish the picture and its selection layout together on the UI sequence.
+            if (auto commit = std::exchange(latest->preview.commit, {})) commit();
+            shown.emplace(std::move(*latest));
           }
         } catch (const std::exception& error) {
           LogWorkbench(WorkbenchLogLevel::Error, "Cannot present the preview frame: %s", error.what());
@@ -224,36 +206,35 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
         if (shown) presented = std::move(shown);
       });
     };
-    auto active = canvas ? std::make_shared<WorkbenchPlayer>(*canvas, *resource_pack, std::move(present)) : nullptr;
-    player = PreviewSession{canvas.value_or(PixelSize{}), active};
+    auto active = preview_texture_size
+        ? std::make_shared<WorkbenchPlayer>(*preview_texture_size, resource_pack, std::move(present)) : nullptr;
+    if (active) active->Seek(timeline.position.Get());
+    player = PreviewSession{preview_texture_size.value_or(PixelSize{}), active};
     playback = WorkbenchPlayback{timeline.position.Get()};
     presented = std::nullopt;
     return [active] { if (active) active->Close(); };
-  }, canvas);
+  }, preview_texture_size);
   const auto session = player.Get();
-  const auto active = canvas && *canvas == session.first ? session.second : nullptr;
-  using PreparedPicture = std::pair<std::shared_ptr<const ProjectSnapshot>, std::shared_ptr<const ProjectSnapshot>>;
-  const auto prepared = UseState(PreparedPicture{});
-  Lifecycle([prepared, project, size] {
-    auto picture = PrepareWorkbenchPicture(project);
-    if (picture && size.width && size != picture->canvas) {
-      auto preview = std::make_shared<ProjectSnapshot>(*picture);
-      preview->canvas = size;
-      picture = std::move(preview);
-    }
-    prepared = PreparedPicture{project, std::move(picture)};
-  }, project, size);
-  const auto picture = prepared->first == project ? prepared->second : nullptr;
+  const auto active = preview_texture_size && *preview_texture_size == session.first ? session.second : nullptr;
+  const auto picture = project;
+  Lifecycle([active, picture] {
+    if (!active || !picture) return;
+    active->Session().Pause();
+    active->Session().ApplyProject(picture);
+  }, active, picture);
   const auto drag = preview_drag();
-  Lifecycle([active, picture, timeline, drag] {
-    if (active && picture) active->Show(picture, timeline.position.Get(), false, drag);
-  }, active, picture, drag);
+  Lifecycle([active, drag] {
+    if (!active) return;
+    if (drag) active->Session().Pause();
+    active->SetDrag(drag);
+  }, active, drag);
   const auto seek = timeline.seek.Get();
   Lifecycle([active, picture, timeline, playback, seek] {
     if (!active || !picture || !seek || active->Closed()) return;
     timeline.seek = std::nullopt;
     playback = WorkbenchPlayback{*seek};
-    active->Show(picture, *seek, false);
+    if (timeline.scrubbing.Get()) active->Session().Pause();
+    active->Seek(*seek);
   }, active, picture, seek);
   Lifecycle([active, tasks, playback, timeline] {
     if (!active) return;
@@ -275,16 +256,20 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
   View canvas_controls;
   if (has_media) {
     if (active && shown) {
-      preview = WorkbenchVideoPicture(shown->texture).With(Grow());
-      if (views.canvas) canvas_controls = views.canvas(*shown, shown->project == picture);
+      preview = WorkbenchVideoPicture(shown->preview.texture).With(Grow());
+      if (views.preview_controls) canvas_controls = views.preview_controls(*shown, shown->preview.project == picture);
     } else if (exporting.Get()) preview = {};
     else preview = Text("正在准备预览…");
   }
   const auto play = [active, picture, duration] {
     if (!active || !picture || active->Closed()) return;
     const auto displayed = active->Status();
-    const bool at_end = displayed.seconds >= duration - 1.0 / kTimelinePreviewRate;
-    active->Show(picture, !displayed.playing && at_end ? 0.0 : displayed.seconds, !displayed.playing);
+    if (displayed.playing) {
+      active->Session().Pause();
+    } else {
+      if (displayed.seconds >= duration - 1.0 / kTimelinePreviewRate) active->Seek(0.0);
+      active->Session().Play();
+    }
   };
   const auto document = context.document.Get();
   const auto change_history = [context](bool redo) {
@@ -346,7 +331,7 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
     return [poll] { poll.Cancel(); };
   }, export_work);
   const auto export_probe = UseState(std::optional<std::pair<PixelSize, bool>>{});
-  const auto largest = has_media ? std::optional(ExportSize(project->canvas, 2160U)) : std::nullopt;
+  const auto largest = has_media ? std::optional(ExportSize(project->canvas_size, 2160U)) : std::nullopt;
   Lifecycle([tasks, export_probe, largest] {
     TaskHandle probe;
     if (largest) probe = tasks.Launch([export_probe, largest]() -> Task<void> {
@@ -358,14 +343,14 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
   const auto probed = export_probe.Get();
   const bool high_resolution = probed && largest == probed->first && probed->second;
   const auto selected_height = export_height.Get();
-  const auto resolution = has_media ? ExportSize(project->canvas, selected_height) : PixelSize{};
+  const auto resolution = has_media ? ExportSize(project->canvas_size, selected_height) : PixelSize{};
   const auto fits_encoder = [high_resolution](PixelSize size, unsigned height) {
     return size.width <= 8192 && size.height <= 8192 && (height != 2160 || high_resolution);
   };
   const auto show_resolutions = [=] {
     std::vector<MenuEntry> choices;
     for (auto height : {720U, 1080U, 2160U}) {
-      const auto size = ExportSize(project->canvas, height);
+      const auto size = ExportSize(project->canvas_size, height);
       choices.emplace_back(MenuItem(ResolutionLabel(height) + "  " + std::to_string(size.width) + "×" +
           std::to_string(size.height), [export_height, height] { export_height = height; })
           .Checked(selected_height == height).Enabled(fits_encoder(size, height)));
@@ -380,16 +365,17 @@ View EditorMonitor(WorkbenchContext context, std::shared_ptr<const ProjectSnapsh
     RunWorkbenchAction(context, [=]() -> Task<void> {
       exporting = true;
       try {
-        if (auto current = player.Get().second) current->Close();
-        auto encoded = co_await RunWorker([cache = context.cache, revision, resource_pack, resolution, duration, work] {
+        auto preview = player.Get().second;
+        auto encoded = co_await RunWorker([cache = context.cache, revision, resource_pack, resolution, duration, work,
+                                           preview = std::move(preview)] {
           const auto output = std::make_shared<ExportFile>(WorkbenchOutput(cache, "Exports", "成片.mp4"));
-          auto render_revision = std::make_shared<ProjectSnapshot>(*revision);
-          render_revision->canvas = resolution;
-          ExportWorkbenchMovie(PrepareWorkbenchPicture(std::move(render_revision)), output->path, *resource_pack,
+          auto settings = FileExportSettings::Sdr(resolution);
+          settings.video.frame_rate_numerator = kWorkbenchExportFrameRate;
+          ExportWorkbenchMovie(revision, output->path, settings, resource_pack,
               [work, duration](media::MediaTimestamp pts) {
                 if (work->stop.stop_requested()) throw std::runtime_error("Export cancelled");
                 work->progress.store(std::clamp(float(Seconds(pts) / duration), 0.0F, 0.99F), std::memory_order_relaxed);
-              });
+              }, work->stop.get_token(), preview.get());
           return output;
         });
         export_status.Update([&](auto& current) {

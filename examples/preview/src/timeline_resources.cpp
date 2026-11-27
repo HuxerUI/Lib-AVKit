@@ -1,175 +1,74 @@
 #include "timeline_resources.h"
 
-#include "preview_sticker.h"
-
-#include <algorithm>
-#include <span>
-#include <stdexcept>
+#include <array>
 #include <utility>
-
-#include <bimg/decode.h>
-#include <bx/allocator.h>
-#include <huxerui/avkit/bgfx.h>
 
 namespace avkit_preview {
 namespace {
 
 using namespace huxerui;
 using namespace huxerui::avkit;
-using namespace huxerui::avkit::render;
 using namespace huxerui::media;
 
 constexpr MediaTimestamp kClipMaskFrameInterval{5, 48};
 
-void Check(bool condition, const char* message) {
-  if (!condition) throw std::runtime_error(message);
-}
-
-PagOverlayResources TimelinePagResources(const OverlayAssets& assets) {
-  auto resources = WorkbenchPagResources(assets);
-  resources.clip_animation = [assets](const auto& resource, const auto& replacements) {
-    return ResolvePreviewPagSticker(assets, resource, replacements);
-  };
-  return resources;
-}
-
-ImageSurface LoadMask(const BufferReference& asset) {
-  bx::DefaultAllocator allocator;
-  const auto bytes = asset.AsBytes();
-  // The PNG decoder preserves grayscale samples, which are coverage values rather than sRGB colors.
-  const std::unique_ptr<bimg::ImageContainer, decltype(&bimg::imageFree)> image(
-      bimg::imageParse(&allocator, bytes.data(), static_cast<std::uint32_t>(bytes.size())), bimg::imageFree);
-  Check(image && image->m_parser == bimg::ImageParser::Png &&
-        image->m_format == bimg::TextureFormat::R8 && !image->m_hasAlpha, "Expected an 8-bit grayscale PNG mask");
-  const PixelSize size{image->m_width, image->m_height};
-  const auto* coverage = static_cast<const std::byte*>(image->m_data);
-  auto pixels = std::make_shared<Bytes>(coverage, coverage + std::size_t(size.width) * size.height);
-  return RetainBgfxPixels({size, PixelFormat::R8Unorm}, BufferReference(*pixels, pixels), size.width);
-}
-
-template<std::size_t N>
-MaskSequence ResolveMaskSequence(std::array<BufferReference, N> frames, MediaTimestamp interval = {}) {
-  return {N, interval, [frames = std::move(frames)](std::uint32_t index) { return LoadMask(frames.at(index)); }};
-}
-
-ColorSurface CreateSticker(std::optional<analysis::TrackedPart> part) {
-  auto pixels = std::make_shared<std::vector<PreviewPixel>>();
-  pixels->reserve(kPreviewStickerSize.width * kPreviewStickerSize.height);
-  for (int y = 0; y < static_cast<int>(kPreviewStickerSize.height); ++y) {
-    for (int x = 0; x < static_cast<int>(kPreviewStickerSize.width); ++x) {
-      pixels->push_back(part ? PreviewTrackingStickerPixel(x, y, *part) : PreviewStickerPixel(x, y));
-    }
-  }
-  return ColorSurface{RetainBgfxPixels({kPreviewStickerSize, PixelFormat::Rgba8Unorm},
-      BufferReference(std::as_bytes(std::span(*pixels)), pixels), kPreviewStickerSize.width * sizeof(PreviewPixel))};
-}
-
 } // namespace
 
-TimelineRenderResources PreviewTimelineResources(const OverlayAssets& assets) {
-  return {
-    .overlays = TimelinePagResources(assets),
-    .sticker = [](const ResourceRef& resource) {
-      if (resource == PreviewStickerResource()) return CreateSticker({});
-      for (const auto part : kPreviewTrackingParts) {
-        if (resource == TrackingStickerResource(part)) return CreateSticker(part);
-      }
-      throw std::runtime_error("The preview sticker resource is unavailable: " + resource.key);
-    },
-    .static_mask = [frames = assets.clip_masks](const ResourceRef& resource) {
-      const auto& references = PreviewStaticMaskResources();
-      const auto found = std::ranges::find(references, resource);
-      if (found == references.end()) throw std::runtime_error("The static mask resource is unavailable: " + resource.key);
-      return LoadMask(frames[found - references.begin()]);
-    },
-    .mask_sequence = [clip = assets.clip_masks, wipe = assets.wipe_masks](const ResourceRef& resource) {
-      if (resource == PreviewAnimatedMaskResource()) return ResolveMaskSequence(clip, kClipMaskFrameInterval);
-      if (resource == PreviewWipeResource()) return ResolveMaskSequence(wipe);
-      throw std::runtime_error("The mask sequence is unavailable: " + resource.key);
-    },
-    .pag_transition = [encoded = assets.transition](const ResourceRef& resource) {
-      if (resource != PreviewPagTransitionResource())
-        throw std::runtime_error("The PAG transition resource is unavailable: " + resource.key);
-      return PagTransitionAsset{encoded, 1, 0};
-    },
+std::shared_ptr<const ResourceCatalog> LoadWorkbenchResources(const Resources& resources) {
+  ResourceCatalog catalog;
+  const auto add_template = [&](std::string key, PixelSize canvas, std::int64_t seconds, bool inset) {
+    ResourceRef reference{std::move(key)};
+    const TemplateClip primary{.slot = "主镜头", .source = {{}, {seconds, 1}}, .include_original_audio = true};
+    TemplateClip second{.slot = "第二镜头", .source = {{}, {seconds, 1}}, .include_original_audio = !inset};
+    EditTemplateRecipe recipe{reference, canvas, {primary.slot, second.slot}};
+    recipe.placement = inset ? TemplatePlacement::Parallel : TemplatePlacement::Sequence;
+    if (inset) {
+      second.destination = {0.66F, 0.63F, 0.30F, 0.30F};
+      recipe.tracks = {{TrackKind::Video, {primary}}, {TrackKind::Video, {second}}};
+    } else {
+      recipe.tracks = {{TrackKind::Video, {primary, second}}};
+    }
+    catalog.Register(std::move(reference), std::move(recipe));
   };
-}
-
-MovieCodecProviders TimelineProviders() { return {CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()}; }
-
-VideoEncoderConfig PreviewVideoConfig(PixelSize size) { return FileExportSettings::Sdr(size).video; }
-
-const ResourceRef& PreviewStickerResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "sticker"};
-  return resource;
-}
-
-const ResourceRef& TrackingStickerResource(analysis::TrackedPart part) {
-  static const std::array<ResourceRef, kPreviewTrackingParts.size()> resources{{
-      {"avkit.preview", "1", "glasses"}, {"avkit.preview", "1", "left_hand"}, {"avkit.preview", "1", "right_hand"}}};
-  const auto item = std::ranges::find(kPreviewTrackingParts, part);
-  Check(item != kPreviewTrackingParts.end(), "Unknown preview tracking sticker");
-  return resources[item - kPreviewTrackingParts.begin()];
-}
-
-const ResourceRef& PreviewPagStickerResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "pag-like"};
-  return resource;
-}
-
-const ResourceRef& PreviewEditablePagResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "pag-editable"};
-  return resource;
-}
-
-const ResourceRef& PreviewPagImageResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "pag-replacement-image"};
-  return resource;
-}
-
-const ResourceRef& PreviewPagTransitionResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "pag-crossfade"};
-  return resource;
-}
-
-PagOverlayAsset ResolvePreviewPagSticker(const OverlayAssets& assets, const ResourceRef& resource,
-                                       const StickerReplacements& replacements) {
-  if (resource == PreviewPagStickerResource()) {
-    Check(replacements.Empty(), "The like PAG fixture has no editable slots");
-    return {assets.stickers.front()};
+  add_template("stage-cut", {640, 360}, 6, false);
+  add_template("portrait", {360, 640}, 5, false);
+  add_template("picture-in-picture", {640, 360}, 6, true);
+  const auto raw = [&](RawResource resource) { return resources.GetRawResource(resource); };
+  for (const auto& sticker : kWorkbenchStickers) {
+    catalog.Register({sticker.key}, raw(sticker.pag), PagAsset{});
   }
-  if (resource != PreviewEditablePagResource())
-    throw std::runtime_error("The animated sticker resource is unavailable: " + resource.key);
-  const auto font = std::make_shared<const PagFont>(assets.font);
-  std::array<PagTextReplacement, 1> texts{{{0, std::nullopt, font}}};
-  std::vector<PagImageReplacement> images;
-  for (const auto& text : replacements.texts) {
-    Check(text.slot == "title", "Unknown editable PAG text slot");
-    texts.front().text = text.text;
+  const ResourceRef font{"preview-sans"};
+  catalog.Register(font, raw(app::raw::stickers_preview_sans_ttf));
+  catalog.Register(kPreviewPointTextResource, raw(app::raw::stickers_point_text_pag), PagAsset{
+      .text_slots = {{kPreviewPointTextSlot, 0}}, .fit_text_to_canvas = true});
+  catalog.Register({"pag-editable"}, raw(app::raw::stickers_editable_pag), PagAsset{
+      .text_slots = {{"title", 0}}, .image_slots = {{"icon", 0}}, .font = font});
+  catalog.Register({"pag-crossfade"}, raw(app::raw::transitions_crossfade_pag), PagAsset{
+      .image_slots = {{"outgoing", 1}, {"incoming", 0}},
+      .transition_slots = std::array<std::string, 2>{"outgoing", "incoming"}});
+  catalog.Register({"pag-replacement-image"}, raw(app::raw::stickers_replacement_png));
+
+  const ResourceRef window{"static-window"};
+  const ResourceRef offset{"static-offset"};
+  const ResourceRef corner{"sequence-corner"};
+  catalog.Register(window, raw(app::raw::masks_static_window_png));
+  catalog.Register(offset, raw(app::raw::masks_static_offset_png));
+  catalog.Register(corner, raw(app::raw::masks_sequence_corner_png));
+  catalog.Register({"clip-mask-sequence"}, MaskSequenceData{{{window}, {offset}, {corner}}, kClipMaskFrameInterval});
+
+  const std::array wipe{app::raw::masks_wipe_0_png, app::raw::masks_wipe_1_png, app::raw::masks_wipe_2_png,
+                        app::raw::masks_wipe_3_png, app::raw::masks_wipe_4_png, app::raw::masks_wipe_5_png,
+                        app::raw::masks_wipe_6_png, app::raw::masks_wipe_7_png};
+  MaskSequenceData frames;
+  for (std::size_t index = 0; index < wipe.size(); ++index) {
+    const ResourceRef reference{"wipe/" + std::to_string(index)};
+    catalog.Register(reference, raw(wipe[index]));
+    frames.frames.push_back({reference});
   }
-  for (const auto& image : replacements.images) {
-    Check(image.slot == "icon", "Unknown editable PAG image slot");
-    Check(image.image == PreviewPagImageResource(), "The PAG replacement image is unavailable");
-    images.push_back({0, assets.replacement_image});
-  }
-  return {assets.editable, {texts.begin(), texts.end()}, std::move(images)};
+  catalog.Register({"wipe"}, std::move(frames));
+  return std::make_shared<const ResourceCatalog>(std::move(catalog));
 }
 
-const ResourceRef& PreviewWipeResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "wipe"};
-  return resource;
-}
-
-const std::array<ResourceRef, 2>& PreviewStaticMaskResources() {
-  static const std::array<ResourceRef, 2> resources{{
-      {"avkit.preview", "1", "static-window"}, {"avkit.preview", "1", "static-offset"},
-  }};
-  return resources;
-}
-
-const ResourceRef& PreviewAnimatedMaskResource() {
-  static const ResourceRef resource{"avkit.preview", "1", "clip-mask-sequence"};
-  return resource;
-}
+CodecProviders TimelineProviders() { return {CreateLibMediaCodecProvider(), CreateFFmpegCodecProvider()}; }
 
 } // namespace avkit_preview

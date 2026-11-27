@@ -1,43 +1,14 @@
 #include "video_texture_internal.h"
 
 #include <algorithm>
-#include <array>
-#include <array>
 #include <cmath>
 #include <span>
 #include <stdexcept>
 #include <vector>
 
-#include <huxerui/avkit/bgfx.h>
-
-#include "support/video_geometry.h"
+#include "render/bgfx/backend.h"
 
 namespace huxerui::avkit::render {
-
-Result<Bitmap, RenderError> detail::ReadBgfxBitmap(RenderBackend& backend, const ColorSurface& surface) {
-  using R = Result<Bitmap, RenderError>;
-  auto read = ReadBgfxPixels(backend, surface);
-  if (!read.Succeeded()) return R::Failure(read.Error());
-  const auto bytes = read.Value().AsBytes();
-  const auto [width, height] = surface.pixels.image.size;
-  const auto stride = std::size_t(width) * 4;
-  Bytes pixels(bytes.size());
-  const bool bgra = surface.pixels.image.format == PixelFormat::Bgra8Unorm;
-  for (std::size_t y = 0; y < height; ++y) {
-    const auto row = surface.pixels.origin == RowOrigin::TopLeft ? y : height - 1 - y;
-    for (std::size_t x = 0; x < width; ++x) {
-      const auto* source = bytes.data() + row * stride + x * 4;
-      auto* dest = pixels.data() + y * stride + x * 4;
-      const auto alpha = std::to_integer<unsigned>(source[3]);
-      for (const auto channel : {0, 1, 2}) {
-        const auto value = std::to_integer<unsigned>(source[bgra ? 2 - channel : channel]);
-        dest[channel] = std::byte(alpha ? std::min(255U, (value * 255 + alpha / 2) / alpha) : 0);
-      }
-      dest[3] = source[3];
-    }
-  }
-  return R::Success(Bitmap::FromRgba8(width, height, std::move(pixels)));
-}
 
 namespace {
 
@@ -50,21 +21,6 @@ struct Yuv {
 
 // BT.1886 display transfer for normalized SDR black and white, matching the platform BT.709 output.
 constexpr double kBt709DisplayGamma = 2.4;
-constexpr std::size_t kTransferSteps = 4096;
-
-const std::array<std::byte, kTransferSteps + 1>& Bt709ToSrgb() {
-  static const auto table = [] {
-    std::array<std::byte, kTransferSteps + 1> samples{};
-    for (std::size_t i = 0; i < samples.size(); ++i) {
-      const auto linear = std::pow(double(i) / kTransferSteps, kBt709DisplayGamma);
-      const auto srgb = linear <= 0.0031308 ? 12.92 * linear : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
-      samples[i] = std::byte(std::lround(srgb * 255));
-    }
-    return samples;
-  }();
-  return table;
-}
-
 float EncodeTransfer(std::byte sample, media::ColorTransfer transfer) {
   const float value = std::to_integer<unsigned>(sample) / 255.0F;
   if (transfer == media::ColorTransfer::SRGB || transfer == media::ColorTransfer::Unknown) return value;
@@ -142,162 +98,16 @@ detail::EncoderPicture MakeEncoderPicture(std::span<const std::byte> source, boo
   return R::Success(std::move(result));
 }
 
-detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const ColorSurface& surface,
+detail::EncoderPicture ReadEncoderPicture(RenderBackend& backend, const Texture& surface,
                                          const media::VideoFormat& format, media::MediaTimestamp pts,
                                          std::optional<media::MediaTimestamp> duration) {
   auto read = ReadBgfxPixels(backend, surface);
   if (!read.Succeeded()) return detail::EncoderPicture::Failure(read.Error());
-  return MakeEncoderPicture(read.Value().AsBytes(), surface.pixels.image.format == PixelFormat::Bgra8Unorm,
-                            surface.pixels.origin, false, format, pts, duration);
-}
-
-Task<detail::ImportedTexture> CompleteImport(detail::ImportedTexture result) {
-  co_return result;
-}
-
-struct SampleAxis {
-  SampleAxis(double position, std::uint32_t start, std::uint32_t extent) {
-    const auto end = start + extent - 1;
-    position = std::clamp(position, double(start), double(end));
-    first = static_cast<std::uint32_t>(position);
-    second = std::min(first + 1, end);
-    weight = position - first;
-  }
-
-  std::uint32_t first, second;
-  double weight;
-};
-
-struct VideoSampleAxis {
-  SampleAxis luma, chroma;
-};
-
-std::vector<VideoSampleAxis> VideoSampleAxes(std::uint32_t length, double crop, bool invert,
-                                          std::uint32_t start, std::uint32_t extent) {
-  const auto chroma_start = start / 2;
-  const auto chroma_extent = (start + extent - 1) / 2 - chroma_start + 1;
-  std::vector<VideoSampleAxis> axes;
-  axes.reserve(length);
-  for (std::uint32_t i = 0; i < length; ++i) {
-    const auto t = 0.5 + ((i + 0.5) / length - 0.5) * crop;
-    const auto position = start + (invert ? 1 - t : t) * extent;
-    axes.push_back({{position - 0.5, start, extent}, {position / 2 - 0.5, chroma_start, chroma_extent}});
-  }
-  return axes;
-}
-
-struct CpuPlaneView {
-  explicit CpuPlaneView(const media::VideoPlane& plane)
-      : bytes(plane.data.AsBytes()), row_stride(plane.row_stride), pixel_stride(plane.pixel_stride) {}
-
-  double Sample(const SampleAxis& x, const SampleAxis& y, std::size_t channel = 0) const {
-    const auto row = [&](std::uint32_t index) {
-      const auto* samples = bytes.data() + index * row_stride + channel;
-      return std::lerp(double(std::to_integer<unsigned>(samples[x.first * pixel_stride])),
-                       double(std::to_integer<unsigned>(samples[x.second * pixel_stride])), x.weight);
-    };
-    return std::lerp(row(y.first), row(y.second), y.weight);
-  }
-
-  std::span<const std::byte> bytes;
-  std::size_t row_stride, pixel_stride;
-};
-
-detail::ImportedTexture ImportCpuVideo(const media::VideoFrame& frame, media::VideoTextureOptions options,
-                                       const avkit::detail::VideoTextureFit& fit) {
-  using R = detail::ImportedTexture;
-  using namespace media;
-  const auto& format = frame.format;
-  const bool planar = format.pixel_format == VideoPixelFormat::I420;
-  if ((!planar && format.pixel_format != VideoPixelFormat::NV12) ||
-      format.primaries == ColorPrimaries::BT2020 || format.matrix == ColorMatrix::BT2020 ||
-      format.transfer == ColorTransfer::PQ || format.transfer == ColorTransfer::HLG) {
-    return R::Failure({kUnsupported, "CPU video import requires eight-bit SDR I420 or NV12 frames"});
-  }
-
-  const auto visible = format.visible;
-  const bool rotated = format.rotation == VideoRotation::Clockwise90 || format.rotation == VideoRotation::Clockwise270;
-  const auto& [area, crop_width, crop_height] = fit;
-  // Resolve crop and bilinear weights once per axis. Quarter turns exchange the output axes.
-  const auto columns = VideoSampleAxes(rotated ? area.height : area.width, rotated ? crop_height : crop_width,
-      format.rotation == VideoRotation::Clockwise180 || format.rotation == VideoRotation::Clockwise270,
-      visible.x, visible.width);
-  const auto rows = VideoSampleAxes(rotated ? area.width : area.height, rotated ? crop_width : crop_height,
-      format.rotation == VideoRotation::Clockwise180 || format.rotation == VideoRotation::Clockwise90,
-      visible.y, visible.height);
-  const CpuPlaneView y_plane(frame.planes[0]), u_plane(frame.planes[1]), v_plane(frame.planes[planar ? 2 : 1]);
-  const bool full = format.range == ColorRange::Full;
-  const double kr = format.matrix == ColorMatrix::BT709 ? 0.2126 : 0.299;
-  const double kb = format.matrix == ColorMatrix::BT709 ? 0.0722 : 0.114;
-  const auto* transfer = format.transfer == ColorTransfer::BT709 ? &Bt709ToSrgb() : nullptr;
-  const auto byte = [transfer](double value) {
-    value = std::clamp(value, 0., 1.);
-    if (!transfer) return std::byte(std::lround(value * 255));
-    return (*transfer)[static_cast<std::size_t>(value * kTransferSteps + 0.5)];
-  };
-
-  const auto stride = std::size_t(options.width) * 4;
-  auto bytes = std::make_shared<Bytes>(stride * options.height);
-  for (std::size_t i = 3; i < bytes->size(); i += 4) (*bytes)[i] = std::byte{255};
-  for (std::uint32_t y = 0; y < area.height; ++y) {
-    for (std::uint32_t x = 0; x < area.width; ++x) {
-      const auto& sx = columns[rotated ? y : x];
-      const auto& sy = rows[rotated ? x : y];
-      const auto luma = (y_plane.Sample(sx.luma, sy.luma) - (full ? 0 : 16)) / (full ? 255 : 219);
-      const auto cb = (u_plane.Sample(sx.chroma, sy.chroma) - 128) / (full ? 255 : 224);
-      const auto cr = (v_plane.Sample(sx.chroma, sy.chroma, planar ? 0 : 1) - 128) / (full ? 255 : 224);
-      const auto red = luma + 2 * (1 - kr) * cr, blue = luma + 2 * (1 - kb) * cb;
-      auto* pixel = bytes->data() + (area.y + y) * stride + (area.x + x) * 4;
-      pixel[0] = byte(red);
-      pixel[1] = byte((luma - kr * red - kb * blue) / (1 - kr - kb));
-      pixel[2] = byte(blue);
-    }
-  }
-  const ImageDesc image{{options.width, options.height}, PixelFormat::Rgba8Unorm};
-  return R::Success({RetainBgfxPixels(image, BufferReference(*bytes, bytes), stride), AlphaMode::Opaque});
-}
-
-ColorSurface RetainBitmap(const Bitmap& bitmap) {
-  const auto source = bitmap.Pixels();
-  auto bytes = std::make_shared<Bytes>(source.begin(), source.end());
-  for (std::size_t i = 0; i < bytes->size(); i += 4) {
-    const auto alpha = std::to_integer<unsigned>((*bytes)[i + 3]);
-    for (unsigned c = 0; c < 3; ++c) {
-      (*bytes)[i + c] = std::byte((std::to_integer<unsigned>((*bytes)[i + c]) * alpha + 127) / 255);
-    }
-  }
-  const ImageDesc desc{{bitmap.PixelWidth(), bitmap.PixelHeight()}, PixelFormat::Rgba8Unorm};
-  return {RetainBgfxPixels(desc, BufferReference(*bytes, bytes), std::size_t(desc.size.width) * 4)};
-}
-
-Task<detail::ImportedTexture> ImportSnapshot(Task<std::optional<Bitmap>> read) {
-  using R = detail::ImportedTexture;
-  try {
-    const auto snapshot = co_await std::move(read);
-    if (!snapshot) co_return R::Failure({kInvalidFrame, "The source texture has no published frame"});
-    co_return R::Success(RetainBitmap(*snapshot));
-  } catch (const std::exception& error) {
-    co_return R::Failure({kUnsupported, error.what()});
-  }
-}
-
-detail::ImportedTexture AcquireTexture(RenderBackend& backend, const ExternalTexture& texture,
-                                      const media::VideoFormat* decoded_format = nullptr) {
-  try {
-    return detail::AcquireBgfxTexture(backend, texture, decoded_format);
-  } catch (const std::exception& error) {
-    return detail::ImportedTexture::Failure({kUnsupported, error.what()});
-  }
+  return MakeEncoderPicture(read.Value().AsBytes(), surface.Info().format == PixelFormat::Bgra8Unorm,
+                            surface.Origin(), false, format, pts, duration);
 }
 
 } // namespace
-
-detail::ImportedTexture detail::FitCpuVideoFrame(const media::VideoFrame& frame, media::VideoTextureOptions options) {
-  if (!frame.Validate() || frame.Storage() != media::VideoStorage::Cpu || options.width == 0 || options.height == 0 ||
-      options.width > 8192 || options.height > 8192)
-    return ImportedTexture::Failure({kInvalidFrame, "Invalid CPU video frame or target extent"});
-  return ImportCpuVideo(frame, options, avkit::detail::FitVideoTexture(frame.format, options));
-}
 
 detail::EncoderPicture detail::EncodeCpuBitmap(const Bitmap& bitmap, const media::VideoFormat& format,
                                               media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) {
@@ -306,75 +116,12 @@ detail::EncoderPicture detail::EncodeCpuBitmap(const Bitmap& bitmap, const media
   return MakeEncoderPicture(bitmap.Pixels(), false, RowOrigin::TopLeft, true, format, pts, duration);
 }
 
-Task<Result<ColorSurface, RenderError>> ImportBgfxTexture(
-    RenderBackend& backend, std::shared_ptr<const ExternalTexture> texture, TextureTransferPolicy policy) {
-  using R = detail::ImportedTexture;
-  if (!texture) return CompleteImport(R::Failure({kInvalidFrame, "Expected an SDK texture"}));
-  auto imported = AcquireTexture(backend, *texture);
-  if (imported.Succeeded() || policy == TextureTransferPolicy::GpuOnly) {
-    return CompleteImport(std::move(imported));
-  }
-  try {
-    return ImportSnapshot(texture->SnapshotAsync());
-  } catch (const std::exception& error) {
-    return CompleteImport(R::Failure({kUnsupported, error.what()}));
-  }
-}
-
-Task<Result<ColorSurface, RenderError>> ImportBgfxVideoFrame(
-    RenderBackend& backend, media::VideoFrame frame, media::VideoTextureOptions options, TextureTransferPolicy policy) {
-  auto result = ImportDecodedBgfxFrame(backend, frame, options, policy);
-  return CompleteImport(result.Succeeded() ? detail::ImportedTexture::Success(std::move(result).Value().surface)
-                                           : detail::ImportedTexture::Failure(result.Error()));
-}
-
-Result<ImportedVideoFrame, RenderError> ImportDecodedBgfxFrame(
-    RenderBackend& backend, const media::VideoFrame& frame, media::VideoTextureOptions options,
-    TextureTransferPolicy policy) {
-  using R = Result<ImportedVideoFrame, RenderError>;
-  if (!frame.Validate() || !options.width || !options.height || options.width > 8192 || options.height > 8192 ||
-      (options.fit != ImageFit::Contain && options.fit != ImageFit::Cover)) {
-    return R::Failure({kInvalidFrame, "Invalid video frame or texture options"});
-  }
-  const auto fit = avkit::detail::FitVideoTexture(frame.format, options);
-  const auto wrap = [&](detail::ImportedTexture surface) {
-    if (!surface.Succeeded()) return R::Failure(surface.Error());
-    return R::Success({std::move(surface).Value(), fit.SourceToTextureUv(options)});
-  };
-  if (frame.Storage() == media::VideoStorage::Platform) {
-    auto texture = media::MakeExternalTexture(frame, options);
-    if (!texture.Succeeded()) return R::Failure({kUnsupported, texture.Error().message});
-    return wrap(AcquireTexture(backend, *texture.Value(), &frame.format));
-  }
-  if (policy == TextureTransferPolicy::GpuOnly) {
-    return R::Failure({kUnsupported, "A GPU transfer requires a platform video frame"});
-  }
-  try {
-    return wrap(ImportCpuVideo(frame, options, fit));
-  } catch (const std::bad_alloc&) {
-    return R::Failure({RenderErrorCode::OutOfMemory, "Cannot allocate the CPU video upload"});
-  }
-}
-
-Result<VideoPreviewImage, RenderError> MakeBgfxPreviewImage(
-    RenderBackend& backend, const ColorSurface& surface, media::MediaTimestamp pts, TextureTransferPolicy policy) {
-  using R = Result<VideoPreviewImage, RenderError>;
-  auto published = detail::PublishBgfxTexture(backend, surface, pts);
-  if (published.Succeeded()) return R::Success(std::move(published).Value());
-  if (policy == TextureTransferPolicy::GpuOnly || published.Error().code != kUnsupported) {
-    return R::Failure(published.Error());
-  }
-  auto bitmap = detail::ReadBgfxBitmap(backend, surface);
-  if (!bitmap.Succeeded()) return R::Failure(bitmap.Error());
-  return R::Success(std::move(bitmap).Value());
-}
-
 Result<media::VideoFrame, RenderError> MakeBgfxEncoderFrame(
-    RenderBackend& backend, const ColorSurface& surface, const media::VideoEncoderConfig& config,
+    RenderBackend& backend, const Texture& surface, const media::VideoEncoderConfig& config,
     media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) {
   using R = detail::EncoderPicture;
   const auto& format = config.input;
-  if (!format.Validate() || surface.pixels.image.size != PixelSize{format.width, format.height} ||
+  if (!format.Validate() || surface.Info().size != PixelSize{format.width, format.height} ||
       pts.timescale <= 0 || (duration && (duration->timescale <= 0 || duration->ticks <= 0))) {
     return R::Failure({kInvalidFrame, "The composite does not match the encoder input geometry or timing"});
   }

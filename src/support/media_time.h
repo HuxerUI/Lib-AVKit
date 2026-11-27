@@ -1,11 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 
-#include <huxerui/media_format.h>
+#include <huxerui/avkit/component.h>
 
 namespace huxerui::avkit::detail {
 
@@ -32,6 +33,11 @@ inline MediaTimestamp Add(MediaTimestamp a, MediaTimestamp b) {
 inline MediaTimestamp Difference(MediaTimestamp end, MediaTimestamp start) {
   if (start.ticks == std::numeric_limits<std::int64_t>::min()) throw std::runtime_error("Media time overflow");
   return Add(end, {-start.ticks, start.timescale});
+}
+
+inline MediaTimestamp SourceTime(const ClipTiming& clip, MediaTimestamp time) {
+  const auto offset = Difference(time, clip.timeline.start);
+  return clip.source.reverse ? Difference(clip.source.range.end, offset) : Add(clip.source.range.start, offset);
 }
 
 inline bool Before(MediaTimestamp a, MediaTimestamp b) {
@@ -69,6 +75,20 @@ inline std::uint32_t UniformFrameIndex(MediaTimestamp offset, MediaTimestamp dur
     else last = middle - 1;
   }
   return first;
+}
+
+/// @brief Selects a frame from a fixed-rate mask sequence using the clip's elapsed project time.
+inline std::uint32_t ClipMaskFrameIndex(MediaTimestamp offset, MediaTimestamp frame_interval,
+                                       std::uint32_t frame_count, AnimationPlayback playback) {
+  if (!frame_count || !offset.timescale || !frame_interval.timescale || offset.ticks < 0 || frame_interval.ticks <= 0 ||
+      (playback != AnimationPlayback::HoldLast && playback != AnimationPlayback::Loop))
+    throw std::invalid_argument("Invalid clip mask sequence sample");
+  const auto common = std::lcm<std::uint64_t>(offset.timescale, frame_interval.timescale);
+  if (common > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("Incompatible mask sequence clocks");
+  const auto scale = static_cast<std::uint32_t>(common);
+  const auto index = ExactTicks(offset, scale) / ExactTicks(frame_interval, scale);
+  return static_cast<std::uint32_t>(playback == AnimationPlayback::Loop ? index % frame_count :
+                                    std::min(index, std::int64_t(frame_count - 1)));
 }
 
 inline MediaTimestamp Retime(MediaTimestamp time, MediaTimestamp previous, MediaTimestamp duration) {

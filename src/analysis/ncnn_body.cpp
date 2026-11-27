@@ -11,7 +11,7 @@ namespace huxerui::avkit::analysis::detail {
 namespace {
 
 using namespace media;
-using Detections = std::vector<TrackingDetection>;
+using Detections = std::vector<LandmarkDetection>;
 using DetectionResult = Result<std::optional<Detections>, std::string>;
 
 constexpr Point kRight{1, 0}, kDown{0, 1};
@@ -19,9 +19,13 @@ constexpr Rect kImageBounds{0, 0, 1, 1};
 constexpr std::size_t kMaxPeople = 6;
 
 Point Add(Point a, Point b) { return {a.x + b.x, a.y + b.y}; }
+
 Point Difference(Point a, Point b) { return {a.x - b.x, a.y - b.y}; }
+
 Point Scale(Point p, float factor) { return {p.x * factor, p.y * factor}; }
+
 float Dot(Point a, Point b) { return a.x * b.x + a.y * b.y; }
+
 float Length(Point p) { return std::hypot(p.x, p.y); }
 
 Point Normalize(const CpuImage& image, Point p) { return {p.x / image.width, p.y / image.height}; }
@@ -685,9 +689,9 @@ private:
     Detections result;
     for (std::size_t i = 0; i < regions.size(); ++i) {
       if (stop.stop_requested()) return {};
-      const auto count = std::ranges::count(candidates, i, &TrackingDetection::region);
+      const auto count = std::ranges::count(candidates, i, &LandmarkDetection::region);
       if (count == 1) {
-        result.push_back(std::move(*std::ranges::find(candidates, i, &TrackingDetection::region)));
+        result.push_back(std::move(*std::ranges::find(candidates, i, &LandmarkDetection::region)));
       } else if (count == 0 && regions[i].part != TrackedPart::Face) {
         if (auto hand = RetryHand(image, regions, i, stop))
           result.push_back({{regions[i].person.value, std::move(*hand)}, i});

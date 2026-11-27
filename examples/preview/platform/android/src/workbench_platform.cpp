@@ -26,8 +26,6 @@ std::function<void()> ObserveWorkbenchMagnification(WindowHandle, std::function<
   return {};
 }
 
-bool RunWorkbenchRenderIteration(const std::function<bool()>& iteration) { return iteration(); }
-
 void LogWorkbench(WorkbenchLogLevel level, const char* format, ...) {
   constexpr std::array priorities{ANDROID_LOG_INFO, ANDROID_LOG_WARN, ANDROID_LOG_ERROR};
   va_list args;

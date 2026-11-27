@@ -98,7 +98,7 @@ bool CanSample(id<MTLTexture> texture) {
          (texture.usage == MTLTextureUsageUnknown || (texture.usage & MTLTextureUsageShaderRead) != 0);
 }
 
-class MetalStorage final : public SurfaceStorage {
+class MetalStorage final : public TextureBacking {
 public:
   explicit MetalStorage(id<MTLTexture> handle) : texture(handle) {}
   id<MTLTexture> texture;
@@ -106,12 +106,12 @@ public:
   Owned<CVMetalTextureRef> view;
 };
 
-id<MTLTexture> TextureFromSurface(const ImageSurface& surface) {
-  auto storage = std::dynamic_pointer_cast<const MetalStorage>(surface.storage);
+id<MTLTexture> TextureFromSurface(const Texture& surface) {
+  auto storage = std::dynamic_pointer_cast<const MetalStorage>(TextureAccess::Backing(surface));
   return storage ? storage->texture : nil;
 }
 
-ColorSurface RetainColorTexture(id<MTLTexture> texture, RowOrigin origin) {
+Texture RetainColorTexture(id<MTLTexture> texture, RowOrigin origin) {
   PixelFormat format;
   switch (texture.pixelFormat) {
     case MTLPixelFormatRGBA8Unorm: format = PixelFormat::Rgba8Unorm; break;
@@ -122,15 +122,15 @@ ColorSurface RetainColorTexture(id<MTLTexture> texture, RowOrigin origin) {
       texture.height > std::numeric_limits<std::uint16_t>::max()) {
     throw std::invalid_argument("Expected a sampleable 2D Metal texture");
   }
-  const ImageDesc image{{static_cast<std::uint32_t>(texture.width), static_cast<std::uint32_t>(texture.height)}, format};
-  return {{image, origin, std::make_shared<MetalStorage>(texture)}, AlphaMode::Premultiplied};
+  const ImageInfo image{{static_cast<std::uint32_t>(texture.width), static_cast<std::uint32_t>(texture.height)}, format};
+  return TextureAccess::Make(image, origin, std::make_shared<MetalStorage>(texture));
 }
 
 class MetalTextureBridge final : public BgfxTextureBridge {
 public:
   explicit MetalTextureBridge(id<MTLDevice> device) : device_(device) {}
 
-  std::shared_ptr<const SurfaceStorage> CreateOutput(ImageDesc image) const override {
+  std::shared_ptr<const TextureBacking> CreateOutput(ImageInfo image) const override {
     auto* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MetalFormat(image.format)
                                                                           width:image.size.width
                                                                          height:image.size.height
@@ -142,9 +142,9 @@ public:
     return std::make_shared<MetalStorage>(texture);
   }
 
-  std::uint64_t GetTexture(const ImageSurface& surface) const override {
+  std::uint64_t GetTexture(const Texture& surface) const override {
     id<MTLTexture> texture = TextureFromSurface(surface);
-    const auto& image = surface.image;
+    const auto image = surface.Info();
     if (!CanSample(texture) || texture.device != device_ || texture.pixelFormat != MetalFormat(image.format) ||
         texture.width != image.size.width || texture.height != image.size.height) return 0;
     return reinterpret_cast<std::uint64_t>((__bridge void*)texture);
@@ -169,6 +169,7 @@ public:
             texture, origin == MetalTexture::Origin::TopLeft ? RowOrigin::TopLeft : RowOrigin::BottomLeft));
       }
       const auto* mailbox = dynamic_cast<const PixelBufferTexture*>(&source);
+
       Owned<CVPixelBufferRef> pixels(mailbox ? mailbox->AcquireFrame() : nullptr);
       if (!pixels) return R::Failure({RenderErrorCode::Unsupported, "Expected a published Apple video texture"});
       const PixelSize size{static_cast<std::uint32_t>(CVPixelBufferGetWidth(pixels.get())),
@@ -193,6 +194,7 @@ public:
               MTLPixelFormatBGRA8Unorm, size.width, size.height, 0, &view) != kCVReturnSuccess) {
         return R::Failure({RenderErrorCode::Unsupported, "CoreVideo pixels cannot be shared with Metal"});
       }
+
       Owned<CVMetalTextureRef> owned_view(view);
       auto storage = std::make_shared<MetalStorage>(CVMetalTextureGetTexture(view));
       if (!CanSample(storage->texture)) {
@@ -200,17 +202,17 @@ public:
       }
       storage->view = std::move(owned_view);
       storage->pixels = std::move(pixels);
-      return R::Success({{{size, PixelFormat::Bgra8Unorm}, RowOrigin::TopLeft, std::move(storage)}});
+      return R::Success(TextureAccess::Make({size, PixelFormat::Bgra8Unorm}, RowOrigin::TopLeft, std::move(storage)));
     }
   }
 
-  PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp) override {
+  PublishedTexture Publish(const Texture& surface, media::MediaTimestamp) override {
     using R = PublishedTexture;
     try {
-      const auto [width, height] = surface.pixels.image.size;
+      const auto [width, height] = surface.Info().size;
       auto mailbox = std::make_shared<MetalTexture>(Size{float(width), float(height)});
-      mailbox->Publish({.texture = TextureFromSurface(surface.pixels),
-                        .origin = surface.pixels.origin == RowOrigin::TopLeft
+      mailbox->Publish({.texture = TextureFromSurface(surface),
+                        .origin = surface.Origin() == RowOrigin::TopLeft
                                       ? MetalTexture::Origin::TopLeft : MetalTexture::Origin::BottomLeft});
       mailbox->Finish();
       return R::Success(std::move(mailbox));
@@ -219,7 +221,7 @@ public:
     }
   }
 
-  EncoderPicture Encode(const ColorSurface& surface, const media::VideoEncoderConfig& config,
+  EncoderPicture Encode(const Texture& surface, const media::VideoEncoderConfig& config,
                                 media::MediaTimestamp pts, std::optional<media::MediaTimestamp> duration) override {
     using R = EncoderPicture;
     using namespace media;
@@ -233,14 +235,14 @@ public:
     }
     @autoreleasepool {
       try {
-        auto pixels = encoder_pool_.Allocate(surface.pixels.image.size, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        auto pixels = encoder_pool_.Allocate(surface.Info().size, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
         CVBufferSetAttachment(pixels.get(), kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
                               kCVAttachmentMode_ShouldPropagate);
         CVBufferSetAttachment(pixels.get(), kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
                               kCVAttachmentMode_ShouldPropagate);
         CVBufferSetAttachment(pixels.get(), kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
                               kCVAttachmentMode_ShouldPropagate);
-        auto* image = [CIImage imageWithMTLTexture:TextureFromSurface(surface.pixels)
+        auto* image = [CIImage imageWithMTLTexture:TextureFromSurface(surface)
                                           options:@{kCIImageColorSpace: (__bridge id)Srgb()}];
         auto* destination = [[CIRenderDestination alloc] initWithPixelBuffer:pixels.get()];
         Owned<CGColorSpaceRef> bt709(CGColorSpaceCreateWithName(kCGColorSpaceITUR_709));
@@ -285,14 +287,14 @@ private:
 
 } // namespace
 
-std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageInfo target, bgfx::Init init, std::stop_token stop) {
   init.type = bgfx::RendererType::Metal;
-  if (init.swapChain.nwh) return CreateBgfxBackend(target, init);
+  if (init.swapChain.nwh) return CreateBgfxBackend(target, init, stop);
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (device == nil) throw std::invalid_argument("A Metal device is required");
     init.platformData.context = (__bridge void*)device;
-    return CreateBgfxBackend(target, init, std::make_unique<MetalTextureBridge>(device));
+    return CreateBgfxBackend(target, init, stop, std::make_unique<MetalTextureBridge>(device));
   }
 }
 

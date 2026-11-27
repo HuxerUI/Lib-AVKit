@@ -3,15 +3,21 @@
 #include <condition_variable>
 #include <mutex>
 #include <stop_token>
+#include <utility>
+
+#include <huxerui/avkit/render.h>
 
 namespace huxerui::avkit::render::detail {
 
-// bgfx owns one process-wide context. Wait on render workers so UI cleanup can still join them.
+// All bgfx backends share this reservation. Native render workers may wait with a stop token.
 class BgfxRenderLease {
 public:
   explicit BgfxRenderLease(std::stop_token stop = {}) {
     std::unique_lock lock(mutex_);
-    if (ready_.wait(lock, stop, [] { return !occupied_; }) && !stop.stop_requested()) {
+#if !defined(__EMSCRIPTEN__)
+    if (stop.stop_possible()) ready_.wait(lock, stop, [] { return !occupied_; });
+#endif
+    if (!occupied_ && !stop.stop_requested()) {
       occupied_ = true;
       acquired_ = true;
     }
@@ -27,7 +33,11 @@ public:
   }
 
   BgfxRenderLease(const BgfxRenderLease&) = delete;
+
   BgfxRenderLease& operator=(const BgfxRenderLease&) = delete;
+
+  BgfxRenderLease(BgfxRenderLease&& other) noexcept : acquired_(std::exchange(other.acquired_, false)) {}
+
   explicit operator bool() const { return acquired_; }
 
 private:
@@ -36,5 +46,8 @@ private:
   inline static bool occupied_{};
   bool acquired_{};
 };
+
+/// @brief Opens the platform backend, or returns an empty pointer if the wait is cancelled.
+std::unique_ptr<RenderBackend> OpenBgfxBackend(ImageInfo target, RenderPlatformHandles handles, std::stop_token stop);
 
 } // namespace huxerui::avkit::render::detail

@@ -30,28 +30,28 @@ inline GLuint AllocateRgba(PixelSize size) {
   return name;
 }
 
-class GlStorage final : public SurfaceStorage {
+class GlStorage final : public TextureBacking {
 public:
-  GlStorage(std::shared_ptr<const int> owner, ImageDesc image, RowOrigin origin, std::shared_ptr<GlTextureName> name)
+  GlStorage(std::shared_ptr<const int> owner, ImageInfo image, RowOrigin origin, std::shared_ptr<GlTextureName> name)
       : owner(std::move(owner)), image(image), origin(origin), name(std::move(name)) {}
 
   std::shared_ptr<const int> owner;
-  ImageDesc image;
+  ImageInfo image;
   RowOrigin origin;
   std::shared_ptr<GlTextureName> name;
 };
 
 class GlTextureBridge : public BgfxTextureBridge {
 public:
-  std::shared_ptr<const SurfaceStorage> CreateOutput(ImageDesc image) const override {
+  std::shared_ptr<const TextureBacking> CreateOutput(ImageInfo image) const override {
     auto record = std::make_shared<GlTextureName>();
     record->texture = AllocateRgba(image.size);
-    return Retain(image, RowOrigin::BottomLeft, std::move(record)).storage;
+    return TextureAccess::Backing(Retain(image, RowOrigin::BottomLeft, std::move(record)));
   }
 
-  std::uint64_t GetTexture(const ImageSurface& surface) const override {
-    const auto* storage = dynamic_cast<const GlStorage*>(surface.storage.get());
-    if (!storage || storage->owner != owner_ || storage->image != surface.image || storage->origin != surface.origin)
+  std::uint64_t GetTexture(const Texture& surface) const override {
+    const auto* storage = dynamic_cast<const GlStorage*>(TextureAccess::Backing(surface).get());
+    if (!storage || storage->owner != owner_ || storage->image != surface.Info() || storage->origin != surface.Origin())
       return 0;
     return storage->name->texture;
   }
@@ -69,9 +69,10 @@ public:
   }
 
 protected:
-  ImageSurface Retain(ImageDesc image, RowOrigin origin, std::shared_ptr<GlTextureName> name) const {
+  Texture Retain(ImageInfo image, RowOrigin origin, std::shared_ptr<GlTextureName> name,
+                     std::optional<AlphaMode> alpha = {}) const {
     names_.push_back(name);
-    return {image, origin, std::make_shared<GlStorage>(owner_, image, origin, std::move(name))};
+    return TextureAccess::Make(image, origin, std::make_shared<GlStorage>(owner_, image, origin, std::move(name)), alpha);
   }
 
   void CollectReleasedNames() const {

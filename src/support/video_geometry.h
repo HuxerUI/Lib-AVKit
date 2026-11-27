@@ -13,7 +13,7 @@ struct VideoTextureFit {
   media::VideoRectangle area;
   double crop_width{1}, crop_height{1};
 
-  Transform2D SourceToTextureUv(media::VideoTextureOptions options) const {
+  Affine2D SourceToTextureUv(media::VideoTextureOptions options) const {
     const auto x = static_cast<float>(area.width / (options.width * crop_width));
     const auto y = static_cast<float>(area.height / (options.height * crop_height));
     const auto left = float(area.x) / options.width;
@@ -22,11 +22,16 @@ struct VideoTextureFit {
   }
 };
 
-inline VideoTextureFit FitVideoTexture(const media::VideoFormat& format, media::VideoTextureOptions options) {
+inline std::pair<double, double> VideoDisplaySize(const media::VideoFormat& format) {
   double width = double(format.visible.width) * format.aspect_width / format.aspect_height;
   double height = format.visible.height;
   if (format.rotation == media::VideoRotation::Clockwise90 || format.rotation == media::VideoRotation::Clockwise270)
     std::swap(width, height);
+  return {width, height};
+}
+
+inline VideoTextureFit FitVideoTexture(const media::VideoFormat& format, media::VideoTextureOptions options) {
+  const auto [width, height] = VideoDisplaySize(format);
   const auto scale_x = options.width / width, scale_y = options.height / height;
   VideoTextureFit fit{{0, 0, options.width, options.height}};
   if (options.fit == ImageFit::Cover) {

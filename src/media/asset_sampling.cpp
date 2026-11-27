@@ -1,4 +1,5 @@
 #include <huxerui/avkit/asset_sampling.h>
+#include <huxerui/avkit/resource_catalog.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <huxerui/external_texture.h>
 
 #include "project/project_internal.h"
+#include "media/image_asset.h"
 #include "support/cancellation.h"
 #include "support/media_time.h"
 
@@ -28,6 +30,7 @@ using detail::ExactTicks;
 struct AssetFileStamp {
   std::uint64_t size;
   std::optional<std::filesystem::file_time_type> modified;
+
   bool operator==(const AssetFileStamp&) const = default;
 };
 
@@ -44,21 +47,22 @@ AssetFileStamp InspectFile(const File& file) {
 }
 
 struct AssetVersion {
-  File file;
+  std::shared_ptr<const AssetSource> media;
   AssetFileStamp stamp;
-  std::uint64_t revision;
+
   bool operator==(const AssetVersion&) const = default;
 };
 
-AssetVersion Resolve(const ProjectSnapshot& project, AssetId id, std::uint32_t track, TrackKind kind) {
-  const auto& asset = detail::FindAsset(project, id);
-  if (detail::FindSourceTrack(asset.source, track).kind != kind) throw std::invalid_argument("Incorrect sampling track kind");
-  return {asset.source.file, InspectFile(asset.source.file), asset.content_revision};
+AssetVersion Resolve(const ProjectSnapshot& project, const ResourceRef& resource, std::uint32_t track, TrackKind kind) {
+  const auto media = project.resources ? project.resources->FindMedia(resource) : nullptr;
+  if (!media) throw std::invalid_argument("Unknown media resource: " + resource.key);
+  if (detail::FindSourceTrack(*media, track).kind != kind) throw std::invalid_argument("Incorrect sampling track kind");
+  return {media, InspectFile(media->file)};
 }
 
 void CheckVersion(const AssetVersion& version, std::stop_token stop) {
   CheckCancelled(stop);
-  if (InspectFile(version.file) != version.stamp) throw std::runtime_error("Asset changed during timeline sampling");
+  if (InspectFile(version.media->file) != version.stamp) throw std::runtime_error("Asset changed during timeline sampling");
 }
 
 struct ThumbnailKey {
@@ -66,6 +70,7 @@ struct ThumbnailKey {
   std::uint32_t track;
   PixelSize size;
   MediaTimestamp time;
+
   bool operator==(const ThumbnailKey&) const = default;
 };
 
@@ -73,6 +78,7 @@ struct BucketKey {
   AssetVersion version;
   std::uint32_t track;
   std::int64_t start, samples;
+
   bool operator==(const BucketKey&) const = default;
 };
 
@@ -109,7 +115,35 @@ struct AssetSampler::Impl {
     if (!make_thumbnail || !request.size.width || !request.size.height)
       throw std::invalid_argument("Thumbnail needs an image adapter and size");
     const auto version = Resolve(project, request.asset, request.track, TrackKind::Video);
-    const auto movie = ImportMovie(version.file);
+    if (version.media->still_image) {
+      ThumbnailStrip result(request.source_times.size());
+      if (result.empty()) return result;
+      const auto key = ThumbnailKey{version, request.track, request.size, {}};
+      auto image = thumbnails.Find(key);
+      if (!image) {
+        const auto decoded = render::detail::DecodeResourceImage(version.media->file);
+        const auto size = decoded.info.size;
+        const auto& pixels = decoded;
+        auto bitmap = Bitmap::CopyPixels(size.width, size.height, pixels.bytes.AsBytes(), pixels.row_bytes,
+                                         Bitmap::PixelFormat::Rgba8888);
+        const auto aspect = double(request.size.width) / request.size.height;
+        const auto width = std::min(size.width, static_cast<std::uint32_t>(std::clamp(size.height * aspect, 1.0, double(size.width))));
+        const auto height = std::min(size.height, static_cast<std::uint32_t>(std::clamp(size.width / aspect, 1.0, double(size.height))));
+        bitmap = bitmap.Crop((size.width - width) / 2, (size.height - height) / 2, width, height)
+                       .Resize(request.size.width, request.size.height);
+        image = Thumbnail{{}, std::move(bitmap), request.size};
+        CheckVersion(version, stop);
+        thumbnails.Put(key, *image);
+      }
+      for (std::size_t index = 0; index < result.size(); ++index) {
+        CheckCancelled(stop);
+        result[index] = *image;
+        result[index]->pts = request.source_times[index];
+        if (ready) ready(index, result[index]);
+      }
+      return result;
+    }
+    const auto movie = ImportMovie(version.media->file);
     if (movie.video.id != request.track) throw std::invalid_argument("Video track changed after import");
     for (const auto at : request.source_times) {
       if (Before(at, movie.video_range.start) || !Before(at, movie.video_range.end))
@@ -181,7 +215,7 @@ struct AssetSampler::Impl {
   Waveform ReadWaveform(const ProjectSnapshot& project, const WaveformRequest& request, std::stop_token stop) {
     CheckCancelled(stop);
     const auto version = Resolve(project, request.asset, request.track, TrackKind::Audio);
-    const auto movie = ImportMovieAudio(version.file);
+    const auto movie = ImportMovieAudio(version.media->file);
     const auto rate = movie.pcm.sample_rate, channels = movie.pcm.ChannelCount();
     if (movie.audio.id != request.track || Before(request.source_range.start, movie.audio_range.start) ||
         Before(movie.audio_range.end, request.source_range.end) || !Before(request.source_range.start, request.source_range.end))
@@ -269,14 +303,14 @@ struct AssetSampler::Impl {
     return left;
   }
 
-  MovieCodecProviders providers;
+  CodecProviders providers;
   MakeThumbnail make_thumbnail;
   CodecPolicy policy;
   Cache<ThumbnailKey, std::optional<Thumbnail>, 96> thumbnails;
   Cache<BucketKey, std::vector<WaveformPeak>, 4096> buckets;
 };
 
-AssetSampler::AssetSampler(MovieCodecProviders providers, MakeThumbnail make_thumbnail, CodecPolicy policy)
+AssetSampler::AssetSampler(CodecProviders providers, MakeThumbnail make_thumbnail, CodecPolicy policy)
     : impl_(std::make_unique<Impl>(std::move(providers), std::move(make_thumbnail), policy)) {}
 
 AssetSampler::~AssetSampler() = default;

@@ -17,7 +17,7 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-struct D3DStorage final : SurfaceStorage {
+struct D3DStorage final : TextureBacking {
   ComPtr<ID3D11Texture2D> texture;
 };
 
@@ -36,19 +36,19 @@ public:
 
   ID3D11Device* Device() const { return device_.Get(); }
 
-  std::shared_ptr<const SurfaceStorage> CreateOutput(ImageDesc image) const override {
+  std::shared_ptr<const TextureBacking> CreateOutput(ImageInfo image) const override {
     return Allocate(image, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
   }
 
-  std::uint64_t GetTexture(const ImageSurface& surface) const override {
-    const auto* storage = dynamic_cast<const D3DStorage*>(surface.storage.get());
-    if (!storage || surface.origin != RowOrigin::TopLeft) return 0;
+  std::uint64_t GetTexture(const Texture& surface) const override {
+    const auto* storage = dynamic_cast<const D3DStorage*>(TextureAccess::Backing(surface).get());
+    if (!storage || surface.Origin() != RowOrigin::TopLeft) return 0;
     D3D11_TEXTURE2D_DESC description{};
     storage->texture->GetDesc(&description);
     ComPtr<ID3D11Device> owner;
     storage->texture->GetDevice(&owner);
-    if (owner.Get() != device_.Get() || surface.image.size != PixelSize{description.Width, description.Height} ||
-        description.Format != Format(surface.image.format)) return 0;
+    if (owner.Get() != device_.Get() || surface.Info().size != PixelSize{description.Width, description.Height} ||
+        description.Format != Format(surface.Info().format)) return 0;
     return reinterpret_cast<std::uint64_t>(storage->texture.Get());
   }
 
@@ -67,7 +67,7 @@ public:
     auto snapshot = mailbox ? mailbox->AcquireFrame() : nullptr;
     if (!snapshot) return R::Failure({RenderErrorCode::Unsupported, "Expected a published D3D11 frame"});
     try {
-      const ImageDesc image{{static_cast<std::uint32_t>(snapshot->PixelWidth()),
+      const ImageInfo image{{static_cast<std::uint32_t>(snapshot->PixelWidth()),
                              static_cast<std::uint32_t>(snapshot->PixelHeight())}, PixelFormat::Bgra8Unorm};
       auto storage = Allocate(image, D3D11_BIND_SHADER_RESOURCE);
       if (!snapshot->TryCopyTo(*context_.Get(), *storage->texture.Get())) {
@@ -76,17 +76,17 @@ public:
       const auto alpha = snapshot->Alpha() == windows::D3D11Texture::Alpha::Opaque
           ? AlphaMode::Opaque : AlphaMode::Premultiplied;
       WaitForCompletion();
-      return R::Success({{image, RowOrigin::TopLeft, std::move(storage)}, alpha});
+      return R::Success(TextureAccess::Make(image, RowOrigin::TopLeft, std::move(storage), alpha));
     } catch (const std::exception& error) {
       return R::Failure({RenderErrorCode::Unsupported, error.what()});
     }
   }
 
-  PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp) override {
+  PublishedTexture Publish(const Texture& surface, media::MediaTimestamp) override {
     using R = PublishedTexture;
     try {
-      const auto [width, height] = surface.pixels.image.size;
-      auto* source = reinterpret_cast<ID3D11Texture2D*>(GetTexture(surface.pixels));
+      const auto [width, height] = surface.Info().size;
+      auto* source = reinterpret_cast<ID3D11Texture2D*>(GetTexture(surface));
       if (!source) return R::Failure({RenderErrorCode::Unsupported, "Expected a completed D3D11 texture"});
       auto mailbox = std::make_shared<windows::D3D11Texture>(Size{float(width), float(height)});
       mailbox->Publish({.texture = source});
@@ -108,7 +108,7 @@ private:
     return DXGI_FORMAT_UNKNOWN;
   }
 
-  std::shared_ptr<D3DStorage> Allocate(ImageDesc image, UINT flags) const {
+  std::shared_ptr<D3DStorage> Allocate(ImageInfo image, UINT flags) const {
     D3D11_TEXTURE2D_DESC description{};
     description.Width = image.size.width;
     description.Height = image.size.height;
@@ -132,11 +132,11 @@ private:
 
 } // namespace
 
-std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageInfo target, bgfx::Init init, std::stop_token stop) {
   init.type = bgfx::RendererType::Direct3D11;
   auto bridge = std::make_unique<D3D11TextureBridge>();
   init.platformData.context = bridge->Device();
-  return CreateBgfxBackend(target, init, std::move(bridge));
+  return CreateBgfxBackend(target, init, stop, std::move(bridge));
 }
 
 } // namespace huxerui::avkit::render::detail

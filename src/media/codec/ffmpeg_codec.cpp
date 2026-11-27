@@ -35,6 +35,7 @@ using Frame = std::unique_ptr<AVFrame, AvDelete<AVFrame, av_frame_free>>;
 using Resampler = std::unique_ptr<SwrContext, AvDelete<SwrContext, swr_free>>;
 
 struct Failure { CodecError error; };
+
 [[noreturn]] void Fail(CodecErrorCode code, std::string message) {
   throw Failure{{code, std::move(message), {}}};
 }
@@ -176,10 +177,13 @@ void SetAudioExtra(AVCodecContext& context, CodecId codec, const Bytes& bytes) {
 CodecNegotiation Negotiation(const VideoDecoderConfig& config) {
   return {CodecImplementation::Software, VideoFrameContract{config.output_storage, config.output}, true};
 }
+
 CodecNegotiation Negotiation(const VideoEncoderConfig& config) {
   return {CodecImplementation::Software, VideoFrameContract{config.input_storage, config.input.pixel_format}};
 }
+
 CodecNegotiation Negotiation(const AudioDecoderConfig&) { return {CodecImplementation::Software, std::nullopt}; }
+
 CodecNegotiation Negotiation(const AudioEncoderConfig&) { return {CodecImplementation::Software, std::nullopt}; }
 
 Resampler MakeResampler(const AVChannelLayout& out, AVSampleFormat output, const AVChannelLayout& in,
@@ -277,6 +281,7 @@ public:
   Decoder(Context context, Config config) : context_(std::move(context)), config_(std::move(config)) {}
 
   CodecNegotiation Negotiated() const noexcept override { return Negotiation(config_); }
+
   CodecResult<SubmitStatus> TrySubmit(const EncodedPacket& input) override {
     return Guard<SubmitStatus>([&] {
       CheckOpen();
@@ -298,6 +303,7 @@ public:
       return SubmitStatus::Accepted;
     });
   }
+
   CodecResult<std::optional<typename Session::Output>> TryRead() override {
     using Output = typename Session::Output;
     return Guard<std::optional<Output>>([&]() -> std::optional<Output> {
@@ -325,7 +331,9 @@ public:
       return Output(std::move(frame));
     });
   }
+
   CodecResult<void> FinishInput() override { return Guard<void>([&] { CheckOpen(); finishing_ = true; }); }
+
   void Close() noexcept override { pending_.reset(); context_.reset(); }
 
   static constexpr std::uint32_t kClock = 1'000'000;
@@ -381,6 +389,7 @@ public:
       : context_(std::move(context)), config_(std::move(config)), format_(std::move(format)) {}
 
   CodecNegotiation Negotiated() const noexcept override { return Negotiation(config_); }
+
   CodecResult<SubmitStatus> TrySubmit(const VideoFrame& input) override {
     return Guard<SubmitStatus>([&] {
       CheckOpen();
@@ -414,6 +423,7 @@ public:
       return SubmitStatus::Accepted;
     });
   }
+
   CodecResult<std::optional<VideoEncodeOutput>> TryRead() override {
     return Guard<std::optional<VideoEncodeOutput>>([&]() -> std::optional<VideoEncodeOutput> {
       CheckOpen();
@@ -437,7 +447,9 @@ public:
                            (packet->flags & AV_PKT_FLAG_KEY) != 0};
     });
   }
+
   CodecResult<void> FinishInput() override { return Guard<void>([&] { CheckOpen(); finishing_ = true; }); }
+
   void Close() noexcept override { context_.reset(); }
 
   static constexpr std::uint32_t kClock = 90'000;
@@ -459,6 +471,7 @@ public:
                                 AV_SAMPLE_FMT_S16, context_->sample_rate)) {}
 
   CodecNegotiation Negotiated() const noexcept override { return Negotiation(config_); }
+
   CodecResult<SubmitStatus> TrySubmit(const AudioFrame& input) override {
     return Guard<SubmitStatus>([&] {
       CheckOpen();
@@ -477,6 +490,7 @@ public:
       return SubmitStatus::Accepted;
     });
   }
+
   CodecResult<std::optional<AudioEncodeOutput>> TryRead() override {
     return Guard<std::optional<AudioEncodeOutput>>([&]() -> std::optional<AudioEncodeOutput> {
       CheckOpen();
@@ -519,11 +533,14 @@ public:
       return EncodedPacket{CopyBytes(packet->data, packet->size), pts, pts, duration, true};
     });
   }
+
   CodecResult<void> FinishInput() override { return Guard<void>([&] { CheckOpen(); finishing_ = true; }); }
+
   void Close() noexcept override { pcm_.clear(); context_.reset(); }
 
 private:
   void CheckOpen() const { if (!context_) Fail(CodecErrorCode::Closed, "Audio encoder is closed"); }
+
   std::size_t BlockBytes() const { return std::size_t(context_->frame_size) * config_.input.ChannelCount() * 2; }
 
   void SendBlock() {
@@ -678,8 +695,11 @@ public:
   }
 
   CodecResult<CodecNegotiation> Probe(const VideoDecoderConfig& config) const override { return ProbeConfiguration(config); }
+
   CodecResult<CodecNegotiation> Probe(const VideoEncoderConfig& config) const override { return ProbeConfiguration(config); }
+
   CodecResult<CodecNegotiation> Probe(const AudioDecoderConfig& config) const override { return ProbeConfiguration(config); }
+
   CodecResult<CodecNegotiation> Probe(const AudioEncoderConfig& config) const override { return ProbeConfiguration(config); }
 };
 
@@ -687,138 +707,5 @@ public:
 
 std::shared_ptr<CodecProvider> CreateFFmpegCodecProvider() { return std::make_shared<FFmpegProvider>(); }
 
-void PrepareTimelineAudio(const File& source, const File& destination, media::AudioFormat output) {
-  using namespace media;
-  using detail::AtScale;
-  const auto require = [](auto result) {
-    if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
-    if constexpr (!std::is_void_v<decltype(result.Value())>) return std::move(result).Value();
-  };
-  try {
-    if (!SupportedPcm(output) || source == destination) throw std::invalid_argument("Invalid timeline audio destination");
-    auto input = require(MediaDemuxer::Open(require(source.OpenRandomAccess())));
-    const auto tracks = input.Tracks();
-    const auto found = std::ranges::find(tracks, TrackKind::Audio, &MediaTrack::kind);
-    if (found == tracks.end() || found->descriptions.size() != 1) throw std::runtime_error("Expected one audio format");
-    const auto& audio = *found;
-    const auto& description = audio.descriptions.front();
-    if (!description.sample_rate || !description.channel_count || *description.channel_count < 1 ||
-        *description.channel_count > 8) throw std::runtime_error("Invalid audio sample rate or channel layout");
-    const auto rate = *description.sample_rate;
-    const auto id = [&] {
-      switch (description.codec) {
-        case CodecId::Aac: return AV_CODEC_ID_AAC;
-        case CodecId::Mp3: return AV_CODEC_ID_MP3;
-        case CodecId::PcmU8: return AV_CODEC_ID_PCM_U8;
-        case CodecId::PcmS16Le: return AV_CODEC_ID_PCM_S16LE;
-        case CodecId::PcmS24Le: return AV_CODEC_ID_PCM_S24LE;
-        case CodecId::PcmS32Le: return AV_CODEC_ID_PCM_S32LE;
-        case CodecId::PcmF32Le: return AV_CODEC_ID_PCM_F32LE;
-        default: throw std::runtime_error("Expected MP3, AAC or PCM WAVE audio");
-      }
-    }();
-    const auto* codec = avcodec_find_decoder(id);
-    auto context = Allocate(codec);
-    context->sample_rate = static_cast<int>(rate);
-    context->pkt_timebase = {1, static_cast<int>(rate)};
-    av_channel_layout_default(&context->ch_layout, static_cast<int>(*description.channel_count));
-    if (!description.initialization_data.empty()) SetExtra(*context, description.initialization_data);
-    Check(avcodec_open2(context.get(), codec, nullptr), "Open source audio decoder");
-    require(input.SelectTracks(std::span(&audio.id, 1)));
-
-    const MediaTrack wav{.id = 1, .kind = TrackKind::Audio, .descriptions = {{.codec = CodecId::PcmS16Le,
-        .sample_rate = output.sample_rate, .channel_count = output.ChannelCount()}}};
-    detail::StagedOutput staged(destination);
-    auto muxer = require(MediaMuxer::Open(staged.TakeStream(), ContainerFormat::Wave, std::span(&wav, 1)));
-    const auto range = input.PresentationRange(audio.id);
-    std::optional<MediaTimestamp> audible;
-    std::int64_t written = 0;
-    Resampler resampler;
-    const auto convert = [&](const std::uint8_t** data, int count) {
-      const auto capacity = swr_get_out_samples(resampler.get(), count);
-      Check(capacity, "Size timeline audio conversion");
-      Bytes storage(std::size_t(capacity) * output.ChannelCount() * sizeof(std::int16_t));
-      auto* bytes = reinterpret_cast<std::uint8_t*>(storage.data());
-      const auto samples = swr_convert(resampler.get(), &bytes, capacity, data, count);
-      Check(samples, "Convert timeline audio");
-      if (samples) {
-        const auto size = std::size_t(samples) * output.ChannelCount() * sizeof(std::int16_t);
-        require(muxer.TryWrite({1, CopyBytes(bytes, size), MediaTimestamp{written, output.sample_rate}, {},
-                               MediaTimestamp{samples, output.sample_rate}}));
-        written += samples;
-      }
-      return samples;
-    };
-    Frame frame(CheckedAllocation(av_frame_alloc()));
-    const auto drain = [&] {
-      for (;;) {
-        const auto status = avcodec_receive_frame(context.get(), frame.get());
-        if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) return;
-        Check(status, "Read source audio");
-        const auto& decoded = *frame;
-        if (decoded.pts == AV_NOPTS_VALUE || decoded.sample_rate != static_cast<int>(rate))
-          throw std::runtime_error("Source audio changed timestamp or sample rate");
-        const MediaTimestamp first{decoded.pts, rate}, last{decoded.pts + decoded.nb_samples, rate};
-        const auto start = audible && detail::Before(first, *audible) ? *audible : first;
-        if (!detail::Before(start, last)) continue;
-        if (!resampler) {
-          AVChannelLayout layout{};
-          av_channel_layout_default(&layout, static_cast<int>(output.ChannelCount()));
-          SwrContext* converter = nullptr;
-          const auto status = swr_alloc_set_opts2(&converter, &layout, AV_SAMPLE_FMT_S16, output.sample_rate,
-              &decoded.ch_layout, static_cast<AVSampleFormat>(decoded.format), rate, 0, nullptr);
-          resampler.reset(converter);
-          av_channel_layout_uninit(&layout);
-          Check(status, "Configure timeline audio conversion");
-          Check(swr_init(resampler.get()), "Initialize timeline audio conversion");
-        }
-        std::vector<MediaPresentationSlice> slices;
-        require(MapToPresentation(audio.edits, start, last, slices));
-        const auto format = static_cast<AVSampleFormat>(decoded.format);
-        const bool planar = av_sample_fmt_is_planar(format);
-        const auto stride = av_get_bytes_per_sample(format) * (planar ? 1 : decoded.ch_layout.nb_channels);
-        std::vector<const std::uint8_t*> planes(planar ? decoded.ch_layout.nb_channels : 1);
-        for (const auto& slice : slices) {
-          auto begin = slice.presentation.start;
-          auto end = slice.presentation.end;
-          if (range && detail::Before(begin, range->start)) begin = range->start;
-          if (range && detail::Before(range->end, end)) end = range->end;
-          if (!detail::Before(begin, end)) continue;
-          const auto offset = AtScale(slice.media_start, rate).ticks - first.ticks +
-                              AtScale(detail::Difference(begin, slice.presentation.start), rate).ticks;
-          const auto count = AtScale(detail::Difference(end, begin), rate).ticks;
-          if (offset < 0 || count < 0 || offset > decoded.nb_samples || count > decoded.nb_samples - offset)
-            throw std::runtime_error("Invalid source audio trim");
-          if (!count) continue;
-          for (std::size_t i = 0; i < planes.size(); ++i) planes[i] = decoded.extended_data[i] + offset * stride;
-          convert(planes.data(), static_cast<int>(count));
-        }
-      }
-    };
-    Packet packet(CheckedAllocation(av_packet_alloc()));
-    while (auto event = require(input.Read())) {
-      if (const auto* start = std::get_if<TrackDecodeStart>(&*event)) audible = start->first_audible_pts;
-      const auto* compressed = std::get_if<ContainerPacket>(&*event);
-      if (!compressed) continue;
-      const auto data = compressed->data.AsBytes();
-      if (!compressed->pts || data.empty() || data.size() > std::numeric_limits<int>::max())
-        throw std::runtime_error("Invalid source audio packet");
-      av_packet_unref(packet.get());
-      Check(av_new_packet(packet.get(), static_cast<int>(data.size())), "Allocate source audio packet");
-      std::memcpy(packet->data, data.data(), data.size());
-      packet->pts = AtScale(*compressed->pts, rate).ticks;
-      Check(avcodec_send_packet(context.get(), packet.get()), "Submit source audio packet");
-      drain();
-    }
-    Check(avcodec_send_packet(context.get(), nullptr), "Finish source audio decode");
-    drain();
-    if (resampler) while (convert(nullptr, 0)) {}
-    if (!written) throw std::runtime_error("The file has no audible samples");
-    require(muxer.Finish());
-    staged.Publish(destination);
-  } catch (const Failure& failure) {
-    throw std::runtime_error(failure.error.message);
-  }
-}
 
 } // namespace huxerui::avkit

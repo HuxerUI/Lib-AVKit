@@ -26,6 +26,7 @@ struct CpuImage {
 };
 
 CpuImage ConvertPicture(const media::VideoFrame& image, std::stop_token stop);
+
 ncnn::Mat ResizePictureRgb(const media::VideoFrame& image, int width, int height, std::stop_token stop);
 
 /// The model input is planar RGB. Coordinates in the affine crop are in visible source pixels.
@@ -43,6 +44,7 @@ ncnn::Mat Warp(const CpuImage& picture, const ModelCrop& crop, int size, float l
 class Network {
 public:
   Network(const NcnnModelAssets& assets, std::span<const char* const> outputs, const char* name);
+
   ncnn::Extractor Extract(const ncnn::Mat& input) const;
 
 private:
@@ -51,15 +53,21 @@ private:
 };
 
 class YuNet;
+
 std::shared_ptr<const YuNet> LoadFace(const NcnnModelAssets& assets);
+
 std::unique_ptr<AnalysisSession> OpenFace(std::shared_ptr<const YuNet> model, const AnalysisConfig& config);
 
 struct BodyHandModels;
+
 std::shared_ptr<const BodyHandModels> LoadBodyHand(const NcnnBodyHandModels& models);
+
 std::unique_ptr<AnalysisSession> OpenBodyHand(std::shared_ptr<const BodyHandModels> models, const AnalysisConfig& config);
 
 struct PortraitModel;
+
 std::shared_ptr<PortraitModel> LoadPortrait(const NcnnModelAssets& assets, const char* name);
+
 std::unique_ptr<AnalysisSession> OpenPortrait(std::shared_ptr<PortraitModel> model, const AnalysisConfig& config);
 
 } // namespace huxerui::avkit::analysis::detail

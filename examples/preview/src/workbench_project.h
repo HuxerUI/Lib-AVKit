@@ -14,6 +14,7 @@ namespace avkit_preview {
 struct WorkbenchCaption {
   double begin, end;
   std::string text;
+
   bool operator==(const WorkbenchCaption&) const = default;
 };
 
@@ -23,10 +24,9 @@ struct WorkbenchDocument {
   std::optional<huxerui::File> file;
   std::string title;
   bool dirty{};
+
   bool operator==(const WorkbenchDocument&) const = default;
 };
-
-enum class WorkbenchTemplate { StageCut, Portrait, PictureInPicture };
 
 huxerui::media::MediaTimestamp AddWorkbenchTime(huxerui::media::MediaTimestamp time, huxerui::media::MediaTimestamp offset);
 
@@ -36,23 +36,34 @@ inline constexpr std::array<huxerui::Rect, 4> kWorkbenchInsetPositions{{
 }};
 
 huxerui::File WorkbenchDirectory(const huxerui::File& base, std::string_view name);
+
 huxerui::File WorkbenchOutput(const huxerui::File& base, std::string_view directory, std::string_view filename);
+
 std::vector<huxerui::File> RecentWorkbenchProjects(const huxerui::File& data);
+
 WorkbenchDocument EmptyWorkbenchProject();
-WorkbenchDocument CreateWorkbenchProject(std::vector<huxerui::avkit::AssetReference> assets);
+
+WorkbenchDocument CreateWorkbenchProject(std::vector<huxerui::avkit::AssetSource> assets);
+
 WorkbenchDocument OpenWorkbenchProject(const huxerui::File& file);
+
 std::vector<WorkbenchCaption> ReadWorkbenchCaptions(const huxerui::File& file);
-void AppendWorkbenchMovie(WorkbenchDocument& document, huxerui::avkit::AssetReference asset);
-void InsertWorkbenchLayer(WorkbenchDocument& document, huxerui::avkit::AssetReference asset,
-                          huxerui::media::TrackKind kind, huxerui::media::MediaTimestamp position);
+
+void AppendWorkbenchMovie(WorkbenchDocument& document, huxerui::avkit::AssetSource asset);
+
+void InsertWorkbenchLayer(WorkbenchDocument& document, huxerui::avkit::AssetSource asset,
+                          huxerui::media::TrackKind kind, huxerui::media::MediaTimestamp position,
+                          bool include_original_audio = false);
+
 std::optional<huxerui::avkit::PixelSize> WorkbenchVideoSize(const huxerui::avkit::ProjectSnapshot& project,
-                                                         const huxerui::avkit::ClipInfo& clip);
+                                                         const huxerui::avkit::TimelineClip& clip);
+
 huxerui::Rect FitWorkbenchInset(huxerui::Rect bounds, huxerui::avkit::PixelSize canvas,
                                 std::optional<huxerui::avkit::PixelSize> source);
-std::shared_ptr<const huxerui::avkit::ProjectSnapshot> PrepareWorkbenchPicture(
-    std::shared_ptr<const huxerui::avkit::ProjectSnapshot> project);
-void ApplyWorkbenchTrim(huxerui::avkit::ProjectEdit& edit, const huxerui::avkit::ProjectSnapshot& project,
-                        huxerui::avkit::ClipId clip, huxerui::avkit::ClipPlacement placement, bool main_track);
-WorkbenchDocument MakeWorkbenchTemplate(WorkbenchTemplate kind, std::array<huxerui::avkit::AssetReference, 2> assets);
+
+
+WorkbenchDocument MakeWorkbenchTemplate(const huxerui::avkit::ResourceCatalog& resources,
+                                        const huxerui::avkit::ResourceRef& reference, std::string title,
+                                        std::vector<huxerui::avkit::AssetSource> assets);
 
 } // namespace avkit_preview

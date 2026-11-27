@@ -4,13 +4,11 @@
 #include "support/geometry.h"
 
 #include <stdexcept>
-#include <type_traits>
 
 namespace huxerui::avkit::detail {
 
 template<analysis::AnalysisCapability Capability> class SourceTexture {
   static constexpr bool kDepth = Capability == analysis::AnalysisCapability::DepthMap;
-  using Completion = std::conditional_t<kDepth, analysis::DepthCompletion, analysis::MaskCompletion>;
   static constexpr auto kSubmit = kDepth ? "depth map" : "portrait mask";
   static constexpr auto kFormat = kDepth ? render::PixelFormat::R32Float : render::PixelFormat::R8Unorm;
 
@@ -21,7 +19,7 @@ public:
     if (!provider_) throw std::runtime_error("Missing analysis provider for " + std::string(kSubmit));
   }
 
-  using Request = PendingAnalysis<Completion>;
+  using Request = PendingAnalysis<analysis::AnalysisImageCompletion>;
 
   std::unique_ptr<Request> Submit(const media::VideoFrame& frame, std::stop_token stop,
                                   std::optional<std::chrono::milliseconds> budget) {
@@ -38,29 +36,40 @@ public:
     return request;
   }
 
-  std::optional<analysis::AnalysisTexture> Collect(std::unique_ptr<Request> request) {
-    if (!request) return texture_;
+  struct Sample {
+    render::PixelInput input;
+    Affine2D source_to_texture_uv;
+    Rect valid_uv;
+  };
+
+  std::optional<Sample> Collect(std::unique_ptr<Request> request) {
+    if (!request) return sample_;
     auto result = request->Wait();
     if (!result) {
       Reset();
       return std::nullopt;
     }
     if (!result->result.Succeeded()) throw std::runtime_error(std::string(kSubmit) + " analysis failed: " + result->result.Error());
-    auto texture = std::move(result->result).Value();
-    if (texture && (!texture->surface.storage || !texture->surface.image.size.width || !texture->surface.image.size.height ||
-                    texture->surface.image.format != kFormat || !IsUnitRect(texture->valid_uv) ||
-                    !IsFinite(texture->source_to_texture_uv))) {
-      throw std::runtime_error(std::string(kSubmit) + " analysis returned an invalid texture");
+    auto image = std::move(result->result).Value();
+    sample_.reset();
+    if (image) {
+      if (!IsUnitRect(result->valid_uv) || !IsFinite(result->source_to_texture_uv))
+        throw std::runtime_error(std::string(kSubmit) + " analysis returned an invalid UV mapping");
+      const auto info = render::GetImageInfo(*image);
+      if (!info.size.width || !info.size.height || info.format != kFormat)
+        throw std::runtime_error(std::string(kSubmit) + " analysis returned an invalid image format");
+      if (const auto* pixels = std::get_if<render::ImagePixels>(&*image); pixels && !pixels->Validate())
+        throw std::runtime_error(std::string(kSubmit) + " analysis returned invalid pixel rows");
+      sample_.emplace(Sample{std::move(*image), result->source_to_texture_uv, result->valid_uv});
     }
-    texture_ = std::move(texture);
     sampled_ = result->target;
-    return texture_;
+    return sample_;
   }
 
   void Reset() {
     session_.reset();
     sampled_.reset();
-    texture_.reset();
+    sample_.reset();
   }
 
 private:
@@ -86,7 +95,7 @@ private:
   analysis::AnalysisConfig config_;
   std::unique_ptr<analysis::AnalysisSession> session_;
   std::optional<analysis::FrameKey> sampled_;
-  std::optional<analysis::AnalysisTexture> texture_;
+  std::optional<Sample> sample_;
 };
 
 using SourceMask = SourceTexture<analysis::AnalysisCapability::PortraitMask>;

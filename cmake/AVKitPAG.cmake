@@ -29,9 +29,9 @@ add_library(avkit_pag_sdk UNKNOWN IMPORTED GLOBAL)
 set_target_properties(avkit_pag_sdk PROPERTIES IMPORTED_LOCATION "${AVKIT_PAG_LIBRARY}")
 
 add_library(avkit_pag STATIC
-    src/animation/pag_animation.cpp
-    src/animation/pag_frame_renderer.cpp
-    src/render/pag_overlay_renderer.cpp
+    src/render/pag/pag_asset.cpp
+    src/render/pag/pag_frame_renderer.cpp
+    src/render/pag/pag_overlay_renderer.cpp
 )
 add_library(AVKit::PAG ALIAS avkit_pag)
 target_include_directories(avkit_pag PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -44,9 +44,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     target_compile_options(avkit_pag PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     target_link_libraries(avkit_pag PRIVATE AVKit::Bgfx "-framework CoreVideo" "-framework OpenGL" "-framework IOSurface")
 elseif (ANDROID)
-    target_sources(avkit_pag PRIVATE platform/android/src/pag_texture.cpp src/animation/pag_transition_unavailable.cpp)
+    target_sources(avkit_pag PRIVATE platform/android/src/pag_texture.cpp src/render/pag/pag_transition_unavailable.cpp)
     target_link_libraries(avkit_pag PRIVATE AVKit::Bgfx EGL GLESv3)
 else ()
-    target_sources(avkit_pag PRIVATE src/animation/pag_transition_unavailable.cpp)
-    target_sources(avkit_pag PRIVATE src/animation/pag_gpu_unavailable.cpp)
+    target_sources(avkit_pag PRIVATE src/render/pag/pag_transition_unavailable.cpp)
+    target_sources(avkit_pag PRIVATE src/render/pag/pag_gpu_unavailable.cpp)
 endif ()

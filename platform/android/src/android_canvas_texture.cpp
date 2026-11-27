@@ -144,6 +144,7 @@ android::LocalRef<jobject> CopyCanvasBitmap(JNIEnv* env, std::uint32_t source, P
     GLint read{}, draw{}, texture{};
     EGLImageKHR image{EGL_NO_IMAGE_KHR};
     GLuint destination{}, framebuffers[2]{};
+
     ~Images() {
       glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
       glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
@@ -202,6 +203,7 @@ std::shared_ptr<ExternalTexture> MakeAndroidCanvasImage(const ExternalTexture& s
     const ScopedCanvasContext current(*context);
     struct ImportedTexture {
       GLuint name;
+
       ~ImportedTexture() { glDeleteTextures(1, &name); }
     } imported{frame->ImportCurrent()};
     const PixelSize size{static_cast<std::uint32_t>(frame->PixelWidth()), static_cast<std::uint32_t>(frame->PixelHeight())};

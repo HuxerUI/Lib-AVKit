@@ -42,7 +42,8 @@ CaptureDevice UseCaptureDevice(State<bool> robot, State<bool> sticker) {
   const auto camera_status = camera.Status();
 
   Lifecycle([=] {
-    auto active = std::make_shared<CameraRecording>(canvas, PreviewTimelineResources(LoadOverlayAssets(*resources)),
+    auto active = std::make_shared<CameraRecording>(canvas,
+        SceneConfiguration{.resources = LoadWorkbenchResources(*resources)},
         [](const CodecFallback& fallback) {
           LogWorkbench(WorkbenchLogLevel::Warning, "Recording codec fallback %s to %s: %s",
               fallback.from.c_str(), fallback.to.c_str(), fallback.cause.message.c_str());
@@ -62,8 +63,8 @@ CaptureDevice UseCaptureDevice(State<bool> robot, State<bool> sticker) {
   const bool robot_enabled = robot.Get(), sticker_enabled = sticker.Get();
   Lifecycle([=] {
     if (recording) {
-      recording->SetRobotVoice(robot_enabled);
-      recording->SetSticker(sticker_enabled ? std::optional{CaptureSticker(canvas)} : std::nullopt);
+      recording->SetVoiceEffect(robot_enabled ? std::optional{VoiceEffect::Robot} : std::nullopt);
+      recording->SetOverlays(sticker_enabled ? std::vector{CaptureSticker(canvas)} : std::vector<OverlayInstance>{});
     }
   }, recording, robot_enabled, sticker_enabled, canvas);
 
@@ -88,53 +89,20 @@ CaptureDevice UseCaptureDevice(State<bool> robot, State<bool> sticker) {
     .sticker_available = true,
     .seconds = observed->sample_rate ? double(observed->samples) / observed->sample_rate : 0.0,
     .error = camera_status.error ? camera_status.error->message : permission_error.Get(),
-    .photo = [camera](File destination) -> Task<void> {
-      const auto photo = co_await camera.CapturePhotoAsync();
-      if (!photo.Succeeded()) throw std::runtime_error(photo.Error().message);
-      WriteCaptureFile(destination, photo.Value().EncodedBytes());
+    .photo = [recording](File destination) -> Task<void> {
+      if (!recording) throw std::runtime_error("相机未就绪");
+      co_await recording->CapturePhoto(std::move(destination));
     },
     .record = [=](File destination) -> Task<void> {
       if (!recording) throw std::runtime_error("录制未就绪");
       co_await RequestCapturePermission(application, Permission::Microphone);
       microphone_active = true;
       try {
-        const auto start_deadline = std::chrono::steady_clock::now() + 10s;
-        for (;;) {
-          const auto status = microphone.Status();
-          if (status.error) throw std::runtime_error(status.error->message);
-          if (status.state == audio::SessionState::Running && status.format) {
-            auto reader = microphone.OpenReader();
-            if (!reader.Succeeded()) throw std::runtime_error(reader.Error().message);
-            recording->Start(destination, std::move(reader).Value(), *status.format);
-            break;
-          }
-          if (std::chrono::steady_clock::now() >= start_deadline) throw std::runtime_error("麦克风未返回音频");
-          co_await Delay(40ms);
-        }
-        const auto capture_deadline = std::chrono::steady_clock::now() + 10s;
-        auto finish_deadline = std::chrono::steady_clock::time_point::max();
-        for (;;) {
-          const auto status = recording->Status();
-          if (status.state == RecordingState::Complete) {
-            LogWorkbench(WorkbenchLogLevel::Info, "Recorded %zu frames, %lld samples at %u Hz, paused %lld samples",
-                status.video_frames, static_cast<long long>(status.samples), status.sample_rate,
-                static_cast<long long>(status.paused_samples));
-            break;
-          }
-          if (status.state == RecordingState::Failed) throw std::runtime_error(status.error);
-          const auto camera_state = camera.Status();
-          if (camera_state.error || camera_state.state == camera::SessionState::Suspended)
-            throw std::runtime_error(camera_state.error ? camera_state.error->message : "相机录制已中断");
-          const auto now = std::chrono::steady_clock::now();
-          if (status.state == RecordingState::Starting && now >= capture_deadline)
-            throw std::runtime_error("相机和麦克风未就绪");
-          if (status.state == RecordingState::Finishing && finish_deadline == std::chrono::steady_clock::time_point::max())
-            finish_deadline = now + 20s;
-          if (now >= finish_deadline) throw std::runtime_error("录像未能完成写入");
-          co_await Delay(40ms);
-        }
-      } catch (const std::exception& error) {
-        recording->Cancel(error.what());
+        const auto status = co_await recording->Record(std::move(destination), camera, microphone);
+        LogWorkbench(WorkbenchLogLevel::Info, "Recorded %zu frames, %lld samples at %u Hz, paused %lld samples",
+            status.video_frames, static_cast<long long>(status.samples), status.sample_rate,
+            static_cast<long long>(status.paused_samples));
+      } catch (...) {
         microphone_active = false;
         throw;
       }

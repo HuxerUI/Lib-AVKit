@@ -1,5 +1,6 @@
 #include <huxerui/avkit/file_movie.h>
-#include <huxerui/avkit/timeline.h>
+#include <huxerui/avkit/resource_catalog.h>
+#include "media/timeline_internal.h"
 
 #include "support/cancellation.h"
 #include "support/media_time.h"
@@ -67,6 +68,7 @@ public:
     std::lock_guard lock(mutex_);
     return version_;
   }
+
   void Wake() {
     {
       std::lock_guard lock(mutex_);
@@ -74,6 +76,7 @@ public:
     }
     changed_.notify_one();
   }
+
   bool Wait(std::uint64_t version) {
     std::unique_lock lock(mutex_);
     return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return version_ != version; });
@@ -92,7 +95,7 @@ template<class Session> struct Selection {
 };
 
 template<class Session, class Config>
-Selection<Session> OpenSelected(const MovieCodecProviders& providers, CodecOperation operation, bool software_only,
+Selection<Session> OpenSelected(const CodecProviders& providers, CodecOperation operation, bool software_only,
                                 Config platform, Config software, const OnCodecFallback& report) {
   Selection<Session> selection;
   selection.signal = std::make_shared<WakeSignal>();
@@ -141,10 +144,15 @@ public:
 
   Pump(Selection<Session> selection, CodecOperation operation, std::function<std::optional<Input>()> next)
       : selection_(std::move(selection)), operation_(operation), next_(std::move(next)) {}
+
   ~Pump() { selection_.session->Close(); }
+
   bool Software() const { return selection_.software; }
+
   const std::string& Provider() const { return selection_.provider; }
+
   bool AllowsSequenceHandoff() const noexcept { return selection_.session->Negotiated().allow_sequence_handoff; }
+
   Output Pull(std::stop_token stop = {}) {
     auto& session = *selection_.session;
     const std::stop_callback wake(stop, [&] { selection_.signal->Wake(); });
@@ -364,27 +372,21 @@ MovieAsset ImportMovie(const File& file) {
 
 MovieAsset ImportMovieAudio(const File& file) {
   auto demuxer = OpenDemuxer(file);
-  if (demuxer.Format() != ContainerFormat::Wave) {
-    auto movie = InspectMovie(file, demuxer);
-    if (!movie.HasAudio()) throw std::runtime_error("The selected video has no audio track");
-    return movie;
+  for (const auto& track : demuxer.Tracks()) {
+    if (track.kind != TrackKind::Audio || track.descriptions.size() != 1 ||
+        !MovieAudio(track.descriptions.front())) continue;
+    const auto range = MovieTrackRange(demuxer, track);
+    if (!range || !Before(range->start, range->end) || Before(range->start, {})) continue;
+    const auto& description = track.descriptions.front();
+    const AudioFormat pcm{*description.sample_rate, AudioSampleFormat::S16, AudioPacking::Interleaved,
+        description.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
+    return {file, {}, track, {}, *range, range->end, pcm};
   }
-  const auto tracks = demuxer.Tracks();
-  if (tracks.size() != 1 || tracks[0].kind != TrackKind::Audio || tracks[0].descriptions.size() != 1)
-    throw std::runtime_error("Expected one prepared audio track");
-  const auto& description = tracks[0].descriptions.front();
-  const auto range = demuxer.PresentationRange(tracks[0].id);
-  if (description.codec != CodecId::PcmS16Le || !description.sample_rate ||
-      (*description.sample_rate != 44100 && *description.sample_rate != 48000) ||
-      (description.channel_count != 1 && description.channel_count != 2) ||
-      !range || !Before(range->start, range->end)) throw std::runtime_error("Invalid prepared PCM WAVE audio");
-  const AudioFormat pcm{*description.sample_rate, AudioSampleFormat::S16, AudioPacking::Interleaved,
-      description.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
-  return {file, {}, tracks[0], {}, *range, range->end, pcm};
+  throw std::runtime_error("No supported mono or stereo audio track at 44.1 or 48 kHz");
 }
 
 struct MovieReader::Impl {
-  Impl(MovieAsset movie, MovieCodecProviders codec_providers, CodecPolicy selection_policy, OnCodecFallback fallback,
+  Impl(MovieAsset movie, CodecProviders codec_providers, CodecPolicy selection_policy, OnCodecFallback fallback,
        std::optional<TrackKind> track = {})
       : asset(std::move(movie)), providers(std::move(codec_providers)), policy(selection_policy),
         report(std::move(fallback)), selected(track) {
@@ -628,7 +630,7 @@ struct MovieReader::Impl {
   }
 
   MovieAsset asset;
-  MovieCodecProviders providers;
+  CodecProviders providers;
   CodecPolicy policy;
   OnCodecFallback report;
   const std::optional<TrackKind> selected;
@@ -643,38 +645,46 @@ struct MovieReader::Impl {
   bool ready{}, video_end{}, audio_end{}, force_software_video{};
 };
 
-MovieReader::MovieReader(MovieAsset asset, MovieCodecProviders providers, CodecPolicy policy, OnCodecFallback report)
+MovieReader::MovieReader(MovieAsset asset, CodecProviders providers, CodecPolicy policy, OnCodecFallback report)
     : impl_(std::make_unique<Impl>(std::move(asset), std::move(providers), policy, std::move(report))) {
   Seek({});
 }
 
-MovieReader::MovieReader(MovieAsset asset, MovieCodecProviders providers, TrackKind track, MediaTimestamp start,
+MovieReader::MovieReader(MovieAsset asset, CodecProviders providers, TrackKind track, MediaTimestamp start,
                          CodecPolicy policy, OnCodecFallback report)
     : impl_(std::make_unique<Impl>(std::move(asset), std::move(providers), policy, std::move(report), track)) {
   Seek(start);
 }
+
 MovieReader::~MovieReader() = default;
+
 void MovieReader::Seek(MediaTimestamp at) {
   try { impl_->Seek(at); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
+
 std::optional<VideoFrame> MovieReader::ReadVideo(std::stop_token stop) {
   return ReadVideoInternal(stop, std::nullopt);
 }
+
 bool MovieReader::AllowsVideoSequenceHandoff() const noexcept {
   return impl_->selected == TrackKind::Video && impl_->video && impl_->video->AllowsSequenceHandoff();
 }
+
 void MovieReader::SetCodecFallbackHandler(OnCodecFallback report) { impl_->report = std::move(report); }
+
 std::optional<VideoFrame> MovieReader::ReadVideoInternal(std::stop_token stop, std::optional<MediaTimestamp> cpu_preroll) {
   try { return impl_->ReadVideo(stop, cpu_preroll); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
+
 VideoFrame MovieReader::RetryVideoFrame(const VideoFrame& rejected, const PlatformVideoImportError& cause,
                                        std::stop_token stop) {
   try { return impl_->RetryVideoFrame(rejected, cause, stop); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
 }
-VideoFrame MovieReader::RetryDetachedVideoFrame(const MovieAsset& movie, const MovieCodecProviders& providers,
+
+VideoFrame MovieReader::RetryDetachedVideoFrame(const MovieAsset& movie, const CodecProviders& providers,
                                                const VideoFrame& rejected, const PlatformVideoImportError& cause,
                                                const OnCodecFallback& report, std::stop_token stop) {
   CheckCancelled(stop);
@@ -685,6 +695,7 @@ VideoFrame MovieReader::RetryDetachedVideoFrame(const MovieAsset& movie, const M
                       std::string(providers.software->Name()), {CodecErrorCode::Unsupported, cause.what(), {}}, rejected.pts});
   return replacement;
 }
+
 std::optional<AudioFrame> MovieReader::ReadAudio(std::stop_token stop) {
   try { return impl_->ReadAudio(stop); }
   catch (const CodecFailure& failure) { throw std::runtime_error(failure.error.message); }
@@ -692,8 +703,8 @@ std::optional<AudioFrame> MovieReader::ReadAudio(std::stop_token stop) {
 
 namespace {
 
-template<class Format, class Session> Format ReadFormat(Pump<Session>& pump) {
-  auto event = pump.Pull();
+template<class Format, class Session> Format ReadFormat(Pump<Session>& pump, std::stop_token stop) {
+  auto event = pump.Pull(stop);
   if (auto* format = std::get_if<Format>(&event)) return std::move(*format);
   throw std::runtime_error("Encoder did not announce the output format before its packets");
 }
@@ -703,15 +714,22 @@ struct MuxLane {
   std::optional<ContainerPacket> packet;
 };
 
-void EncodeMp4(const File& destination, const MovieCodecProviders& providers, const FileExportSettings& settings,
-               const AudioFormat& pcm, std::optional<std::uint32_t> video_timescale, const ReadRecordingVideo& read_video,
-               const ReadRecordingAudio& read_audio, const OnCodecFallback& report, bool software_only) {
+std::pair<VideoEncoderConfig, VideoEncoderConfig> EncoderInputs(const FileExportSettings& settings) {
   auto platform = settings.video;
   platform.input_storage = VideoStorage::Platform;
   platform.input.pixel_format = kPlatformVideoLayout;
   auto software = settings.video;
   software.input_storage = VideoStorage::Cpu;
   software.input.pixel_format = VideoPixelFormat::I420;
+  return {std::move(platform), std::move(software)};
+}
+
+void EncodeMp4(const File& destination, const CodecProviders& providers, const FileExportSettings& settings,
+               const AudioFormat& pcm, std::uint32_t video_timescale, const ReadRecordingVideo& read_video,
+               const ReadRecordingAudio& read_audio, const OnCodecFallback& report, bool software_only,
+               std::stop_token stop = {}) {
+  CheckCancelled(stop);
+  const auto [platform, software] = EncoderInputs(settings);
   auto selected = OpenSelected<VideoEncoderSession>(providers, CodecOperation::VideoEncode, software_only,
                                                   platform, software, report);
   const auto contract = selected.session->Negotiated().video;
@@ -726,7 +744,7 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
       if (output && (output->format != bound.input || output->Storage() != bound.input_storage))
         throw std::runtime_error("The source returned a video frame outside the negotiated format");
       return output;
-    } catch (const PlatformVideoTransferError& error) {
+    } catch (const PlatformEncoderInputError& error) {
       if (bound.input_storage != VideoStorage::Platform) throw;
       throw CodecFailure{CodecOperation::VideoEncode, video_software,
                          {CodecErrorCode::Unsupported, error.what(), {}}};
@@ -742,46 +760,24 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
                    audio_config, audio_config, report), CodecOperation::AudioEncode, read_audio);
   }
 
-  const auto picture = ReadFormat<VideoEncodeFormat>(video);
-  const auto video_grid = video_timescale.value_or(1'000'000);
-  std::vector tracks{VideoTrack(picture, bound, video_grid)};
-  if (audio) tracks.push_back(AudioTrack(ReadFormat<AudioEncodeFormat>(*audio)));
+  const auto picture = ReadFormat<VideoEncodeFormat>(video, stop);
+  std::vector tracks{VideoTrack(picture, bound, video_timescale)};
+  if (audio) tracks.push_back(AudioTrack(ReadFormat<AudioEncodeFormat>(*audio, stop)));
   Require(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, tracks));
   StagedOutput stage(destination);
   auto muxer = Require(MediaMuxer::Open(stage.TakeStream(), ContainerFormat::Mp4, tracks));
   std::optional<AudioEncodeSummary> summary;
-  const auto read_video_packet = [&]() -> std::optional<ContainerPacket> {
-    auto event = video.Pull();
+  const auto next_video = [&]() -> std::optional<ContainerPacket> {
+    auto event = video.Pull(stop);
     if (auto* packet = std::get_if<EncodedPacket>(&event)) return ToContainer(*packet, 1);
     if (!std::holds_alternative<EndOfStream>(event)) throw std::runtime_error("Unexpected video encode event");
+    Require(muxer.EndTrack(1));
     return std::nullopt;
-  };
-  std::optional<ContainerPacket> video_lookahead;
-  bool video_drained = false;
-  const auto next_video = [&]() -> std::optional<ContainerPacket> {
-    if (!video_drained && !video_lookahead) video_lookahead = read_video_packet();
-    auto packet = std::exchange(video_lookahead, std::nullopt);
-    if (!packet) {
-      Require(muxer.EndTrack(1));
-      return std::nullopt;
-    }
-    if (!video_timescale) {
-      // Rebuild the continuous MP4 decode grid from adjacent timestamps when the source uses a coarse segment clock.
-      video_lookahead = read_video_packet();
-      video_drained = !video_lookahead;
-      if (!packet->dts || !packet->pts || !packet->duration)
-        throw std::runtime_error("Encoded video packet is missing its timing");
-      const auto next = video_lookahead ? *video_lookahead->dts : Add(*packet->dts, *packet->duration);
-      packet->pts = AtScale(*packet->pts, video_grid);
-      packet->dts = AtScale(*packet->dts, video_grid);
-      packet->duration = Difference(AtScale(next, video_grid), *packet->dts);
-    }
-    return packet;
   };
   const auto next_audio = [&]() -> std::optional<ContainerPacket> {
     if (!audio) return std::nullopt;
     for (;;) {
-      auto event = audio->Pull();
+      auto event = audio->Pull(stop);
       if (auto* packet = std::get_if<EncodedPacket>(&event)) return ToContainer(*packet, 2);
       if (auto* counts = std::get_if<AudioEncodeSummary>(&event)) { summary = *counts; continue; }
       if (!std::holds_alternative<EndOfStream>(event) || !summary)
@@ -818,36 +814,14 @@ void EncodeMp4(const File& destination, const MovieCodecProviders& providers, co
     lane.packet.reset();
     lane.packet = index == 0 ? next_video() : next_audio();
   }
+  CheckCancelled(stop);
   Require(muxer.Finish());
+  CheckCancelled(stop);
   stage.Publish(destination);
 }
 
-void ExportAttempt(const MovieAsset& asset, const File& destination, const MovieCodecProviders& providers,
-                   const FileExportSettings& settings, const ComposeMovieFrame& compose,
-                   const OnCodecFallback& report, bool software_only) {
-  MovieReader source(asset, providers, settings.policy, report);
-  ReadRecordingAudio read_audio;
-  if (asset.HasAudio()) read_audio = [&] { return source.ReadAudio(); };
-  EncodeMp4(destination, providers, settings, asset.pcm, asset.video.timescale,
-      [&](const VideoEncoderConfig& bound) -> std::optional<VideoFrame> {
-        auto input = source.ReadVideo();
-        if (!input) return std::nullopt;
-        auto output = [&] {
-          try {
-            return compose(*input, bound);
-          } catch (const PlatformVideoImportError& error) {
-            input = source.RetryVideoFrame(*input, error);
-            return compose(*input, bound);
-          }
-        }();
-        if (output.pts != input->pts || output.duration != input->duration)
-          throw std::runtime_error("Compositor changed source video timing");
-        return output;
-      }, read_audio, report, software_only);
-}
-
 template<class Attempt>
-void ExportWithRestart(const MovieCodecProviders& providers, CodecPolicy policy, const OnCodecFallback& report,
+void ExportWithRestart(const CodecProviders& providers, CodecPolicy policy, const OnCodecFallback& report,
                        const Attempt& attempt) {
   try {
     try {
@@ -877,15 +851,18 @@ FileExportSettings FileExportSettings::Sdr(PixelSize size) {
   return settings;
 }
 
-void ExportMovie(const MovieAsset& asset, const File& destination, const MovieCodecProviders& providers,
-                 const FileExportSettings& settings, const ComposeMovieFrame& compose, OnCodecFallback report) {
-  if (!compose || destination == asset.file) throw std::invalid_argument("Export requires a compositor and a new destination");
-  ExportWithRestart(providers, settings.policy, report, [&](bool software_only) {
-    ExportAttempt(asset, destination, providers, settings, compose, report, software_only);
-  });
+media::CodecResult<CodecNegotiation> ProbeVideoExport(const CodecProviders& providers, const FileExportSettings& settings) {
+  const auto [platform, software] = EncoderInputs(settings);
+  using Probe = media::CodecResult<CodecNegotiation>;
+  if (settings.policy != CodecPolicy::SoftwareOnly && providers.platform) {
+    auto result = providers.platform->Probe(platform);
+    if (result.Succeeded() || !providers.software || !Recoverable(result.Error())) return result;
+  }
+  if (providers.software) return providers.software->Probe(software);
+  return Probe::Failure({CodecErrorCode::Unsupported, "No available video encoder", {}});
 }
 
-void WriteLiveMovie(const File& destination, const MovieCodecProviders& providers, const FileExportSettings& settings,
+void WriteLiveMovie(const File& destination, const CodecProviders& providers, const FileExportSettings& settings,
                     const AudioFormat& pcm, const ReadRecordingVideo& video, const ReadRecordingAudio& audio,
                     OnCodecFallback on_fallback) {
   if (!video || !pcm.sample_rate) throw std::invalid_argument("Live MP4 requires a video source and a valid sample clock");
@@ -897,23 +874,32 @@ void WriteLiveMovie(const File& destination, const MovieCodecProviders& provider
   }
 }
 
-void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
-                    const MovieCodecProviders& providers, const FileExportSettings& settings,
-                    const ComposeTimelineFrame& compose, OnCodecFallback report,
-                    std::shared_ptr<analysis::AnalysisProvider> analysis, const ImportVideoFrame& import,
-                    render::PixelFormat target_format) {
+void detail::ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& destination,
+    const CodecProviders& providers, const FileExportSettings& settings,
+    const std::shared_ptr<render::RenderBackend>& device, render::ImageInfo target,
+    const ComposeTimelineFrame& compose, const render::TimelineExportOptions& options) {
+  const auto stop = options.stop;
+  const auto& report = options.on_fallback;
+  CheckCancelled(stop);
   if (!project || !compose) throw std::invalid_argument("Export requires a project and a compositor");
+  const auto& visible = settings.video.input.visible;
+  const auto size = visible.width && visible.height ? PixelSize{visible.width, visible.height} : project->canvas_size;
+  if (target.size != size) throw std::invalid_argument("The export renderer must match the output extent");
   const auto numerator = settings.video.frame_rate_numerator;
   const auto denominator = settings.video.frame_rate_denominator;
   const auto end = project->Range().end;
   if (!numerator || !denominator || !Before({}, end))
     throw std::invalid_argument("Timeline export requires a positive duration and frame rate");
-  if (std::ranges::any_of(project->assets, [&](const auto& asset) { return asset.source.file == destination; }))
+  if (project->resources && std::ranges::any_of(project->resources->Media(), [&](const auto& entry) {
+        return entry.second->file == destination;
+      }))
     throw std::invalid_argument("Timeline export requires a destination separate from its source files");
 
   ExportWithRestart(providers, settings.policy, report, [&](bool software_only) {
-    TimelineSession session(project, providers, settings.policy, report, analysis);
-    const auto pcm = session.PcmFormat();
+    CheckCancelled(stop);
+    auto session = TimelineSessionAccess::Open(project, providers, settings.policy,
+        options.scene, report, device, target);
+    const auto pcm = session->PcmFormat();
     const auto mux_end = detail::FloorOnGrid(end, pcm.sample_rate);
     const auto audio_end = mux_end.ticks;
     if (!audio_end) throw std::invalid_argument("Timeline is shorter than one audio sample");
@@ -924,12 +910,16 @@ void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& 
     if (step > std::numeric_limits<std::int64_t>::max()) throw std::invalid_argument("Unsupported export frame rate");
     const auto video_end = detail::ExactTicks(mux_end, video_scale);
     std::int64_t video_at = 0, audio_at = 0;
+    const std::function<void(const VideoFrame&)> on_decode = [&](const VideoFrame& picture) {
+      if (options.on_video_transfer) options.on_video_transfer(CodecOperation::VideoDecode, picture);
+    };
     EncodeMp4(destination, providers, settings, pcm, video_scale,
         [&](const VideoEncoderConfig& bound) -> std::optional<VideoFrame> {
           if (video_at == video_end) return std::nullopt;
           const MediaTimestamp pts{video_at, video_scale};
           const MediaTimestamp duration{std::min(std::int64_t(step), video_end - video_at), video_scale};
-          auto output = compose(session.SampleVideo(pts, target_format, {}, import), bound, duration);
+          const auto advance = video_at ? std::optional{MediaTimestamp{static_cast<std::int64_t>(step), video_scale}} : std::nullopt;
+          auto output = compose(session->SampleVideo(pts, {}, stop, {}, advance, on_decode), bound, duration);
           if (output.pts != pts || output.duration != duration)
             throw std::runtime_error("Compositor changed the timeline video timing");
           video_at += duration.ticks;
@@ -937,10 +927,10 @@ void ExportTimeline(std::shared_ptr<const ProjectSnapshot> project, const File& 
         }, [&]() -> std::optional<AudioFrame> {
           if (audio_at == audio_end) return std::nullopt;
           const auto count = static_cast<std::uint32_t>(std::min<std::int64_t>(1024, audio_end - audio_at));
-          auto output = session.SampleAudio({audio_at, pcm.sample_rate}, count);
+          auto output = session->SampleAudio({audio_at, pcm.sample_rate}, count, stop);
           audio_at += count;
           return output;
-        }, report, software_only);
+        }, report, software_only, stop);
   });
 }
 

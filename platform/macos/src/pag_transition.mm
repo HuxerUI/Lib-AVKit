@@ -1,9 +1,13 @@
 #define GL_SILENCE_DEPRECATION
 
-#include <huxerui/avkit/pag.h>
+#include "render/pag/pag_transition.h"
+
+#include "render/pag/pag_asset.h"
+#include "render/pag/pag_frame_renderer.h"
+#include "project/resource_internal.h"
 
 #include "bgfx_metal_texture.h"
-#include "animation/pag_frame_renderer.h"
+#include "render/texture_backing.h"
 #include "support/media_time.h"
 
 #import <CoreVideo/CoreVideo.h>
@@ -24,7 +28,6 @@ namespace huxerui::avkit {
 namespace {
 
 using namespace render;
-using Clock = std::chrono::steady_clock;
 
 void Check(bool valid, const char* message) {
   if (!valid) throw std::runtime_error(message);
@@ -44,7 +47,9 @@ public:
     CGLReleasePixelFormat(format);
     Check(status == kCGLNoError && context_, "Cannot create an OpenGL context for PAG");
   }
+
   ~GlContext() { CGLReleaseContext(context_); }
+
   CGLContextObj Get() const { return context_; }
 
 private:
@@ -56,6 +61,7 @@ public:
   explicit CurrentContext(CGLContextObj context) : previous_(CGLGetCurrentContext()) {
     Check(CGLSetCurrentContext(context) == kCGLNoError, "Cannot bind the PAG OpenGL context");
   }
+
   ~CurrentContext() { CGLSetCurrentContext(previous_); }
 
 private:
@@ -138,7 +144,7 @@ struct OutputSlot {
   }
 
   SharedTexture texture;
-  ColorSurface surface;
+  Texture surface;
   std::shared_ptr<pag::PAGSurface> drawable;
 };
 
@@ -148,17 +154,16 @@ public:
     Check(device_ != nil, "No Metal device for the PAG render target");
   }
 
-  ColorSurface Draw(pag::PAGPlayer& player, PagOverlayStats* stats) override {
-    auto found = std::ranges::find_if(outputs_, [](const auto& slot) { return slot->surface.pixels.storage.use_count() == 1; });
+  Texture Draw(pag::PAGPlayer& player) override {
+    auto found = std::ranges::find_if(outputs_, [](const auto& slot) {
+      return detail::TextureAccess::Backing(slot->surface).use_count() == 1;
+    });
     auto& slot = *(found != outputs_.end() ? *found : outputs_.emplace_back(
         std::make_unique<OutputSlot>(device_, context_.Get(), size_)));
     CurrentContext current(context_.Get());
     player.setSurface(slot.drawable);
-    if (stats) ++stats->flushes;
     player.flush();
-    const auto waiting = stats ? Clock::now() : Clock::time_point{};
     glFinish();
-    if (stats) stats->gpu_sync += Clock::now() - waiting;
     Check(glGetError() == GL_NO_ERROR, "PAG texture rendering failed");
     return slot.surface;
   }
@@ -215,7 +220,7 @@ public:
 
   OutputSlot& AcquireOutput(PixelSize size) {
     for (auto& slot : outputs_)
-      if (slot->surface.pixels.storage.use_count() == 1) return *slot;
+      if (detail::TextureAccess::Backing(slot->surface).use_count() == 1) return *slot;
     return *outputs_.emplace_back(std::make_unique<OutputSlot>(device, context.Get(), size));
   }
 
@@ -261,15 +266,15 @@ private:
   std::vector<std::unique_ptr<OutputSlot>> outputs_;
 };
 
-id<MTLTexture> TextureFor(const ColorSurface& surface, PixelSize size) {
+id<MTLTexture> TextureFor(const Texture& surface, PixelSize size) {
   auto texture = macos::GetMetalTexture(surface);
-  const auto format = surface.pixels.image.format;
+  const auto format = surface.Info().format;
   const bool matches_format = texture &&
       ((format == PixelFormat::Bgra8Unorm && texture.pixelFormat == MTLPixelFormatBGRA8Unorm) ||
        (format == PixelFormat::Rgba8Unorm && texture.pixelFormat == MTLPixelFormatRGBA8Unorm));
-  if (!matches_format || surface.pixels.image.size != size || texture.width != size.width ||
-      texture.height != size.height || surface.pixels.origin != RowOrigin::TopLeft ||
-      surface.alpha != AlphaMode::Premultiplied)
+  if (!matches_format || surface.Info().size != size || texture.width != size.width ||
+      texture.height != size.height || surface.Origin() != RowOrigin::TopLeft ||
+      surface.Alpha() != AlphaMode::Premultiplied)
     throw std::invalid_argument("PAG transition requires completed top-left premultiplied RGBA8 or BGRA8 Metal textures");
   return texture;
 }
@@ -281,12 +286,11 @@ std::unique_ptr<detail::PagGpuTarget> detail::CreatePagGpuTarget(render::RenderB
 }
 
 struct PagTransition::Impl {
-  Impl(BufferReference bytes, PixelSize size, int outgoing, int incoming)
-      : encoded(std::move(bytes)), size(size), outgoing_index(outgoing), incoming_index(incoming) {
+  Impl(const ResourceCatalog& catalog, const ResourceRef& resource, PixelSize size, int outgoing, int incoming)
+      : size(size), outgoing_index(outgoing), incoming_index(incoming) {
     if (!size.width || !size.height || size.width > 8192 || size.height > 8192)
       throw std::invalid_argument("Invalid PAG transition output dimensions");
-    const auto data = encoded.AsBytes();
-    composition = pag::PAGFile::Load(data.data(), data.size());
+    composition = detail::LoadPagFile(catalog, resource);
     if (!composition) throw std::invalid_argument("Invalid PAG transition composition");
     const auto editable = composition->getEditableIndices(pag::LayerType::Image);
     if (outgoing == incoming || std::ranges::find(editable, outgoing) == editable.end() ||
@@ -301,7 +305,6 @@ struct PagTransition::Impl {
     player.setMaxFrameRate(composition->frameRate());
   }
 
-  BufferReference encoded;
   PixelSize size;
   int outgoing_index, incoming_index;
   std::uint32_t frames;
@@ -310,12 +313,18 @@ struct PagTransition::Impl {
   pag::PAGPlayer player;
 };
 
-PagTransition::PagTransition(BufferReference encoded, PixelSize size, int outgoing, int incoming)
-    : impl_(std::make_unique<Impl>(std::move(encoded), size, outgoing, incoming)) {}
+PagTransition::PagTransition(const ResourceRef& source, const ResourceCatalog& resources, PixelSize size) {
+  const auto& asset = resources.Get<PagAsset>(source);
+  if (!asset.transition_slots) throw std::invalid_argument("A PAG transition needs two named image slots");
+  const auto& [outgoing, incoming] = *asset.transition_slots;
+  impl_ = std::make_unique<Impl>(resources, source, size, detail::PagEditableIndex(asset.image_slots, outgoing),
+                                detail::PagEditableIndex(asset.image_slots, incoming));
+}
+
 PagTransition::~PagTransition() = default;
 
-ColorSurface PagTransition::Sample(media::MediaTimestamp offset, media::MediaTimestamp duration,
-    const ColorSurface& outgoing, const ColorSurface& incoming, PagTransitionTiming* timing) {
+Texture PagTransition::Sample(media::MediaTimestamp offset, media::MediaTimestamp duration,
+    const Texture& outgoing, const Texture& incoming) {
   auto& state = *impl_;
   const auto index = detail::UniformFrameIndex(offset, duration, state.frames);
   auto from = TextureFor(outgoing, state.size);
@@ -324,9 +333,7 @@ ColorSurface PagTransition::Sample(media::MediaTimestamp offset, media::MediaTim
     throw std::invalid_argument("PAG transition input textures must use the same device");
   if (!state.gpu) state.gpu = std::make_unique<Interop>(from.device, state.size);
   auto& gpu = *state.gpu;
-  const auto started = timing ? Clock::now() : Clock::time_point{};
   gpu.CopyInputs(from, to);
-  const auto copied = timing ? Clock::now() : Clock::time_point{};
   auto& output = gpu.AcquireOutput(state.size);
   CurrentContext current(gpu.context.Get());
   state.player.setSurface(output.drawable);
@@ -334,12 +341,9 @@ ColorSurface PagTransition::Sample(media::MediaTimestamp offset, media::MediaTim
   state.composition->replaceImage(state.incoming_index, gpu.to.Image());
   // PAG converts progress to whole microseconds. Use the interior of the selected authored frame.
   state.player.setProgress((index + 0.5) / state.frames);
-  const auto bound = timing ? Clock::now() : Clock::time_point{};
   Check(state.player.flush(), "PAG could not render the GPU transition");
-  const auto flushed = timing ? Clock::now() : Clock::time_point{};
   glFinish();
   Check(glGetError() == GL_NO_ERROR, "The PAG OpenGL transition failed");
-  if (timing) *timing = {copied - started, bound - copied, flushed - bound, Clock::now() - flushed};
   return output.surface;
 }
 

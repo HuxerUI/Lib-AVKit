@@ -1,5 +1,8 @@
 #include "timeline_strip.h"
 
+#include <huxerui/avkit/project.h>
+#include <huxerui/avkit/resource_catalog.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <iterator>
@@ -101,14 +104,14 @@ void ReadStrip(AssetSampler& sampler, TrackKind kind, const ProjectSnapshot& pro
 } // namespace
 
 bool SameStripInputs(const ProjectSnapshot& before, const ProjectSnapshot& after) {
-  const auto sampled = [](const TrackInfo& track) {
+  const auto sampled = [](const TimelineTrack& track) {
     return track.kind == TrackKind::Video || track.kind == TrackKind::Audio;
   };
-  return before.assets == after.assets &&
+  return before.resources == after.resources &&
       std::ranges::equal(before.tracks | std::views::filter(sampled), after.tracks | std::views::filter(sampled),
-          [](const TrackInfo& a, const TrackInfo& b) {
+          [](const TimelineTrack& a, const TimelineTrack& b) {
             return a.id == b.id && a.kind == b.kind && std::ranges::equal(a.clips, b.clips,
-                [](const ClipInfo& first, const ClipInfo& second) {
+                [](const TimelineClip& first, const TimelineClip& second) {
                   return first.id == second.id && first.placement == second.placement;
                 });
           });
@@ -119,15 +122,15 @@ std::shared_ptr<const StripResult> RetainStripSamples(const StripResult& display
   std::unordered_set<std::uint64_t> unchanged;
   for (const auto& previous_track : before.tracks) {
     if (previous_track.kind != TrackKind::Video && previous_track.kind != TrackKind::Audio) continue;
-    const auto track = std::ranges::find(after.tracks, previous_track.id, &TrackInfo::id);
+    const auto track = std::ranges::find(after.tracks, previous_track.id, &TimelineTrack::id);
     if (track == after.tracks.end() || track->kind != previous_track.kind) continue;
     for (const auto& previous : previous_track.clips) {
-      const auto clip = std::ranges::find(track->clips, previous.id, &ClipInfo::id);
+      const auto clip = std::ranges::find(track->clips, previous.id, &TimelineClip::id);
       if (clip == track->clips.end() || clip->placement != previous.placement) continue;
       const auto asset_id = clip->placement.source.asset;
-      const auto old_asset = std::ranges::find(before.assets, asset_id, &AssetInfo::id);
-      const auto new_asset = std::ranges::find(after.assets, asset_id, &AssetInfo::id);
-      if (old_asset != before.assets.end() && new_asset != after.assets.end() && *old_asset == *new_asset)
+      const auto old_asset = before.resources->FindMedia(asset_id);
+      const auto new_asset = after.resources->FindMedia(asset_id);
+      if (old_asset && old_asset == new_asset)
         unchanged.insert(clip->id.value);
     }
   }
@@ -183,7 +186,7 @@ struct StripWorker::Impl {
     Publish progress;
   };
 
-  Impl(MovieCodecProviders providers, MakeThumbnail make_thumbnail)
+  Impl(CodecProviders providers, MakeThumbnail make_thumbnail)
       : thumbnails(static_cast<bool>(make_thumbnail)), pictures(providers, std::move(make_thumbnail)),
         waveforms(std::move(providers), {}, CodecPolicy::SoftwareOnly),
         thread([this](std::stop_token stop) { Run(stop); }) {}
@@ -254,8 +257,9 @@ struct StripWorker::Impl {
   std::jthread thread;
 };
 
-StripWorker::StripWorker(MovieCodecProviders providers, MakeThumbnail make_thumbnail)
+StripWorker::StripWorker(CodecProviders providers, MakeThumbnail make_thumbnail)
     : impl_(std::make_unique<Impl>(std::move(providers), std::move(make_thumbnail))) {}
+
 StripWorker::~StripWorker() = default;
 
 std::uint64_t StripWorker::Schedule(std::shared_ptr<const ProjectSnapshot> project, StripViewport viewport,

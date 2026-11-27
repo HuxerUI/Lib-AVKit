@@ -1,5 +1,7 @@
 #include "workbench_project.h"
 
+#include <huxerui/avkit/resource_catalog.h>
+
 #include <huxerui/avkit/edit_template.h>
 
 #include <algorithm>
@@ -22,14 +24,14 @@ using namespace huxerui::media;
 
 double Seconds(MediaTimestamp time) { return double(time.ticks) / time.timescale; }
 
-const AssetTrack& Track(const AssetReference& asset, TrackKind kind) {
+const AssetTrack& Track(const AssetSource& asset, TrackKind kind) {
   const auto match = std::ranges::find(asset.tracks, kind, &AssetTrack::kind);
   if (match == asset.tracks.end())
     throw std::invalid_argument(kind == TrackKind::Audio ? "所选素材没有音轨" : "所选素材没有视频轨");
   return *match;
 }
 
-MediaTimestamp Available(const AssetReference& asset, double limit, std::optional<TrackKind> only = {}) {
+MediaTimestamp Available(const AssetSource& asset, double limit, std::optional<TrackKind> only = {}) {
   for (const auto& track : asset.tracks) {
     if (only && track.kind != *only) continue;
     const auto range = track.presentation;
@@ -52,8 +54,8 @@ WorkbenchDocument NewDocument(PixelSize canvas, std::string title) {
   return {project, project->Snapshot(), {}, std::move(title)};
 }
 
-bool TrackAvailable(const TrackInfo& track, TimeRange span) {
-  return std::ranges::none_of(track.clips, [&](const ClipInfo& clip) {
+bool TrackAvailable(const TimelineTrack& track, TimeRange span) {
+  return std::ranges::none_of(track.clips, [&](const TimelineClip& clip) {
     const auto range = clip.placement.timeline;
     return range.start.Compare(span.end) == -1 && span.start.Compare(range.end) == -1;
   });
@@ -108,7 +110,7 @@ std::vector<File> RecentWorkbenchProjects(const File& data) {
 
 WorkbenchDocument EmptyWorkbenchProject() { return NewDocument({640, 360}, "未命名项目"); }
 
-WorkbenchDocument CreateWorkbenchProject(std::vector<AssetReference> assets) {
+WorkbenchDocument CreateWorkbenchProject(std::vector<AssetSource> assets) {
   if (assets.empty()) throw std::invalid_argument("A new edit needs initial media");
   auto document = EmptyWorkbenchProject();
   for (auto& asset : assets) AppendWorkbenchMovie(document, std::move(asset));
@@ -165,16 +167,17 @@ std::vector<WorkbenchCaption> ReadWorkbenchCaptions(const File& file) {
   return captions;
 }
 
-void AppendWorkbenchMovie(WorkbenchDocument& document, AssetReference asset) {
-  const auto duration = Available(asset, 24 * 60 * 60);
+void AppendWorkbenchMovie(WorkbenchDocument& document, AssetSource asset) {
+  const auto duration = asset.still_image ? asset.tracks.front().presentation.end : Available(asset, 24 * 60 * 60);
   const auto before = document.revision;
-  const auto main = std::ranges::find(before->tracks, TrackKind::Video, &TrackInfo::kind);
+  const auto main = std::ranges::find(before->tracks, TrackKind::Video, &TimelineTrack::kind);
   const auto begin = main != before->tracks.end() && !main->clips.empty() ?
       main->clips.back().placement.timeline.end : MediaTimestamp{};
   const TimeRange timeline{begin, AddWorkbenchTime(begin, duration)};
-  const auto audio = std::ranges::find_if(before->tracks, [&](const TrackInfo& track) {
+  const auto audio = std::ranges::find_if(before->tracks, [&](const TimelineTrack& track) {
     return track.kind == TrackKind::Audio && TrackAvailable(track, timeline);
   });
+  const auto still_image = asset.still_image;
   const auto video_source = Track(asset, TrackKind::Video);
   const auto audio_match = std::ranges::find(asset.tracks, TrackKind::Audio, &AssetTrack::kind);
   const auto audio_source = audio_match == asset.tracks.end() ? std::optional<AssetTrack>{} : *audio_match;
@@ -183,22 +186,28 @@ void AppendWorkbenchMovie(WorkbenchDocument& document, AssetReference asset) {
     const auto id = edit.Import(std::move(asset));
     if (before->tracks.empty() && video_source.display_size) {
       const auto size = *video_source.display_size;
-      edit.SetCanvas({std::max(2U, size.width & ~1U), std::max(2U, size.height & ~1U)});
+      edit.SetCanvasSize({std::max(2U, size.width & ~1U), std::max(2U, size.height & ~1U)});
     }
     const auto insert = [&](const AssetTrack& source, auto track) {
       const auto output = track == before->tracks.end() ? edit.AddTrack(source.kind) : track->id;
       const auto start = source.presentation.start;
       return edit.InsertClip(output, {{id, source.id, {start, AddWorkbenchTime(start, duration)}}, timeline});
     };
-    const auto owner = insert(video_source, main);
+    const auto owner = still_image ?
+        edit.InsertImage(main == before->tracks.end() ? edit.AddTrack(TrackKind::Video) : main->id, id, begin) :
+        insert(video_source, main);
     if (audio_source) edit.BindAudio(insert(*audio_source, audio), owner);
   });
-  if (before->assets.empty()) document.title = name;
+  if (before->resources->Empty()) document.title = name;
   document.dirty = true;
 }
 
-void InsertWorkbenchLayer(WorkbenchDocument& document, AssetReference asset, TrackKind kind, MediaTimestamp position) {
-  const auto duration = Available(asset, 24 * 60 * 60, kind);
+void InsertWorkbenchLayer(WorkbenchDocument& document, AssetSource asset, TrackKind kind, MediaTimestamp position,
+                          bool include_original_audio) {
+  const auto sound = std::ranges::find(asset.tracks, TrackKind::Audio, &AssetTrack::kind);
+  const auto linked = kind == TrackKind::Video && include_original_audio && sound != asset.tracks.end()
+      ? std::optional{*sound} : std::nullopt;
+  const auto duration = Available(asset, 24 * 60 * 60, linked ? std::nullopt : std::optional{kind});
   const auto source = Track(asset, kind);
   const auto begin = position.Compare(document.revision->Range().end) == 1 ? document.revision->Range().end : position;
   const TimeRange timeline{begin, AddWorkbenchTime(begin, duration)};
@@ -230,108 +239,38 @@ void InsertWorkbenchLayer(WorkbenchDocument& document, AssetReference asset, Tra
     if (kind == TrackKind::Video) {
       auto corner = std::ranges::find(occupied, false);
       const auto bounds = kWorkbenchInsetPositions[corner == occupied.end() ? 0 : corner - occupied.begin()];
-      edit.SetLayout(clip, FitWorkbenchInset(bounds, document.revision->canvas, source.display_size));
+      edit.SetLayout(clip, bounds);
       edit.SetClipFill(clip, true);
+    }
+    if (linked) {
+      const auto lane = std::ranges::find_if(document.revision->tracks, [&](const TimelineTrack& track) {
+        return track.kind == TrackKind::Audio && TrackAvailable(track, timeline);
+      });
+      const auto track = lane == document.revision->tracks.end() ? edit.AddTrack(TrackKind::Audio) : lane->id;
+      const auto start = linked->presentation.start;
+      const auto original = edit.InsertClip(track, {{id, linked->id, {start, AddWorkbenchTime(start, duration)}}, timeline});
+      edit.BindAudio(original, clip);
     }
   });
   document.dirty = true;
 }
 
-std::optional<PixelSize> WorkbenchVideoSize(const ProjectSnapshot& project, const ClipInfo& clip) {
+std::optional<PixelSize> WorkbenchVideoSize(const ProjectSnapshot& project, const TimelineClip& clip) {
   const auto source = clip.placement.source;
-  const auto asset = std::ranges::find(project.assets, source.asset, &AssetInfo::id);
-  if (asset == project.assets.end()) return {};
-  const auto track = std::ranges::find(asset->source.tracks, source.track, &AssetTrack::id);
-  return track == asset->source.tracks.end() ? std::nullopt : track->display_size;
+  const auto asset = project.resources->FindMedia(source.asset);
+  if (!asset) return {};
+  const auto track = std::ranges::find(asset->tracks, source.track, &AssetTrack::id);
+  return track == asset->tracks.end() ? std::nullopt : track->display_size;
 }
 
 Rect FitWorkbenchInset(Rect bounds, PixelSize canvas, std::optional<PixelSize> source) {
-  if (!source || !source->width || !source->height) return bounds;
-  const auto ratio = float(source->width) * canvas.height / (float(source->height) * canvas.width);
-  if (std::abs(bounds.width - bounds.height * ratio) < 1e-5F) return bounds;
-  const auto width = std::min(bounds.width, bounds.height * ratio);
-  const auto height = width / ratio;
-  return {bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - height) / 2, width, height};
+  return source ? FitCanvasAspect(bounds, canvas, {static_cast<float>(source->width), static_cast<float>(source->height)}) : bounds;
 }
 
-std::shared_ptr<const ProjectSnapshot> PrepareWorkbenchPicture(std::shared_ptr<const ProjectSnapshot> project) {
-  if (!project) return {};
-  std::shared_ptr<ProjectSnapshot> fitted;
-  bool main = true;
-  for (std::size_t lane = 0; lane < project->tracks.size(); ++lane) {
-    const auto& track = project->tracks[lane];
-    if (track.kind != TrackKind::Video || std::exchange(main, false)) continue;
-    for (std::size_t index = 0; index < track.clips.size(); ++index) {
-      const auto& clip = track.clips[index];
-      if (clip.destination == Rect{0, 0, 1, 1} || std::ranges::any_of(project->transitions, [&](const auto& transition) {
-            return transition.from == clip.id || transition.to == clip.id;
-          })) continue;
-      const auto bounds = FitWorkbenchInset(clip.destination, project->canvas, WorkbenchVideoSize(*project, clip));
-      if (clip.fill && clip.destination == bounds) continue;
-      if (!fitted) fitted = std::make_shared<ProjectSnapshot>(*project);
-      auto& picture = fitted->tracks[lane].clips[index];
-      picture.destination = bounds;
-      picture.fill = true;
-    }
-  }
-  return fitted ? fitted : project;
-}
-
-void ApplyWorkbenchTrim(ProjectEdit& edit, const ProjectSnapshot& project, ClipId id,
-                        ClipPlacement placement, bool main_track) {
-  edit.SetClip(id, placement);
-  if (!main_track) return;
-  const auto primary = std::ranges::find(project.tracks, TrackKind::Video, &TrackInfo::kind);
-  if (primary == project.tracks.end()) throw std::invalid_argument("The project has no main video track");
-  const auto clip = std::ranges::find(primary->clips, id, &ClipInfo::id);
-  if (clip == primary->clips.end()) throw std::invalid_argument("The clip is not on the main video track");
-  const auto previous_end = clip->placement.timeline.end;
-  const auto shift = AddWorkbenchTime(placement.timeline.end, {-previous_end.ticks, previous_end.timescale});
-  const auto shifted = [shift](TimeRange range) {
-    return TimeRange{AddWorkbenchTime(range.start, shift), AddWorkbenchTime(range.end, shift)};
-  };
-  for (auto following = clip + 1; following != primary->clips.end(); ++following) {
-    auto next = following->placement;
-    next.timeline = shifted(next.timeline);
-    edit.SetClip(following->id, next);
-    for (const auto& transition : project.transitions) {
-      if (transition.from == following->id) edit.SetTransitionRange(transition.id, shifted(transition.spec.range));
-    }
-  }
-}
-
-WorkbenchDocument MakeWorkbenchTemplate(WorkbenchTemplate kind, std::array<AssetReference, 2> assets) {
-  const bool portrait = kind == WorkbenchTemplate::Portrait;
-  const bool inset = kind == WorkbenchTemplate::PictureInPicture;
-  const auto title = portrait ? "竖屏记录" : inset ? "双镜头画中画" : "舞台快剪";
-  const auto key = portrait ? "portrait" : inset ? "picture-in-picture" : "stage-cut";
-  const PixelSize canvas = portrait ? PixelSize{360, 640} : PixelSize{640, 360};
-  auto document = NewDocument(canvas, title);
-  auto first = Available(assets[0], portrait ? 5 : 6);
-  auto second = Available(assets[1], portrait ? 5 : 6);
-  if (inset) first = second = first.Compare(second) == -1 ? first : second;
-  const auto has_audio = [](const AssetReference& asset) {
-    return std::ranges::find(asset.tracks, TrackKind::Audio, &AssetTrack::kind) != asset.tracks.end();
-  };
-  const TemplateClip a{.slot = "first", .source = {{}, first}, .timeline = {{}, first},
-                       .include_original_audio = has_audio(assets[0])};
-  const TemplateClip b{.slot = "second", .source = {{}, second},
-                       .timeline = inset ? TimeRange{{}, second} : TimeRange{first, AddWorkbenchTime(first, second)},
-                       .destination = inset ? FitWorkbenchInset({0.66F, 0.63F, 0.30F, 0.30F}, canvas,
-                           Track(assets[1], TrackKind::Video).display_size) : Rect{0, 0, 1, 1},
-                       .include_original_audio = !inset && has_audio(assets[1])};
-  EditTemplateRecipe recipe{{"avkit.workbench", "1", key}, canvas, {"first", "second"}};
-  if (inset) recipe.tracks = {{TrackKind::Video, {a}}, {TrackKind::Video, {b}}};
-  else recipe.tracks = {{TrackKind::Video, {a, b}}};
-  EditTemplateInputs binding;
-  document.project->Edit([&](ProjectEdit& edit) {
-    for (std::size_t i = 0; i < assets.size(); ++i)
-      binding.bindings.push_back({recipe.slots[i], edit.Import(std::move(assets[i]))});
-  });
-  const auto plan = PlanEditTemplate(*document.project, recipe, binding);
-  document.revision = ApplyEditTemplate(*document.project, plan);
-  document.dirty = true;
-  return document;
+WorkbenchDocument MakeWorkbenchTemplate(const ResourceCatalog& resources, const ResourceRef& reference,
+                                        std::string title, std::vector<AssetSource> assets) {
+  auto project = std::make_shared<Project>(CreateTemplateProject(resources, reference, std::move(assets)));
+  return {project, project->Snapshot(), {}, std::move(title), true};
 }
 
 } // namespace avkit_preview

@@ -17,19 +17,6 @@ Task<void> RequestCapturePermission(ApplicationHandle application, Permission pe
   }
 }
 
-void WriteCaptureFile(const File& file, std::span<const std::byte> bytes) {
-  if (bytes.empty()) throw std::runtime_error("Capture returned an empty file");
-  auto opened = file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew);
-  if (!opened.Succeeded()) throw std::runtime_error(opened.Error().message);
-  auto stream = std::move(opened).Value();
-  const auto written = stream.WriteAt(0, bytes);
-  const auto closed = stream.Close();
-  if (!written.Succeeded() || !closed.Succeeded()) {
-    (void)file.Delete();
-    throw std::runtime_error("Could not save the complete capture");
-  }
-}
-
 void InstallPreviewCapture(ApplicationContext& context) {
   camera::Install(context);
   audio::Install(context);

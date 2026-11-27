@@ -12,13 +12,17 @@ namespace huxerui::avkit::analysis {
 
 /// @brief A trusted ncnn graph and its matching weights.
 struct NcnnModelAssets {
+  /// Converted ncnn graph from the trusted model pack.
   RawAsset parameters;
+  /// Matching weights from the same pack revision.
   RawAsset weights;
 };
 
 /// @brief MediaPipe detector and landmark pairs converted using the documented pack recipe.
 struct NcnnBodyHandModels {
+  /// Full-person detection and body landmarks within the detected region.
   NcnnModelAssets person_detector, body_landmarks;
+  /// Palm detection and hand landmarks within a caller-supplied hand region.
   NcnnModelAssets palm_detector, hand_landmarks;
 };
 
@@ -28,7 +32,9 @@ inline constexpr std::string_view kPPHumanSegV2LiteModelId = "pp-humansegv2-lite
 
 /// @brief Model packs loaded into one CPU analysis provider.
 struct NcnnAnalysisModels {
+  /// Optional YuNet face pack.
   std::optional<NcnnModelAssets> face;
+  /// Optional body and hand pack with all four model graphs.
   std::optional<NcnnBodyHandModels> body_hand;
   /// MediaPipe Selfie Segmentation 256x256, selected by default.
   std::optional<NcnnModelAssets> portrait;
@@ -40,18 +46,20 @@ struct NcnnAnalysisModels {
 /// Body sessions associate observations with their first valid reference picture. Hand sessions
 /// require body-derived regions and return source-space points with the input region index.
 /// Portrait sessions use one full picture per job and return R8Unorm foreground coverage.
-[[nodiscard]] Result<std::shared_ptr<AnalysisProvider>, std::string> CreateNcnnAnalysisProvider(
+/// @param models Packaged graphs and weights for the capabilities to expose. Omit unavailable packs.
+/// @return Provider with the requested models, or a diagnostic if a supplied pack cannot be loaded.
+Result<std::shared_ptr<AnalysisProvider>, std::string> CreateNcnnAnalysisProvider(
     const NcnnAnalysisModels& models);
 
 /// @brief Loads the trusted YuNet 2023mar FP32 graph and weights into a reusable provider.
-/// @param parameters The converted ncnn text graph from the YuNet model pack.
-/// @param weights The matching FP32 ncnn weights from the same pack revision.
-/// @return The provider or a diagnostic for missing, unreadable, or incompatible model data.
 /// Sessions accept unrotated SDR I420 CPU pictures. In full-frame mode the first valid job supplies the
 /// reference picture, which timeline sampling takes from the start of the clip's source trim. Full-frame
 /// analysis reports one subject when the current picture has one face that matches the reference.
 /// Region-based analysis uses caller-supplied head regions. Inference and completion run on the submitting sequence.
-[[nodiscard]] Result<std::shared_ptr<AnalysisProvider>, std::string> CreateNcnnFaceAnalysisProvider(
+/// @param parameters The converted ncnn text graph from the YuNet model pack.
+/// @param weights The matching FP32 ncnn weights from the same pack revision.
+/// @return The provider or a diagnostic for missing, unreadable, or incompatible model data.
+Result<std::shared_ptr<AnalysisProvider>, std::string> CreateNcnnFaceAnalysisProvider(
     const RawAsset& parameters, const RawAsset& weights);
 
 } // namespace huxerui::avkit::analysis

@@ -1,6 +1,6 @@
 #include <huxerui/avkit/asset_sampling.h>
 
-#include "render/bgfx/video_texture_internal.h"
+#include "media/video_texture.h"
 
 #if defined(__ANDROID__)
 #include "android_canvas_texture.h"
@@ -10,9 +10,9 @@ namespace huxerui::avkit {
 namespace {
 
 ThumbnailImage MakeSoftwareThumbnail(const media::VideoFrame& frame, media::VideoTextureOptions options) {
-  const auto fitted = render::detail::FitCpuVideoFrame(frame, options);
+  const auto fitted = avkit::detail::FitCpuVideoFrame(frame, options);
   if (!fitted.Succeeded()) throw std::runtime_error(fitted.Error().message);
-  const auto pixels = render::GetImagePixels(fitted.Value().pixels).value();
+  const auto& pixels = fitted.Value();
   return Bitmap::CopyPixels(options.width, options.height, pixels.bytes.AsBytes(), pixels.row_bytes,
                             Bitmap::PixelFormat::Rgba8888);
 }

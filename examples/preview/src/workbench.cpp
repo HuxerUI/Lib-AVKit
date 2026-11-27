@@ -13,6 +13,7 @@
 
 #include "capture_preview.h"
 #include "workbench_media.h"
+#include "workbench_overlay.h"
 
 namespace avkit_preview {
 namespace {
@@ -58,7 +59,7 @@ void SelectWorkbenchMedia(const WorkbenchContext& context, WorkbenchMediaRequest
 }
 
 struct Preset {
-  WorkbenchTemplate kind;
+  const char* key;
   const char* title;
   const char* description;
   const char* layout;
@@ -66,9 +67,9 @@ struct Preset {
 };
 
 const std::array kPresets{
-    Preset{WorkbenchTemplate::StageCut, "舞台快剪", "两段视频依次拼接，每段最多六秒。", "16:9  ·  2 段素材  ·  12 秒", app::images::workbench_stage},
-    Preset{WorkbenchTemplate::Portrait, "竖屏记录", "两段视频排进竖屏画布，每段最多五秒。", "9:16  ·  2 段素材", app::images::workbench_portrait},
-    Preset{WorkbenchTemplate::PictureInPicture, "双镜头", "两段视频同时播放，保留主镜头音轨。", "画中画  ·  2 段素材", app::images::workbench_dissolve},
+    Preset{"stage-cut", "舞台快剪", "两段视频依次拼接，每段最多六秒。", "16:9  ·  2 段素材  ·  12 秒", app::images::workbench_stage},
+    Preset{"portrait", "竖屏记录", "两段视频排进竖屏画布，每段最多五秒。", "9:16  ·  2 段素材", app::images::workbench_portrait},
+    Preset{"picture-in-picture", "双镜头", "两段视频同时播放，保留主镜头音轨。", "画中画  ·  2 段素材", app::images::workbench_dissolve},
 };
 
 ThemeSpec WorkbenchTheme() {
@@ -197,8 +198,14 @@ View Home(WorkbenchContext context, State<Page> page, bool wide) {
 View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, bool wide) {
   const auto& theme = UseTheme();
   const auto which = UseState(std::size_t{});
-  const auto inputs = UseState(std::array<std::optional<AssetReference>, 2>{});
+  const auto inputs = UseState(std::vector<std::optional<AssetSource>>{});
+  const auto resources = UseService<Resources>();
+  const auto catalog_state = UseState(std::shared_ptr<const ResourceCatalog>{});
+  Lifecycle([resources, catalog_state] { catalog_state = LoadWorkbenchResources(*resources); }, resources);
+  const auto templates = catalog_state.Get();
   const auto& preset = kPresets[which.Get()];
+  const ResourceRef reference{preset.key};
+  const auto names = templates ? OpenEditTemplate(*templates, reference).slots : std::vector<std::string>{};
   const bool busy = context.busy.Get();
   const auto card = [&](std::size_t index, float height) {
     const auto& item = kPresets[index];
@@ -216,7 +223,7 @@ View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, b
         CornerRadius(9.0F), Border{wide && index == which.Get() ? theme.colors.primary : theme.colors.outline, 1.0F},
         ClipChildren{}, Enabled(!busy), Semantics{.role = SemanticRole::Button, .label = item.title}))
         .OnClick([which, detail, inputs, index] {
-          if (which.Get() != index) inputs = std::array<std::optional<AssetReference>, 2>{};
+          if (which.Get() != index) inputs = std::vector<std::optional<AssetSource>>{};
           which = index;
           detail = true;
         });
@@ -229,9 +236,12 @@ View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, b
       }.With(Spacing(9.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   if (!wide && !detail.Get())
     return ScrollView(std::move(catalog).With(Padding(12.0F)));
-  const auto bound = inputs.Get();
-  const auto selected = int(bool(bound[0])) + int(bool(bound[1]));
-  const auto portrait = preset.kind == WorkbenchTemplate::Portrait;
+  auto bound = inputs.Get();
+  bound.resize(names.size());
+  const auto selected = std::ranges::count_if(bound, [](const auto& asset) { return bool(asset); });
+  const auto total = names.size();
+  const auto complete = total && static_cast<std::size_t>(selected) == total;
+  const auto portrait = std::string_view(preset.key) == "portrait";
   const auto height = wide ? 320.0F : portrait ? 236.0F : 182.0F;
   View artwork = portrait ? View(Row{Cover(preset.image, height).With(
       Frame{.width = height * 9.0F / 16.0F, .height = height})}.With(MainAlign(MainAxisAlignment::Center))) :
@@ -245,19 +255,22 @@ View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, b
   std::vector<View> slots;
   slots.push_back(Row{
     Text("素材", TextRole::Label).With(Grow()),
-    Text(std::to_string(selected) + " / 2").Style(
+    Text(std::to_string(selected) + " / " + std::to_string(total)).Style(
         TextStyle{.font = Font::Monospace(11.0F),
-                  .foreground = selected == 2 ? theme.colors.primary : theme.colors.on_surface_variant}),
+                  .foreground = complete ? theme.colors.primary : theme.colors.on_surface_variant}),
   }.With(CrossAlign(CrossAxisAlignment::Center)));
   const bool has_media = HasWorkbenchMedia();
   for (std::size_t i = 0; has_media && i < bound.size(); ++i) {
     const auto& asset = bound[i];
-    const auto name = i == 0 ? "主镜头" : "第二镜头";
-    const auto action = [context, inputs, i, name] {
-      SelectWorkbenchVideo(context, name, 1, [inputs, i](std::vector<File> files) -> Task<void> {
-        auto asset = co_await RunWorker([file = files.front()] { return ReadWorkbenchMovie(file); });
-        inputs.Update([&](auto& current) { current[i] = std::move(asset); });
-      });
+    const auto name = names[i];
+    const auto action = [context, inputs, i, name, total] {
+      SelectWorkbenchMedia(context, {name, 1, true, [inputs, i, total](std::vector<File> files) -> Task<void> {
+        auto asset = co_await RunWorker([file = files.front()] { return ReadWorkbenchVisual(file); });
+        inputs.Update([&](auto& current) {
+          current.resize(total);
+          current[i] = std::move(asset);
+        });
+      }});
     };
     slots.push_back(View(Row{
       Column{
@@ -274,35 +287,42 @@ View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, b
            Enabled(!busy && CanSelectWorkbenchVideo(context)), Semantics{.role = SemanticRole::Button, .label = name}))
         .OnClick(action).Key(std::to_string(i)));
   }
-  if (has_media && context.browse_library.Get()) {
-    slots.push_back(WorkbenchControl(Button("选择两个镜头").OnClick([context, inputs] {
-      SelectWorkbenchVideo(context, "选择模板镜头", 2, [inputs](std::vector<File> files) -> Task<void> {
+  if (has_media && total > 1) {
+    slots.push_back(WorkbenchControl(Button("选择多段素材").OnClick([context, inputs, total] {
+      SelectWorkbenchMedia(context, {"选择模板素材", static_cast<std::uint32_t>(total), true,
+          [inputs, total](std::vector<File> files) -> Task<void> {
         auto assets = co_await RunWorker([files = std::move(files)] {
-          std::vector<AssetReference> result;
-          for (const auto& file : files) result.push_back(ReadWorkbenchMovie(file));
+          std::vector<AssetSource> result;
+          for (const auto& file : files) result.push_back(ReadWorkbenchVisual(file));
           return result;
         });
         inputs.Update([&](auto& current) {
-          for (std::size_t index = 0; index < assets.size(); ++index) current[index] = std::move(assets[index]);
+          current.resize(total);
+          for (std::size_t index = 0; index < std::min(total, assets.size()); ++index)
+            current[index] = std::move(assets[index]);
         });
-      });
+      }});
     }).With(Enabled(!busy)), theme));
   }
   if (!has_media) slots.push_back(Text("此构建无法导入视频素材。").With(Foreground(theme.colors.on_surface_variant)));
   View binding = Column(std::move(slots)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  View apply = WorkbenchControl(Button("生成并进入剪辑").OnClick([context, inputs, page, kind = preset.kind] {
-    RunWorkbenchAction(context, [context, inputs, page, kind]() -> Task<void> {
+  View apply = WorkbenchControl(Button("生成并进入剪辑").OnClick([context, inputs, page, total, templates,
+                                                              reference, title = std::string(preset.title)] {
+    RunWorkbenchAction(context, [context, inputs, page, total, templates, reference, title]() -> Task<void> {
       auto selected = inputs.Get();
-      if (!selected[0] || !selected[1]) co_return;
-      auto document = co_await RunWorker([assets = std::array{*selected[0], *selected[1]}, kind]() mutable {
-        return MakeWorkbenchTemplate(kind, std::move(assets));
+      if (!templates || selected.size() != total ||
+          !std::ranges::all_of(selected, [](const auto& asset) { return bool(asset); })) co_return;
+      std::vector<AssetSource> assets;
+      for (auto& asset : selected) assets.push_back(std::move(*asset));
+      auto document = co_await RunWorker([assets = std::move(assets), templates, reference, title]() mutable {
+        return MakeWorkbenchTemplate(*templates, reference, title, std::move(assets));
       });
       if (const auto current = context.document.Get(); current && current->dirty)
         co_await SaveWorkbenchDocument(context);
       context.document = std::move(document);
       page = Page::Edit;
     });
-  }).With(Enabled(!busy && selected == 2)), theme, WorkbenchActionTone::Primary);
+  }).With(Enabled(!busy && complete)), theme, WorkbenchActionTone::Primary);
 
   if (wide) {
     return ScrollView(Row{
@@ -325,7 +345,7 @@ View Templates(WorkbenchContext context, State<Page> page, State<bool> detail, b
 [[huxerui::composable]]
 View CapturePage(WorkbenchContext context, State<Page> page, State<bool> capturing) {
   const auto append = [context, page](File file) -> Task<void> {
-    auto asset = co_await RunWorker([file] { return ReadWorkbenchMovie(file); });
+    auto asset = co_await RunWorker([file] { return ReadWorkbenchVisual(file); });
     auto edited = context.document.Get();
     if (!edited) edited = EmptyWorkbenchProject();
     AppendWorkbenchMovie(*edited, std::move(asset));
@@ -576,13 +596,20 @@ FilePickerFilter WorkbenchMovieFilter() {
           {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-matroska", "video/webm", "video/mp2t",
            "video/x-msvideo"}};
 }
+
 FilePickerFilter WorkbenchAudioFilter() {
   return {"音乐", {"mp3", "m4a", "wav"}, {"audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav"}};
 }
+
 FilePickerFilter WorkbenchProjectFilter() { return {"AVKit 工程", {"avkit"}, {}}; }
 
 bool CanSelectWorkbenchVideo(const WorkbenchContext& context) {
   return context.browse_library.Get() || context.picker->CanOpenFiles();
+}
+
+void SelectWorkbenchVisual(const WorkbenchContext& context, std::string title, std::uint32_t limit,
+                           WorkbenchMediaSelection confirmed) {
+  SelectWorkbenchMedia(context, {std::move(title), limit, true, std::move(confirmed)});
 }
 
 void SelectWorkbenchVideo(const WorkbenchContext& context, std::string title, std::uint32_t limit,
@@ -593,20 +620,10 @@ void SelectWorkbenchVideo(const WorkbenchContext& context, std::string title, st
 void StartWorkbenchProject(const WorkbenchContext& context, std::function<void()> on_created) {
   SelectWorkbenchMedia(context, {"选择初始素材", 10, true,
       [context, on_created = std::move(on_created)](std::vector<File> files) -> Task<void> {
-        std::vector<AssetReference> assets;
+        std::vector<AssetSource> assets;
         for (const auto& file : files) {
           try {
-            auto extension = file.Extension();
-            std::ranges::transform(extension, extension.begin(), [](unsigned char c) { return std::tolower(c); });
-            if (extension == ".png" || extension == ".jpg" || extension == ".jpeg") {
-              const auto source = co_await RunWorker([file] { return ImageAsset::FromFile(file); });
-              auto bitmap = co_await source.DecodeAsync();
-              assets.push_back(co_await RunWorker([file, data = context.data, bitmap = std::move(bitmap)]() mutable {
-                return PrepareWorkbenchPhoto(std::move(bitmap), WorkbenchOutput(data, "Media", file.Stem() + ".mp4"));
-              }));
-            } else {
-              assets.push_back(co_await RunWorker([file] { return ReadWorkbenchMovie(file); }));
-            }
+            assets.push_back(co_await RunWorker([file] { return ReadWorkbenchVisual(file); }));
           } catch (const std::exception& failure) {
             throw std::runtime_error("无法导入 " + file.Name() + "。" + failure.what());
           }

@@ -155,6 +155,7 @@ endfunction()
 add_library(avkit_bgfx STATIC
         src/render/bgfx/bgfx_backend.cpp
         src/render/bgfx/video_texture.cpp
+        src/render/render_passes.cpp
 )
 add_library(AVKit::Bgfx ALIAS avkit_bgfx)
 target_compile_features(avkit_bgfx PRIVATE cxx_std_20)

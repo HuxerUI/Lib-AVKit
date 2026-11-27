@@ -18,13 +18,13 @@ namespace {
 
 constexpr int kMaskSize = 256;
 constexpr std::array kOutputs{"out0"};
-using MaskResult = decltype(MaskCompletion::result);
+using MaskResult = decltype(AnalysisImageCompletion::result);
 
 struct PortraitRequest {
   AnalysisConfig config;
   AnalysisJob job;
   std::stop_token stop;
-  AnalysisSession::MaskCallback complete;
+  AnalysisSession::ImageCallback complete;
 };
 
 MaskResult Infer(const Network& model, const PortraitRequest& request) {
@@ -55,9 +55,9 @@ MaskResult Infer(const Network& model, const PortraitRequest& request) {
         (*bytes)[row * kMaskSize + col] = std::byte(int(std::clamp(value, 0.F, 1.F) * 255.F + 0.5F));
       }
     }
-    const auto surface = render::RetainImagePixels({{kMaskSize, kMaskSize}, render::PixelFormat::R8Unorm},
-                                                  {BufferReference(*bytes, bytes), kMaskSize});
-    return MaskResult::Success(AnalysisTexture{surface, {}});
+    return MaskResult::Success(render::ImagePixels{
+        {{kMaskSize, kMaskSize}, render::PixelFormat::R8Unorm},
+        BufferReference(*bytes, bytes), kMaskSize});
   } catch (const std::exception& error) {
     return MaskResult::Failure(error.what());
   }
@@ -141,7 +141,7 @@ class PortraitSession final : public AnalysisSession {
 public:
   PortraitSession(std::shared_ptr<PortraitModel> model, AnalysisConfig config) : model_(std::move(model)), config_(config) {}
 
-  void SubmitMask(AnalysisJob job, std::stop_token stop, MaskCallback complete) override {
+  void SubmitMask(AnalysisJob job, std::stop_token stop, ImageCallback complete) override {
     model_->Submit({config_, std::move(job), stop, std::move(complete)});
   }
 

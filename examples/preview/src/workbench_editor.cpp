@@ -2,6 +2,8 @@
 #include "workbench_media.h"
 #include "workbench_overlay.h"
 
+#include <huxerui/avkit/resource_catalog.h>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -20,6 +22,7 @@ using namespace huxerui;
 using namespace huxerui::avkit;
 
 double Seconds(media::MediaTimestamp time) { return double(time.ticks) / time.timescale; }
+
 bool Before(media::MediaTimestamp a, media::MediaTimestamp b) { return a.Compare(b) == -1; }
 
 constexpr float kRulerHeight = 28.0F;
@@ -38,22 +41,57 @@ enum class OverlayPage { Font, Style, Background, Position };
 enum class EditorPanel { None, Overlay, Picture, Audio, Stickers };
 
 struct TimelineLane {
-  const TrackInfo* track{};
+  const TimelineTrack* track{};
   media::TrackKind kind{media::TrackKind::Video};
   std::string label;
-  std::vector<const CanvasOverlay*> overlays;
+  std::vector<const OverlayInstance*> overlays;
 };
 
-bool VisibleClip(const ClipInfo& clip) { return !clip.audio_of; }
+bool VisibleClip(const TimelineClip& clip) { return !clip.audio_of; }
 
 const char* OverlayLabel(CanvasOverlayKind kind) {
   switch (kind) {
     case CanvasOverlayKind::Text: return "文字";
     case CanvasOverlayKind::Subtitle: return "字幕";
     case CanvasOverlayKind::Sticker: return "贴纸";
-    case CanvasOverlayKind::PagText: return "PAG 文字";
   }
   return "叠加";
+}
+
+const PagAsset* OverlayPagAsset(const OverlayInstance& overlay, const ResourceCatalog* resources) {
+  const auto* pag = std::get_if<PagOverlay>(&overlay.content);
+  return pag && resources ? resources->Find<PagAsset>(pag->resource) : nullptr;
+}
+
+bool IsPointText(const OverlayInstance& overlay, const ResourceCatalog* resources) {
+  const auto* asset = OverlayPagAsset(overlay, resources);
+  return asset && asset->fit_text_to_canvas;
+}
+
+std::string_view OverlayTextSlot(const OverlayInstance& overlay, const ResourceCatalog* resources) {
+  if (const auto* asset = OverlayPagAsset(overlay, resources); asset && !asset->text_slots.empty()) {
+    const auto& slots = asset->text_slots;
+    const auto named_title = std::ranges::find(slots, "title", &PagEditableSlot::name);
+    return (named_title == slots.end() ? slots.front() : *named_title).name;
+  }
+  if (const auto* pag = std::get_if<PagOverlay>(&overlay.content); pag && !pag->replacements.texts.empty())
+    return pag->replacements.texts.front().slot;
+  return "title";
+}
+
+const PagTextReplacement& OverlayText(const OverlayInstance& overlay, std::string_view slot) {
+  static const PagTextReplacement defaults{};
+  const auto* pag = std::get_if<PagOverlay>(&overlay.content);
+  if (!pag) return defaults;
+  const auto& texts = pag->replacements.texts;
+  const auto found = std::ranges::find(texts, slot, &PagTextReplacement::slot);
+  return found == texts.end() ? defaults : *found;
+}
+
+PagTextReplacement& EditOverlayText(OverlayInstance& overlay, std::string_view slot) {
+  auto& texts = std::get<PagOverlay>(overlay.content).replacements.texts;
+  const auto found = std::ranges::find(texts, slot, &PagTextReplacement::slot);
+  return found == texts.end() ? texts.emplace_back(PagTextReplacement{std::string(slot)}) : *found;
 }
 
 std::vector<TimelineLane> TimelineLanes(const ProjectSnapshot* project) {
@@ -76,10 +114,9 @@ std::vector<TimelineLane> TimelineLanes(const ProjectSnapshot* project) {
     }
   }
   if (project) {
-    for (const auto kind : {CanvasOverlayKind::Text, CanvasOverlayKind::Subtitle, CanvasOverlayKind::PagText,
-                            CanvasOverlayKind::Sticker}) {
+    for (const auto kind : {CanvasOverlayKind::Text, CanvasOverlayKind::Subtitle, CanvasOverlayKind::Sticker}) {
       const auto first_lane = rows.size();
-      std::vector<const CanvasOverlay*> overlays;
+      std::vector<const OverlayInstance*> overlays;
       for (const auto& overlay : project->overlays) if (overlay.kind == kind) overlays.push_back(&overlay);
       std::ranges::stable_sort(overlays, [](const auto* a, const auto* b) {
         return a->range.start.Compare(b->range.start) == -1;
@@ -108,6 +145,7 @@ struct TimelineWindow {
   double Time(float x, float width) const {
     return begin + span * (x - Origin()) / Width(width);
   }
+
   static float Width(float width) { return std::max(1.0F, width - kLaneHeader - 2 * kTimelineGutter); }
 
 private:
@@ -126,7 +164,6 @@ StripViewport SamplingWindow(TimelineWindow display, double base_span, double du
 enum class TrimEdge { Start, End, Body };
 enum class TrimPhase { Move, Commit, Cancel };
 
-using CanvasTarget = std::variant<ClipId, InstanceId>;
 
 Rect ArtworkBounds(Rect frame, Rect artwork) {
   return {frame.x + artwork.x * frame.width, frame.y + artwork.y * frame.height,
@@ -139,20 +176,63 @@ Rect FrameFromArtwork(Rect bounds, Rect artwork) {
 }
 
 struct CanvasItem {
-  CanvasTarget target;
+  EditTarget target;
   Rect bounds;
   Rect artwork{0, 0, 1, 1};
   float degrees{};
   bool text{};
   CanvasGuides guides;
+  std::optional<avkit::Affine2D> presented_transform;
+
   Rect Visible() const { return ArtworkBounds(bounds, artwork); }
+
   bool operator==(const CanvasItem&) const = default;
 };
 
-Rect CanvasArea(Size available, PixelSize canvas) {
-  const auto scale = std::min(available.width / canvas.width, available.height / canvas.height);
-  const auto width = canvas.width * scale, height = canvas.height * scale;
-  return {(available.width - width) / 2, (available.height - height) / 2, width, height};
+bool ParticipatesInTransition(const ProjectSnapshot& project, ClipId clip) {
+  return std::ranges::any_of(project.transitions, [clip](const auto& transition) {
+    return transition.from == clip || transition.to == clip;
+  });
+}
+
+bool CanEditOnCanvas(const ProjectSnapshot& project, EditTarget target) {
+  if (const auto clip = target.AsClip()) {
+    bool main = true;
+    for (const auto& track : project.tracks) {
+      if (track.kind != media::TrackKind::Video) continue;
+      if (std::ranges::find(track.clips, *clip, &TimelineClip::id) != track.clips.end())
+        return !main && !ParticipatesInTransition(project, *clip);
+      main = false;
+    }
+    return false;
+  }
+  return std::ranges::find(project.overlays, *target.AsOverlay(), &OverlayInstance::id) != project.overlays.end();
+}
+
+std::optional<CanvasItem> FindCanvasItem(const render::PreviewFrame& frame, EditTarget target) {
+  const auto layout = frame.FindLayout(target);
+  if (!layout) return std::nullopt;
+  bool text = false;
+  if (const auto id = target.AsOverlay()) {
+    const auto& overlays = frame.project->overlays;
+    const auto overlay = std::ranges::find(overlays, *id, &OverlayInstance::id);
+    text = overlay != overlays.end() && overlay->kind != CanvasOverlayKind::Sticker;
+  }
+  const auto& matrix = layout->transform;
+  const auto center = matrix.Apply({0.5F, 0.5F});
+  const auto x_scale = float(frame.texture_size.width) / frame.texture_size.height;
+  const auto width = std::hypot(matrix.m11, matrix.m12 / x_scale);
+  const auto height = std::hypot(matrix.m22, matrix.m21 * x_scale);
+  const auto degrees = std::atan2(matrix.m12 / x_scale, matrix.m11) * 180.0F / std::numbers::pi_v<float>;
+  return CanvasItem{target, {center.x - width / 2, center.y - height / 2, width, height},
+                    layout->local_bounds, degrees, text, {}, matrix};
+}
+
+Rect PreviewContentRect(Size preview_view_size, PixelSize project_canvas_size) {
+  const auto scale = std::min(preview_view_size.width / project_canvas_size.width,
+                              preview_view_size.height / project_canvas_size.height);
+  const auto width = project_canvas_size.width * scale, height = project_canvas_size.height * scale;
+  return {(preview_view_size.width - width) / 2, (preview_view_size.height - height) / 2, width, height};
 }
 
 Rect PlaceCanvasItem(Rect bounds, float x, float y, float scale = 1.0F) {
@@ -166,24 +246,30 @@ enum class CanvasCorner { Delete, Edit, Transform, Duplicate };
 constexpr float kCanvasButtonSize = 18.0F;
 constexpr float kCanvasButtonHitRadius = 16.0F;
 
-Point CanvasCenter(const CanvasItem& item, Rect area) {
-  return {area.x + (item.bounds.x + item.bounds.width / 2) * area.width,
-          area.y + (item.bounds.y + item.bounds.height / 2) * area.height};
+Point CanvasCenter(const CanvasItem& item, Rect preview_content_rect) {
+  return {preview_content_rect.x + (item.bounds.x + item.bounds.width / 2) * preview_content_rect.width,
+          preview_content_rect.y + (item.bounds.y + item.bounds.height / 2) * preview_content_rect.height};
 }
 
-std::array<Point, 4> CanvasCorners(const CanvasItem& item, Rect area, PixelSize canvas, bool pad_text = true) {
+std::array<Point, 4> CanvasCorners(const CanvasItem& item, Rect preview_content_rect, PixelSize project_canvas_size,
+                                  bool pad_text = true) {
   auto rect = item.Visible();
   if (pad_text && item.text) {
     constexpr float padding = 6.0F;
-    const auto horizontal = padding / area.width, vertical = padding / area.height;
+    const auto horizontal = padding / preview_content_rect.width, vertical = padding / preview_content_rect.height;
     rect = {rect.x - horizontal, rect.y - vertical, rect.width + 2 * horizontal, rect.height + 2 * vertical};
   }
-  const auto rotate = CanvasRotation(item.bounds, canvas, item.degrees);
+  const auto rotate = CanvasRotation(item.bounds, project_canvas_size, item.degrees);
   std::array points{Point{rect.x, rect.y}, Point{rect.x + rect.width, rect.y},
       Point{rect.x + rect.width, rect.y + rect.height}, Point{rect.x, rect.y + rect.height}};
   for (auto& point : points) {
-    point = rotate.Apply(point);
-    point = {area.x + point.x * area.width, area.y + point.y * area.height};
+    if (item.presented_transform) {
+      point = item.presented_transform->Apply({
+          (point.x - item.bounds.x) / item.bounds.width, (point.y - item.bounds.y) / item.bounds.height});
+    } else {
+      point = rotate.Apply(point);
+    }
+    point = {preview_content_rect.x + point.x * preview_content_rect.width, preview_content_rect.y + point.y * preview_content_rect.height};
   }
   return points;
 }
@@ -217,12 +303,12 @@ std::optional<float> SnapCanvasAxis(float artwork_start, float artwork_end, floa
 
 struct CanvasPointer {
   class Extension;
-  PixelSize canvas;
-  std::vector<CanvasItem> items;
+  PixelSize project_canvas_size;
+  render::PreviewFrame frame;
   std::optional<CanvasItem> active;
   State<std::optional<CanvasCorner>> pressed;
-  std::function<void(std::optional<CanvasTarget>)> select;
-  std::function<void(CanvasItem, TrimPhase)> update;
+  std::function<void(std::optional<EditTarget>)> select;
+  std::function<void(const CanvasItem&, CanvasItem, TrimPhase)> update;
   std::function<void(CanvasCorner)> action;
   bool interactive;
 };
@@ -230,6 +316,7 @@ struct CanvasPointer {
 class CanvasPointer::Extension final : public NodeExtension {
 public:
   Extension(ViewNode&, const CanvasPointer& value) : config_(value) {}
+
   void Update(ViewNode&, const CanvasPointer& value) { config_ = value; }
 
   bool HitTest(ViewNode& node, Point point) const override {
@@ -237,12 +324,12 @@ public:
   }
 
   PointerResult OnPointer(ViewNode& node, const PointerEvent& event) override {
-    const auto area = CanvasArea({node.Bounds().width, node.Bounds().height}, config_.canvas);
-    if (area.IsEmpty()) return PointerResult::Ignored;
-    if (event.type == PointerEventType::Down) return Begin(event, area);
+    const auto preview_content_rect = PreviewContentRect({node.Bounds().width, node.Bounds().height}, config_.project_canvas_size);
+    if (preview_content_rect.IsEmpty()) return PointerResult::Ignored;
+    if (event.type == PointerEventType::Down) return Begin(event, preview_content_rect);
     if (!first_ || (first_ != event.pointer_id && second_ != event.pointer_id)) return PointerResult::Ignored;
     if (event.type == PointerEventType::Cancel) {
-      if (changed_) update_(*current_, TrimPhase::Cancel);
+      if (changed_) update_(*initial_, *current_, TrimPhase::Cancel);
       Clear();
       return PointerResult::Handled;
     }
@@ -252,7 +339,7 @@ public:
         const bool inside = std::hypot(event.position.x - origin_.x, event.position.y - origin_.y) <= kCanvasButtonHitRadius;
         config_.pressed = inside ? button_ : std::nullopt;
       }
-      Move(area);
+      Move(preview_content_rect);
       return PointerResult::Handled;
     }
     if (event.type != PointerEventType::Up) return PointerResult::Handled;
@@ -268,8 +355,8 @@ public:
       return PointerResult::Handled;
     }
     if (changed_) {
-      const bool edited = current_->bounds != initial_bounds_ || current_->degrees != initial_degrees_;
-      update_(*current_, edited ? TrimPhase::Commit : TrimPhase::Cancel);
+      const bool edited = current_->bounds != initial_->bounds || current_->degrees != initial_->degrees;
+      update_(*initial_, *current_, edited ? TrimPhase::Commit : TrimPhase::Cancel);
     } else if (button_ && *button_ != CanvasCorner::Transform &&
                std::hypot(event.position.x - origin_.x, event.position.y - origin_.y) <= kCanvasButtonHitRadius) {
       config_.action(*button_);
@@ -283,7 +370,7 @@ public:
 private:
   static Point Midpoint(Point first, Point second) { return {(first.x + second.x) / 2, (first.y + second.y) / 2}; }
 
-  PointerResult Begin(const PointerEvent& event, Rect area) {
+  PointerResult Begin(const PointerEvent& event, Rect preview_content_rect) {
     if (event.changed_button == PointerButton::Secondary) return PointerResult::Ignored;
     if (first_) {
       if (second_ || !current_ || event.device_kind != PointerDeviceKind::Touch) return PointerResult::Ignored;
@@ -297,14 +384,13 @@ private:
       multi_ = true;
       return PointerResult::Capture;
     }
-    const Point normalized{(event.position.x - area.x) / area.width, (event.position.y - area.y) / area.height};
-    const auto hits_artwork = [&](const CanvasItem& item) {
-      const auto position = CanvasRotation(item.bounds, config_.canvas, item.degrees).Inverse(normalized);
-      return position && item.Visible().Contains(*position);
-    };
+    const Point normalized{(event.position.x - preview_content_rect.x) / preview_content_rect.width, (event.position.y - preview_content_rect.y) / preview_content_rect.height};
     if (config_.active) {
-      const auto corners = CanvasCorners(*config_.active, area, config_.canvas);
-      auto near = hits_artwork(*config_.active) ? kCanvasButtonSize / 2 : kCanvasButtonHitRadius;
+      const auto corners = CanvasCorners(*config_.active, preview_content_rect, config_.project_canvas_size);
+      const auto active = config_.frame.HitTest(normalized, [&](EditTarget target) {
+        return target == config_.active->target;
+      });
+      auto near = active ? kCanvasButtonSize / 2 : kCanvasButtonHitRadius;
       for (std::size_t index = 0; index < corners.size(); ++index) {
         const auto distance = std::hypot(corners[index].x - event.position.x, corners[index].y - event.position.y);
         if (distance < near) {
@@ -315,16 +401,18 @@ private:
       if (button_) base_ = config_.active;
     }
     if (!base_) {
-      const auto hit = std::ranges::find_if(config_.items.rbegin(), config_.items.rend(), hits_artwork);
-      if (hit != config_.items.rend() && config_.active && hit->target != config_.active->target &&
+      const auto hit = config_.frame.HitTest(normalized, [&](EditTarget target) {
+        return CanEditOnCanvas(*config_.frame.project, target);
+      });
+      if (hit && config_.active && *hit != config_.active->target &&
           event.device_kind == PointerDeviceKind::Touch) {
         base_ = config_.active;
-        tap_target_ = hit->target;
+        tap_target_ = hit;
         background_ = true;
-      } else if (hit != config_.items.rend()) {
-        base_ = *hit;
+      } else if (hit) {
+        base_ = FindCanvasItem(config_.frame, *hit);
         move_body_ = true;
-        config_.select(hit->target);
+        config_.select(hit);
       } else if (config_.active) {
         base_ = config_.active;
         background_ = true;
@@ -333,8 +421,7 @@ private:
       }
     }
     current_ = base_;
-    initial_bounds_ = base_->bounds;
-    initial_degrees_ = base_->degrees;
+    initial_ = base_;
     update_ = config_.update;
     first_ = event.pointer_id;
     origin_ = first_point_ = event.position;
@@ -342,7 +429,7 @@ private:
     return PointerResult::Capture;
   }
 
-  void Move(Rect area) {
+  void Move(Rect preview_content_rect) {
     if (!move_body_ && !second_ && button_ != CanvasCorner::Transform) return;
     Point translation{};
     Point before{}, after{};
@@ -352,7 +439,7 @@ private:
       before = span_;
       after = {second_point_.x - first_point_.x, second_point_.y - first_point_.y};
     } else if (button_ == CanvasCorner::Transform) {
-      const auto center = CanvasCenter(*base_, area);
+      const auto center = CanvasCenter(*base_, preview_content_rect);
       before = {origin_.x - center.x, origin_.y - center.y};
       after = {first_point_.x - center.x, first_point_.y - center.y};
     } else {
@@ -368,11 +455,12 @@ private:
       return;
     auto next = *base_;
     next.guides = {};
+    next.presented_transform.reset();
     const auto rect = next.Visible();
     const auto maximum = 1.0F / std::max(rect.width, rect.height);
     const auto bounded = std::clamp(scale, 0.025F * maximum, maximum);
-    auto placed = PlaceCanvasItem(rect, rect.x + (1 - bounded) * rect.width / 2 + translation.x / area.width,
-        rect.y + (1 - bounded) * rect.height / 2 + translation.y / area.height, bounded);
+    auto placed = PlaceCanvasItem(rect, rect.x + (1 - bounded) * rect.width / 2 + translation.x / preview_content_rect.width,
+        rect.y + (1 - bounded) * rect.height / 2 + translation.y / preview_content_rect.height, bounded);
     next.bounds = FrameFromArtwork(placed, next.artwork);
     next.degrees = std::remainder(next.degrees + angle, 360.0F);
     next.guides.rotating = transform && (current_->guides.rotating || std::abs(angle) >= 1.0F);
@@ -389,17 +477,17 @@ private:
       }
     }
     if (second_ ? (translation.x != 0.0F || translation.y != 0.0F) : move_body_) {
-      const auto corners = CanvasCorners(next, area, config_.canvas, false);
+      const auto corners = CanvasCorners(next, preview_content_rect, config_.project_canvas_size, false);
       const auto [left, right] = std::ranges::minmax_element(corners, {}, &Point::x);
       const auto [top, bottom] = std::ranges::minmax_element(corners, {}, &Point::y);
-      next.guides.x = SnapCanvasAxis(left->x, right->x, area.x, area.width, current_->guides.x, placed.x, placed.width);
-      next.guides.y = SnapCanvasAxis(top->y, bottom->y, area.y, area.height, current_->guides.y, placed.y, placed.height);
+      next.guides.x = SnapCanvasAxis(left->x, right->x, preview_content_rect.x, preview_content_rect.width, current_->guides.x, placed.x, placed.width);
+      next.guides.y = SnapCanvasAxis(top->y, bottom->y, preview_content_rect.y, preview_content_rect.height, current_->guides.y, placed.y, placed.height);
       next.bounds = FrameFromArtwork(placed, next.artwork);
     }
     if (current_ == next) return;
     current_ = next;
     changed_ = true;
-    update_(next, TrimPhase::Move);
+    update_(*initial_, next, TrimPhase::Move);
   }
 
   void Clear() {
@@ -407,6 +495,7 @@ private:
     second_.reset();
     base_.reset();
     current_.reset();
+    initial_.reset();
     button_.reset();
     config_.pressed = std::nullopt;
     tap_target_.reset();
@@ -417,12 +506,10 @@ private:
   CanvasPointer config_;
   std::optional<std::int64_t> first_, second_;
   Point origin_, first_point_, second_point_, span_;
-  Rect initial_bounds_;
-  float initial_degrees_{};
-  std::optional<CanvasItem> base_, current_;
+  std::optional<CanvasItem> base_, current_, initial_;
   std::optional<CanvasCorner> button_;
-  std::optional<CanvasTarget> tap_target_;
-  std::function<void(CanvasItem, TrimPhase)> update_;
+  std::optional<EditTarget> tap_target_;
+  std::function<void(const CanvasItem&, CanvasItem, TrimPhase)> update_;
   bool changed_{}, background_{}, move_body_{}, multi_{};
 };
 
@@ -441,11 +528,11 @@ std::optional<std::pair<float, float>> GuideInterval(Point origin, Point directi
   return std::pair{first, last};
 }
 
-void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasItem& item, PixelSize canvas,
-                       const CanvasGuides& guides) {
-  if (area.width < 2.0F || area.height < 2.0F || (!guides.x && !guides.y && !guides.rotating)) return;
+void PaintCanvasGuides(PaintContext& paint, Size preview_view_size, Rect preview_content_rect, const CanvasItem& item,
+                       PixelSize project_canvas_size, const CanvasGuides& guides) {
+  if (preview_content_rect.width < 2.0F || preview_content_rect.height < 2.0F || (!guides.x && !guides.y && !guides.rotating)) return;
   constexpr float clearance = kCanvasButtonSize / 2 + 3.0F;
-  const auto corners = CanvasCorners(item, area, canvas);
+  const auto corners = CanvasCorners(item, preview_content_rect, project_canvas_size);
   const auto [left, right] = std::ranges::minmax_element(corners, {}, &Point::x);
   const auto [top, bottom] = std::ranges::minmax_element(corners, {}, &Point::y);
   const Rect excluded{left->x - clearance, top->y - clearance,
@@ -456,7 +543,7 @@ void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasIt
     paint.StrokePath(Path{}.MoveTo(from).LineTo(to), tint, dashed);
   };
   const auto align = [&](Point origin, Point direction) {
-    const auto visible = GuideInterval(origin, direction, area);
+    const auto visible = GuideInterval(origin, direction, preview_content_rect);
     if (!visible) return;
     const auto [start, end] = *visible;
     const auto segment = [&](float first, float last) {
@@ -471,12 +558,12 @@ void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasIt
     }
   };
   if (guides.x) {
-    const auto x = area.x + std::clamp(*guides.x * area.width, 0.75F, area.width - 0.75F);
-    align({x, area.y}, {0, 1});
+    const auto x = preview_content_rect.x + std::clamp(*guides.x * preview_content_rect.width, 0.75F, preview_content_rect.width - 0.75F);
+    align({x, preview_content_rect.y}, {0, 1});
   }
   if (guides.y) {
-    const auto y = area.y + std::clamp(*guides.y * area.height, 0.75F, area.height - 0.75F);
-    align({area.x, y}, {1, 0});
+    const auto y = preview_content_rect.y + std::clamp(*guides.y * preview_content_rect.height, 0.75F, preview_content_rect.height - 0.75F);
+    align({preview_content_rect.x, y}, {1, 0});
   }
   if (guides.rotating) {
     const auto first = (corners[0] + corners[3]) / 2.0F;
@@ -488,21 +575,21 @@ void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasIt
     const auto center = (first + last) / 2.0F;
     const auto angle_ink = guides.angle_snapped ? Color::White() : ink;
     constexpr float angle_tail = 20.0F;
-    paint.PushClip({0, 0, size.width, size.height});
+    paint.PushClip({0, 0, preview_view_size.width, preview_view_size.height});
     stroke(first - direction * clearance, first - direction * (clearance + angle_tail), angle_ink);
     stroke(last + direction * clearance, last + direction * (clearance + angle_tail), angle_ink);
     paint.PopClip();
 
     constexpr float label_width = 36.0F, label_height = 18.0F, label_gap = 3.0F;
-    if (size.width < label_width + 2 * label_gap || size.height < label_height + 2 * label_gap) return;
-    const auto x = std::clamp(center.x - label_width / 2, label_gap, size.width - label_width - label_gap);
-    const auto y = std::clamp(center.y - label_height / 2, label_gap, size.height - label_height - label_gap);
+    if (preview_view_size.width < label_width + 2 * label_gap || preview_view_size.height < label_height + 2 * label_gap) return;
+    const auto x = std::clamp(center.x - label_width / 2, label_gap, preview_view_size.width - label_width - label_gap);
+    const auto y = std::clamp(center.y - label_height / 2, label_gap, preview_view_size.height - label_height - label_gap);
     const std::array positions{Point{x, excluded.y - label_height - label_gap},
         Point{x, excluded.y + excluded.height + label_gap},
         Point{excluded.x + excluded.width + label_gap, y}, Point{excluded.x - label_width - label_gap, y}};
     const auto position = std::ranges::find_if(positions, [&](Point at) {
       return at.x >= label_gap && at.y >= label_gap &&
-             at.x + label_width + label_gap <= size.width && at.y + label_height + label_gap <= size.height;
+             at.x + label_width + label_gap <= preview_view_size.width && at.y + label_height + label_gap <= preview_view_size.height;
     });
     if (position == positions.end()) return;
     const Rect label{position->x, position->y, label_width, label_height};
@@ -513,12 +600,12 @@ void PaintCanvasGuides(PaintContext& paint, Size size, Rect area, const CanvasIt
   }
 }
 
-void PaintCanvasSelection(PaintContext& paint, Rect area, const CanvasItem& item, PixelSize canvas,
+void PaintCanvasSelection(PaintContext& paint, Rect preview_content_rect, const CanvasItem& item, PixelSize project_canvas_size,
                           bool show_controls, std::optional<CanvasCorner> pressed, const VectorAsset& plate_icon,
                           const VectorAsset& pressed_plate_icon,
                           const std::array<VectorAsset, 4>& action_icons) {
-  if (area.IsEmpty()) return;
-  const auto corners = CanvasCorners(item, area, canvas);
+  if (preview_content_rect.IsEmpty()) return;
+  const auto corners = CanvasCorners(item, preview_content_rect, project_canvas_size);
   auto outline = Path{}.MoveTo(corners[0]).LineTo(corners[1]).LineTo(corners[2]).LineTo(corners[3]).Close();
   paint.StrokePath(outline, Color::White(), StrokeStyle{.width = 1.0F});
   if (!show_controls) return;
@@ -536,13 +623,13 @@ void PaintCanvasSelection(PaintContext& paint, Rect area, const CanvasItem& item
 
 using GeometryInput = std::array<TextEditingValue, 3>;
 
-GeometryInput GeometryValues(Rect bounds, PixelSize canvas) {
-  return {TextEditingValue::FromText(std::to_string(std::lround(bounds.x * canvas.width))),
-          TextEditingValue::FromText(std::to_string(std::lround(bounds.y * canvas.height))),
-          TextEditingValue::FromText(std::to_string(std::lround(bounds.width * canvas.width)))};
+GeometryInput GeometryValues(Rect bounds, PixelSize project_canvas_size) {
+  return {TextEditingValue::FromText(std::to_string(std::lround(bounds.x * project_canvas_size.width))),
+          TextEditingValue::FromText(std::to_string(std::lround(bounds.y * project_canvas_size.height))),
+          TextEditingValue::FromText(std::to_string(std::lround(bounds.width * project_canvas_size.width)))};
 }
 
-std::optional<Rect> ReadGeometry(const GeometryInput& fields, Rect bounds, PixelSize canvas) {
+std::optional<Rect> ReadGeometry(const GeometryInput& fields, Rect bounds, PixelSize project_canvas_size) {
   std::array<int, 3> pixels{};
   for (std::size_t index = 0; index < fields.size(); ++index) {
     const auto& text = fields[index].text;
@@ -550,10 +637,10 @@ std::optional<Rect> ReadGeometry(const GeometryInput& fields, Rect bounds, Pixel
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) return {};
   }
   if (pixels[2] <= 0) return {};
-  const auto x = pixels[0] == std::lround(bounds.x * canvas.width) ? bounds.x : float(pixels[0]) / canvas.width;
-  const auto y = pixels[1] == std::lround(bounds.y * canvas.height) ? bounds.y : float(pixels[1]) / canvas.height;
-  const auto scale = pixels[2] == std::lround(bounds.width * canvas.width) ? 1.0F :
-      float(pixels[2]) / (bounds.width * canvas.width);
+  const auto x = pixels[0] == std::lround(bounds.x * project_canvas_size.width) ? bounds.x : float(pixels[0]) / project_canvas_size.width;
+  const auto y = pixels[1] == std::lround(bounds.y * project_canvas_size.height) ? bounds.y : float(pixels[1]) / project_canvas_size.height;
+  const auto scale = pixels[2] == std::lround(bounds.width * project_canvas_size.width) ? 1.0F :
+      float(pixels[2]) / (bounds.width * project_canvas_size.width);
   if (x == bounds.x && y == bounds.y && scale == 1.0F) return bounds;
   const auto width = bounds.width * scale, height = bounds.height * scale;
   if (x < 0 || y < 0 || x + width > 1.00001F || y + height > 1.00001F) return {};
@@ -583,7 +670,7 @@ View EditorField(TextField field, const ThemeSpec& theme, bool caption = false) 
       .With(CrossAlign(CrossAxisAlignment::Stretch));
 }
 
-View GeometryFields(State<GeometryInput> fields, Rect bounds, PixelSize canvas, const ThemeSpec& theme) {
+View GeometryFields(State<GeometryInput> fields, Rect bounds, PixelSize project_canvas_size, const ThemeSpec& theme) {
   const auto values = fields.Get();
   std::vector<View> inputs;
   constexpr std::array labels{"X", "Y", "宽度"};
@@ -598,10 +685,10 @@ View GeometryFields(State<GeometryInput> fields, Rect bounds, PixelSize canvas, 
       EditorField(std::move(field), theme),
     }.With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch), Grow()).Key(labels[index]));
   }
-  const auto displayed = ReadGeometry(values, bounds, canvas);
+  const auto displayed = ReadGeometry(values, bounds, project_canvas_size);
   return Column{
     Row(std::move(inputs)).With(Spacing(6.0F)),
-    Text(displayed ? "像素 · 高度 " + std::to_string(std::lround(displayed->height * canvas.height)) + " · 等比缩放"
+    Text(displayed ? "像素 · 高度 " + std::to_string(std::lround(displayed->height * project_canvas_size.height)) + " · 等比缩放"
                    : "请输入画布内的位置和宽度", TextRole::Label),
   }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
@@ -657,6 +744,7 @@ struct TrimPreview {
   std::optional<media::MediaTimestamp> ripple_from;
   media::MediaTimestamp ripple;
   double thumbnail_shift{};
+
   bool operator==(const TrimPreview&) const = default;
 };
 
@@ -669,13 +757,14 @@ struct TrimLimits {
   }
 };
 
-TrimLimits LimitTrim(const ProjectSnapshot& project, const ClipInfo& clip, TrimEdge edge, double minimum_length, bool ripple) {
+TrimLimits LimitTrim(const ProjectSnapshot& project, const TimelineClip& clip, TrimEdge edge, double minimum_length, bool ripple) {
   const auto source = clip.placement.source;
   const auto interval = clip.placement.timeline;
-  const auto& asset = *std::ranges::find(project.assets, source.asset, &AssetInfo::id);
-  const auto& available = std::ranges::find(asset.source.tracks, source.track, &AssetTrack::id)->presentation;
+  const auto& asset = project.resources->FindMedia(source.asset);
+  const auto& available = std::ranges::find(asset->tracks, source.track, &AssetTrack::id)->presentation;
   const auto length = Seconds(interval.end) - Seconds(interval.start);
-  const auto remaining = edge == TrimEdge::Start
+  const auto remaining = asset->still_image && edge == TrimEdge::End && !source.reverse ?
+      std::numeric_limits<double>::infinity() : edge == TrimEdge::Start
       ? source.reverse ? Seconds(available.end) - Seconds(source.range.end)
                        : Seconds(source.range.start) - Seconds(available.start)
       : source.reverse ? Seconds(source.range.start) - Seconds(available.start)
@@ -683,7 +772,7 @@ TrimLimits LimitTrim(const ProjectSnapshot& project, const ClipInfo& clip, TrimE
   if (ripple) return edge == TrimEdge::Start ? TrimLimits{-remaining, std::max(0.0, length - minimum_length)}
                                            : TrimLimits{std::min(0.0, minimum_length - length), remaining};
   for (const auto& lane : project.tracks) {
-    const auto at = std::ranges::find(lane.clips, clip.id, &ClipInfo::id);
+    const auto at = std::ranges::find(lane.clips, clip.id, &TimelineClip::id);
     if (at == lane.clips.end()) continue;
     if (edge == TrimEdge::Start) {
       const auto previous = at == lane.clips.begin() ? 0.0 : Seconds((at - 1)->placement.timeline.end);
@@ -696,7 +785,7 @@ TrimLimits LimitTrim(const ProjectSnapshot& project, const ClipInfo& clip, TrimE
   return {};
 }
 
-ClipPlacement MoveClipEdge(ClipPlacement placement, TrimEdge edge, media::MediaTimestamp delta, bool ripple) {
+ClipTiming MoveClipEdge(ClipTiming placement, TrimEdge edge, media::MediaTimestamp delta, bool ripple) {
   const bool start = edge == TrimEdge::Start;
   auto& project_edge = start && !ripple ? placement.timeline.start : placement.timeline.end;
   const auto project_delta = start && ripple ? media::MediaTimestamp{-delta.ticks, delta.timescale} : delta;
@@ -754,9 +843,11 @@ public:
       return true;
     });
   }
+
   ~Extension() override {
     if (stop_magnify_) stop_magnify_();
   }
+
   void Update(ViewNode&, const TimelinePointer& value) { config_ = value; }
 
   bool HitTest(ViewNode& node, Point point) const override {
@@ -887,6 +978,7 @@ struct TimelineResize {
 class TimelineResize::Extension final : public NodeExtension {
 public:
   Extension(ViewNode&, const TimelineResize& resize) : config_(resize) {}
+
   void Update(ViewNode&, const TimelineResize& resize) { config_ = resize; }
 
   bool HitTest(ViewNode& node, Point point) const override {
@@ -1038,11 +1130,11 @@ void PaintEditorTimeline(PaintContext& paint, Size size, const ProjectSnapshot* 
             paint.DrawRect({first, start, std::max(0.65F, last - first - 0.6F), std::max(0.85F, end - start)}, marker);
           }
         }
-        const auto asset = std::ranges::find(project->assets, clip.placement.source.asset, &AssetInfo::id);
+        const auto asset = project->resources->FindMedia(clip.placement.source.asset);
         const auto title_x = std::max(kLaneHeader, rect.x) + 5.0F;
         const auto title_width = std::min(size.width, right) - title_x - 4.0F;
         if (title_width > 19.0F) {
-          auto name = asset == project->assets.end() ? std::string("片段") : asset->source.file.Stem();
+          auto name = !asset ? std::string("片段") : asset->file.Stem();
           const auto top = audio ? rect.y + 1.0F : rect.y + rect.height - 15.0F;
           if (!audio) paint.DrawRect({rect.x, rect.y + rect.height * 0.45F, rect.width, rect.height * 0.55F},
               LinearGradient{.start = {0, 0}, .end = {0, 1},
@@ -1065,8 +1157,9 @@ void PaintEditorTimeline(PaintContext& paint, Size size, const ProjectSnapshot* 
       paint.DrawRect(rect, Color::Rgb(63, 49, 81), corner);
       paint.PushClip(rect);
       const auto title = std::max(left, kLaneHeader) + 5.0F;
+      const auto& text = OverlayText(*cue, OverlayTextSlot(*cue, nullptr)).text;
       label({title, y + 5.0F, std::max(0.0F, right - title), 15.0F},
-            cue->text.empty() ? OverlayLabel(cue->kind) : cue->text, Color::Rgb(228, 213, 239));
+            text && !text->empty() ? *text : OverlayLabel(cue->kind), Color::Rgb(228, 213, 239));
       paint.PopClip();
       if (selected_overlay == cue->id) selected_grips = rect;
     }
@@ -1148,7 +1241,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const auto selected = UseState(std::optional<ClipId>{});
   const auto selected_overlay = UseState(std::optional<InstanceId>{});
   const auto text_draft = UseState(TextEditingValue::FromText(""));
-  const auto overlay_draft = UseState(CanvasOverlay{});
+  const auto overlay_draft = UseState(OverlayInstance{});
   const auto overlay_page = UseState(OverlayPage::Style);
   const auto text_focused = UseState(false);
   const auto text_input = UseViewHandle();
@@ -1156,12 +1249,14 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const auto overlay_artwork_draft = UseState(Rect{0, 0, 1, 1});
   const auto picture_draft = UseState(Rect{});
   const auto fill_draft = UseState(false);
-  const auto dragging = UseState(std::optional<CanvasItem>{});
+  const auto dragging = UseState(std::optional<WorkbenchDrag>{});
+  const auto presented = UseState(std::optional<WorkbenchFrame>{});
   const auto pressed_corner = UseState(std::optional<CanvasCorner>{});
   const auto gain_draft = UseState(1.0F);
   const auto mute_draft = UseState(false);
   const auto fade_in_draft = UseState(0.0F);
   const auto fade_out_draft = UseState(0.0F);
+  const auto robot_draft = UseState(false);
   const auto transport = EditorTransport{UseState(0.0), UseState(std::optional<double>{}), UseState(false)};
   const auto timeline_left = UseState(0.0);
   const auto timeline_zoom = UseState(0.0);
@@ -1179,15 +1274,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     window_handle.HideKeyboard();
     panel = EditorPanel::None;
   };
-  const auto choose_canvas = [selected, selected_overlay, close_panel](std::optional<CanvasTarget> target) {
+  const auto select_target = [selected, selected_overlay, close_panel](std::optional<EditTarget> target) {
     close_panel();
-    const auto* clip = target ? std::get_if<ClipId>(&*target) : nullptr;
-    const auto* overlay = target ? std::get_if<InstanceId>(&*target) : nullptr;
-    selected = clip ? std::optional{*clip} : std::nullopt;
-    selected_overlay = overlay ? std::optional{*overlay} : std::nullopt;
+    selected = target ? target->AsClip() : std::nullopt;
+    selected_overlay = target ? target->AsOverlay() : std::nullopt;
   };
-  const auto enter = [section, choose_canvas](EditorTools next) {
-    choose_canvas({});
+  const auto enter = [section, select_target](EditorTools next) {
+    select_target({});
     section = next;
   };
   const auto edit = [context](auto change) {
@@ -1205,16 +1298,16 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     }
   };
 
-  const auto missing = UseState(std::vector<AssetId>{});
+  const auto missing = UseState(std::vector<ResourceRef>{});
   const auto tasks = UseTaskScope();
   const auto resources = UseService<Resources>();
-  const auto assets = UseState(std::shared_ptr<const OverlayAssets>{});
+  const auto assets = UseState(std::shared_ptr<const huxerui::avkit::ResourceCatalog>{});
   Lifecycle([assets, resources, has_file_media] {
-    assets = has_file_media ? std::make_shared<const OverlayAssets>(LoadOverlayAssets(*resources)) : nullptr;
+    assets = has_file_media ? LoadWorkbenchResources(*resources) : nullptr;
   }, has_file_media);
   const auto resource_pack = assets.Get();
   Lifecycle([tasks, project, missing] {
-    missing = std::vector<AssetId>{};
+    missing = std::vector<ResourceRef>{};
     TaskHandle request;
     if (project) {
       request = tasks.Launch([project, missing]() -> Task<void> {
@@ -1227,11 +1320,18 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const auto import_movie = [context, transport](std::optional<media::TrackKind> layer) {
     const auto position = media::MediaTimestamp{std::llround(transport.position.Get() * 12.0), 12};
     const auto title = !layer ? "导入主轨" : *layer == media::TrackKind::Video ? "选择画中画" : "从视频提取音频";
-    SelectWorkbenchVideo(context, title, layer ? 1 : 10, [context, layer, position](std::vector<File> files) -> Task<void> {
-      auto assets = co_await RunWorker([files = std::move(files)] {
-        std::vector<std::variant<AssetReference, std::string>> items;
+    using Imported = std::pair<AssetSource, bool>;
+    const auto select = layer == media::TrackKind::Audio ? SelectWorkbenchVideo : SelectWorkbenchVisual;
+    select(context, title, layer ? 1 : 10, [context, layer, position](std::vector<File> files) -> Task<void> {
+      auto assets = co_await RunWorker([files = std::move(files), layer] {
+        std::vector<std::variant<Imported, std::string>> items;
         for (const auto& file : files) {
-          try { items.emplace_back(ReadWorkbenchMovie(file)); }
+          try {
+            auto asset = ReadWorkbenchVisual(file);
+            const bool linked = layer == media::TrackKind::Video &&
+                std::ranges::find(asset.tracks, media::TrackKind::Audio, &AssetTrack::kind) != asset.tracks.end();
+            items.emplace_back(Imported{std::move(asset), linked});
+          }
           catch (const std::exception& error) { items.emplace_back(file.Name() + "：" + error.what()); }
         }
         return items;
@@ -1245,10 +1345,10 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
           if (first_failure.empty()) first_failure = std::move(*failure);
           continue;
         }
-        auto& asset = std::get<AssetReference>(item);
+        auto& [asset, linked] = std::get<Imported>(item);
         const auto name = asset.file.Name();
         try {
-          if (layer) InsertWorkbenchLayer(*next, std::move(asset), *layer, position);
+          if (layer) InsertWorkbenchLayer(*next, std::move(asset), *layer, position, linked);
           else AppendWorkbenchMovie(*next, std::move(asset));
           ++imported;
         } catch (const std::exception& error) {
@@ -1273,10 +1373,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       if (!next) co_return;
       const auto picked = co_await PickWorkbenchFile(context, WorkbenchAudioFilter(), "AudioImports", "audio.m4a");
       if (!picked) co_return;
-      const auto output = WorkbenchOutput(context.data, "Media", picked->Stem() + ".wav");
-      auto asset = co_await RunWorker([file = *picked, output, snapshot = next->revision] {
-        return ReadWorkbenchMusic(file, output, *snapshot);
-      });
+      auto asset = co_await RunWorker([file = *picked] { return ReadWorkbenchMusic(file); });
       InsertWorkbenchLayer(*next, std::move(asset), media::TrackKind::Audio, position);
       context.document = std::move(next);
     });
@@ -1301,38 +1398,36 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   if (project) {
     const auto missing_ids = missing.Get();
 
-    for (const auto& asset : project->assets) {
-      const bool absent = std::ranges::find(missing_ids, asset.id) != missing_ids.end();
-      const bool video = std::ranges::any_of(asset.source.tracks, [](const AssetTrack& track) {
+    for (const auto& [key, asset] : project->resources->Media()) {
+      const bool absent = std::ranges::find(missing_ids, key) != missing_ids.end();
+      const bool video = std::ranges::any_of(asset->tracks, [](const AssetTrack& track) {
         return track.kind == media::TrackKind::Video;
       });
       sources.push_back(Column{
-        Text(asset.source.file.Name(), TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis),
+        Text(asset->file.Name(), TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis),
         Text(absent ? "素材离线" : video ? "视频素材" : "音频素材").With(Foreground(absent ? theme.colors.error : theme.colors.on_surface_variant)),
       }.With(Padding(8.0F), Spacing(3.0F), Background(theme.colors.surface_container_low), CornerRadius(6.0F),
-          CrossAlign(CrossAxisAlignment::Stretch)).Key(std::to_string(asset.id.value)));
+          CrossAlign(CrossAxisAlignment::Stretch)).Key(key.key));
       if (absent) {
-        if (has_file_media) sources.push_back(WorkbenchControl(Button("重新链接").OnClick([context, video, id = asset.id] {
-          const auto replace = [context, id](AssetReference replacement) {
+        if (has_file_media) sources.push_back(WorkbenchControl(Button("重新链接").OnClick([context, video, key] {
+          const auto relink = [context, key](File file) {
             auto next = context.document.Get();
             if (!next) return;
-            next->revision = next->project->Edit([&](ProjectEdit& draft) { draft.Relink(id, std::move(replacement)); });
+            next->revision = next->project->Edit([&](ProjectEdit& draft) { draft.Relink(key, std::move(file)); });
             next->dirty = true;
             context.document = std::move(next);
           };
           if (video) {
-            SelectWorkbenchVideo(context, "重新链接视频", 1, [replace](std::vector<File> files) -> Task<void> {
-              replace(co_await RunWorker([file = files.front()] { return ReadWorkbenchMovie(file); }));
+            SelectWorkbenchVisual(context, "重新链接素材", 1, [relink](std::vector<File> files) -> Task<void> {
+              if (!files.empty()) relink(std::move(files.front()));
+              co_return;
             });
           } else {
-            RunWorkbenchAction(context, [context, replace]() -> Task<void> {
+            RunWorkbenchAction(context, [context, relink]() -> Task<void> {
               const auto picked = co_await PickWorkbenchFile(context, WorkbenchAudioFilter(), "AudioImports", "audio.m4a");
               const auto project = context.document.Get();
               if (!picked || !project) co_return;
-              const auto output = WorkbenchOutput(context.data, "Media", picked->Stem() + ".wav");
-              replace(co_await RunWorker([file = *picked, output, snapshot = project->revision] {
-                return ReadWorkbenchMusic(file, output, *snapshot);
-              }));
+              relink(*picked);
             });
           }
         }).With(Enabled(allowed && (video ? CanSelectWorkbenchVideo(context) : context.picker->CanOpenFiles()))), theme));
@@ -1340,19 +1435,19 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       }
     }
   }
-  if (!project || project->assets.empty()) sources.push_back(Text("导入视频后在此显示。").With(Foreground(theme.colors.on_surface_variant)));
+  if (!project || project->resources->Empty()) sources.push_back(Text("导入视频后在此显示。").With(Foreground(theme.colors.on_surface_variant)));
   View library = WorkbenchPanel(Column(std::move(sources)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)), theme);
 
-  std::optional<ClipInfo> selection;
-  std::optional<CanvasOverlay> overlay_selection;
+  std::optional<TimelineClip> selection;
+  std::optional<OverlayInstance> overlay_selection;
   if (project && selected_overlay.Get()) {
-    const auto it = std::ranges::find(project->overlays, *selected_overlay.Get(), &CanvasOverlay::id);
+    const auto it = std::ranges::find(project->overlays, *selected_overlay.Get(), &OverlayInstance::id);
     if (it != project->overlays.end()) overlay_selection = *it;
   }
   auto selected_kind = media::TrackKind::Video;
   if (project && selected.Get()) {
     for (const auto& track : project->tracks) {
-      const auto clip = std::ranges::find(track.clips, *selected.Get(), &ClipInfo::id);
+      const auto clip = std::ranges::find(track.clips, *selected.Get(), &TimelineClip::id);
       if (clip != track.clips.end()) {
         selection = *clip;
         selected_kind = track.kind;
@@ -1400,7 +1495,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const auto scrolled = std::clamp(track_scroll.Get(), 0.0F, scroll_limit);
   Lifecycle([track_scroll, scrolled] { track_scroll = scrolled; }, scroll_limit);
 
-  const auto select = [lanes, choose_canvas, pinned_height, scrolled](double time, float y) {
+  const auto select = [lanes, select_target, pinned_height, scrolled](double time, float y) {
     const TimelineLane* lane = &lanes.front();
     if (y >= pinned_height) {
       auto edge = pinned_height - scrolled;
@@ -1414,7 +1509,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       for (const auto& clip : lane->track->clips) {
         if (!VisibleClip(clip)) continue;
         if (time >= Seconds(clip.placement.timeline.start) && time < Seconds(clip.placement.timeline.end)) {
-          choose_canvas(clip.id);
+          select_target(EditTarget::ForClip(clip.id));
           return;
         }
       }
@@ -1422,12 +1517,12 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     if (lane) {
       for (const auto* overlay : lane->overlays) {
         if (time >= Seconds(overlay->range.start) && time < Seconds(overlay->range.end)) {
-          choose_canvas(overlay->id);
+          select_target(EditTarget::ForOverlay(overlay->id));
           return;
         }
       }
     }
-    choose_canvas({});
+    select_target({});
   };
   const auto tools = [&](const char* label, std::function<void()> action, bool enabled, const char* accessible = nullptr) {
     View button = Button(label).OnClick(std::move(action)).With(Enabled(allowed && enabled));
@@ -1444,20 +1539,20 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     });
   };
   const auto inset = selection && selected_kind == media::TrackKind::Video && lanes.front().track &&
-      std::ranges::find(lanes.front().track->clips, selection->id, &ClipInfo::id) == lanes.front().track->clips.end();
+      std::ranges::find(lanes.front().track->clips, selection->id, &TimelineClip::id) == lanes.front().track->clips.end();
   const auto source_size = inset ? WorkbenchVideoSize(*project, *selection) : std::nullopt;
   const auto layout = [=] {
     if (!selection) return;
-    const auto bounds = inset ? FitWorkbenchInset(selection->destination, project->canvas, source_size) : selection->destination;
+    const auto bounds = inset ? FitWorkbenchInset(selection->destination, project->canvas_size, source_size) : selection->destination;
     picture_draft = bounds;
     fill_draft = inset || selection->fill;
-    geometry = GeometryValues(bounds, project->canvas);
+    geometry = GeometryValues(bounds, project->canvas_size);
     panel = EditorPanel::Picture;
   };
   const auto picture_editor = [&]() -> View {
     if (!selection || selected_kind != media::TrackKind::Video) return {};
     const auto basis = picture_draft.Get();
-    const auto bounds = ReadGeometry(geometry.Get(), basis, project->canvas);
+    const auto bounds = ReadGeometry(geometry.Get(), basis, project->canvas_size);
     const auto apply = [=] {
       if (!bounds) return;
       edit([&](Project& value) {
@@ -1471,13 +1566,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       close_panel();
     };
     const auto option = [&](const char* title, Rect rect) {
-      const auto fitted = inset ? FitWorkbenchInset(rect, project->canvas, source_size) : rect;
-      return WorkbenchTab(title, theme, [picture_draft, geometry, fitted, canvas = project->canvas] {
+      const auto fitted = inset ? FitWorkbenchInset(rect, project->canvas_size, source_size) : rect;
+      return WorkbenchTab(title, theme, [picture_draft, geometry, fitted, project_canvas_size = project->canvas_size] {
         picture_draft = fitted;
-        geometry = GeometryValues(fitted, canvas);
+        geometry = GeometryValues(fitted, project_canvas_size);
       }, bounds == fitted).With(Grow());
     };
-    auto fields = GeometryFields(geometry, basis, project->canvas, theme);
+    auto fields = GeometryFields(geometry, basis, project->canvas_size, theme);
     auto choices = Row{option("左上", kWorkbenchInsetPositions[2]), option("右上", kWorkbenchInsetPositions[0]),
                        option("左下", kWorkbenchInsetPositions[3]), option("右下", kWorkbenchInsetPositions[1])}.With(Spacing(3.0F));
     if (inset) return EditorDock(theme, EditorRow(theme, std::move(fields), apply, bounds.has_value()), std::move(choices));
@@ -1491,7 +1586,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   };
   // Two preview frames also align to the supported 44.1 and 48 kHz PCM grids.
   const auto now = media::MediaTimestamp{std::llround(position * 12.0), 12};
-  std::optional<ClipInfo> linked;
+  std::optional<TimelineClip> linked;
   if (selection && selected_kind == media::TrackKind::Video) {
     for (const auto& track : project->tracks) {
       if (track.kind != media::TrackKind::Audio) continue;
@@ -1508,6 +1603,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     mute_draft = clip.audio_mix.muted;
     fade_in_draft = static_cast<float>(Seconds(clip.audio_mix.fade_in));
     fade_out_draft = static_cast<float>(Seconds(clip.audio_mix.fade_out));
+    const auto& owner = selected_kind == media::TrackKind::Video ? *selection : clip;
+    robot_draft = owner.voice_effect == VoiceEffect::Robot;
     panel = EditorPanel::Audio;
   };
   const auto audio_editor = [&]() -> View {
@@ -1522,6 +1619,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
         value.Edit([&](ProjectEdit& draft) {
           draft.SetAudioMix(clip.id, {gain_draft.Get(), mute_draft.Get(),
               {std::llround(fade_in_draft.Get() * 1000), 1000}, {std::llround(fade_out_draft.Get() * 1000), 1000}});
+          draft.SetVoiceEffect(clip.id, robot_draft.Get() ? std::optional{VoiceEffect::Robot} : std::nullopt);
           if (detach) draft.BindAudio(clip.id, std::nullopt);
         });
         return true;
@@ -1531,97 +1629,62 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     return EditorDock(theme, EditorRow(theme, row("音量", gain_draft, 2.0F), [apply] { apply(false); }), Column{
       row("淡入", fade_in_draft, 5.0F),
       row("淡出", fade_out_draft, 5.0F),
-      WorkbenchControl(Button(mute_draft.Get() ? "取消静音" : "静音").OnClick([=] { mute_draft = !mute_draft.Get(); }), theme),
+      Row{
+        WorkbenchControl(Button(mute_draft.Get() ? "取消静音" : "静音").OnClick([=] { mute_draft = !mute_draft.Get(); }), theme),
+        WorkbenchControl(Button(robot_draft.Get() ? "机器人变声" : "变声")
+            .OnClick([=] { robot_draft = !robot_draft.Get(); }), theme),
+      }.With(Spacing(6.0F)),
       clip.audio_of ? WorkbenchControl(Button("分离原声").OnClick([apply] { apply(true); }), theme) : View{},
     }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   };
-  const auto participates_in_transition = [](const ProjectSnapshot& snapshot, ClipId id) {
-    return std::ranges::any_of(snapshot.transitions, [id](const auto& transition) {
-      return transition.from == id || transition.to == id;
-    });
-  };
-  const auto has_transition = [&](ClipId id) { return participates_in_transition(*project, id); };
+  const auto has_transition = [&](ClipId id) { return ParticipatesInTransition(*project, id); };
   const bool can_layout = selection && selected_kind == media::TrackKind::Video && !has_transition(selection->id);
-  const auto visible_at = [position](TimeRange range) {
-    return position >= Seconds(range.start) && position < Seconds(range.end);
-  };
-  std::vector<InstanceId> visible_overlays;
-  if (project) {
-    for (const auto& overlay : project->overlays)
-      if (visible_at(overlay.range)) visible_overlays.push_back(overlay.id);
-  }
-  using MeasuredBounds = std::vector<std::pair<InstanceId, Rect>>;
-  const auto text_bounds = UseState(MeasuredBounds{});
-  Lifecycle([=] {
-    MeasuredBounds next;
-    if (resource_pack && project) {
-      for (const auto id : visible_overlays) {
-        const auto overlay = std::ranges::find(project->overlays, id, &CanvasOverlay::id);
-        try { next.emplace_back(id, MeasureWorkbenchOverlay(*overlay, project->canvas, *resource_pack)); }
-        catch (const std::exception&) { next.emplace_back(id, Rect{0, 0, 1, 1}); }
-      }
+  const auto overlay_artwork = [presented](InstanceId id) {
+    const auto frame = presented.Get();
+    if (frame) {
+      if (const auto layout = frame->preview.FindLayout(EditTarget::ForOverlay(id))) return layout->local_bounds;
     }
-    text_bounds = std::move(next);
-  }, project, resource_pack, visible_overlays);
-  const auto overlay_artwork = [measured = text_bounds.Get()](InstanceId id) {
-    const auto bounds = std::ranges::find(measured, id, &MeasuredBounds::value_type::first);
-    return bounds == measured.end() ? Rect{0, 0, 1, 1} : bounds->second;
+    return Rect{0, 0, 1, 1};
   };
-  const auto canvas_items_at = [overlay_artwork, participates_in_transition](const ProjectSnapshot& snapshot,
-                                                                            double seconds, bool prepared) {
-    std::vector<CanvasItem> items;
-    const auto visible_at = [seconds](TimeRange range) {
-      return seconds >= Seconds(range.start) && seconds < Seconds(range.end);
-    };
-    const auto main = std::ranges::find(snapshot.tracks, media::TrackKind::Video, &TrackInfo::kind);
-    for (auto track = snapshot.tracks.begin(); track != snapshot.tracks.end(); ++track) {
-      if (track->kind != media::TrackKind::Video || track == main) continue;
-      for (const auto& clip : track->clips) {
-        if (visible_at(clip.placement.timeline) && !participates_in_transition(snapshot, clip.id)) {
-          const auto bounds = prepared ? clip.destination :
-              FitWorkbenchInset(clip.destination, snapshot.canvas, WorkbenchVideoSize(snapshot, clip));
-          items.push_back({clip.id, bounds, {0, 0, 1, 1}, clip.rotation_degrees});
-        }
-      }
-    }
-    for (const auto& overlay : snapshot.overlays) {
-      if (visible_at(overlay.range)) {
-        items.push_back({overlay.id, overlay.destination, overlay_artwork(overlay.id), overlay.rotation_degrees,
-                         overlay.kind != CanvasOverlayKind::Sticker});
-      }
-    }
-    return items;
-  };
-  const auto find_canvas_item = [clip = selected.Get(), overlay = selected_overlay.Get()](const std::vector<CanvasItem>& items)
+  const auto find_selected_canvas_item = [clip = selected.Get(), overlay = selected_overlay.Get()](const render::PreviewFrame& frame)
       -> std::optional<CanvasItem> {
-    for (const auto& item : items) {
-      if (const auto* id = std::get_if<ClipId>(&item.target); id && clip == *id) return item;
-      if (const auto* id = std::get_if<InstanceId>(&item.target); id && overlay == *id) return item;
-    }
-    return std::nullopt;
+    const auto target = clip ? std::optional{EditTarget::ForClip(*clip)}
+                             : overlay ? std::optional{EditTarget::ForOverlay(*overlay)} : std::nullopt;
+    if (!target || !CanEditOnCanvas(*frame.project, *target)) return std::nullopt;
+    return FindCanvasItem(frame, *target);
   };
-  const auto canvas_item = has_media ? find_canvas_item(canvas_items_at(*project, position, false)) : std::nullopt;
-  const auto change_canvas = [context, project, edit, dragging](CanvasItem item, TrimPhase phase) {
+  const auto change_canvas = [context, project, edit, dragging](const CanvasItem& initial, CanvasItem item, TrimPhase phase) {
     const auto document = context.document.Get();
     if (phase == TrimPhase::Cancel || !document || document->revision != project || context.busy.Get()) {
       dragging = std::nullopt;
       return;
     }
     if (phase == TrimPhase::Move) {
-      dragging = item;
+      const auto& basis = initial.bounds;
+      const auto& destination = item.bounds;
+      const auto scale = destination.width / basis.width;
+      auto transform = CanvasRotation(basis, project->canvas_size, item.degrees - initial.degrees);
+      const auto old_center = Point{basis.x + basis.width / 2, basis.y + basis.height / 2};
+      transform.m11 *= scale;
+      transform.m12 *= scale;
+      transform.m21 *= scale;
+      transform.m22 *= scale;
+      transform.translate_x = destination.x + destination.width / 2 - transform.m11 * old_center.x - transform.m21 * old_center.y;
+      transform.translate_y = destination.y + destination.height / 2 - transform.m12 * old_center.x - transform.m22 * old_center.y;
+      dragging = WorkbenchDrag{item.target, transform, item.guides};
       return;
     }
     dragging = std::nullopt;
     edit([&](Project& value) {
-      if (const auto* id = std::get_if<ClipId>(&item.target)) {
+      if (const auto id = item.target.AsClip()) {
         value.Edit([&](ProjectEdit& draft) {
           draft.SetLayout(*id, item.bounds);
           draft.SetClipRotation(*id, item.degrees);
           draft.SetClipFill(*id, true);
         });
       } else {
-        const auto instance = std::get<InstanceId>(item.target);
-        const auto original = std::ranges::find(project->overlays, instance, &CanvasOverlay::id);
+        const auto instance = *item.target.AsOverlay();
+        const auto original = std::ranges::find(project->overlays, instance, &OverlayInstance::id);
         if (original == project->overlays.end() ||
             (original->destination == item.bounds && original->rotation_degrees == item.degrees)) return false;
         auto changed = *original;
@@ -1632,23 +1695,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       return true;
     });
   };
-  const auto preview_drag = [dragging, canvas_item, canvas = project ? project->canvas : PixelSize{}]()
-      -> std::optional<WorkbenchDrag> {
-    const auto drag = dragging.Get();
-    if (!drag || !canvas_item || drag->target != canvas_item->target) return std::nullopt;
-    const auto basis = canvas_item->bounds;
-    const auto destination = drag->bounds;
-    const auto scale = destination.width / basis.width;
-    auto transform = CanvasRotation(basis, canvas, drag->degrees - canvas_item->degrees);
-    const auto old_center = Point{basis.x + basis.width / 2, basis.y + basis.height / 2};
-    transform.m11 *= scale;
-    transform.m12 *= scale;
-    transform.m21 *= scale;
-    transform.m22 *= scale;
-    transform.translate_x = destination.x + destination.width / 2 - transform.m11 * old_center.x - transform.m21 * old_center.y;
-    transform.translate_y = destination.y + destination.height / 2 - transform.m12 * old_center.x - transform.m22 * old_center.y;
-    return WorkbenchDrag{{drag->target, transform}, destination, drag->degrees, drag->guides};
-  };
+  const auto preview_drag = [dragging] { return dragging.Get(); };
   const auto zoom_by = [timeline_zoom, timeline_left, transport, base_span, duration, wide](double steps) {
     const auto current = timeline_zoom.Get();
     const auto next = std::clamp(current + steps, 0.0, kMaxZoom);
@@ -1667,7 +1714,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const bool trimmable = selection && !has_transition(selection->id) && (!linked || !has_transition(linked->id));
   if (trimmable) {
     const auto main = lanes.front().track;
-    const bool ripple = main && std::ranges::find(main->clips, selection->id, &ClipInfo::id) != main->clips.end();
+    const bool ripple = main && std::ranges::find(main->clips, selection->id, &TimelineClip::id) != main->clips.end();
     const auto clock = linked || selected_kind == media::TrackKind::Audio ? 12U : 24U;
     const auto length = 1.0 / clock;
     auto start = LimitTrim(*project, *selection, TrimEdge::Start, length, ripple);
@@ -1680,7 +1727,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     for (const auto& lane : lanes) {
       const auto height = LaneHeight(lane.kind);
       const auto top = &lane == &lanes.front() ? y : y - scrolled;
-      if (lane.track && std::ranges::find(lane.track->clips, selection->id, &ClipInfo::id) != lane.track->clips.end()) {
+      if (lane.track && std::ranges::find(lane.track->clips, selection->id, &TimelineClip::id) != lane.track->clips.end()) {
         const auto visible_top = std::max(top, &lane == &lanes.front() ? kRulerHeight : pinned_height);
         const auto visible_bottom = std::min(top + height, pinned_height + auxiliary_visible);
         handles = TrimHandles{selection->placement.timeline, {0, visible_top, 0, std::max(0.0F, visible_bottom - visible_top)},
@@ -1720,7 +1767,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
           }
           edit([&](Project& value) {
             value.Edit([&](ProjectEdit& draft) {
-              ApplyWorkbenchTrim(draft, *project, selection->id, placement, ripple);
+              if (ripple) draft.RippleTrim(selection->id, placement);
+              else draft.SetClip(selection->id, placement);
             });
             transport.position = preview;
             transport.seek = preview;
@@ -1808,8 +1856,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
 
   std::string clip_name;
   if (selection) {
-    const auto source = std::ranges::find(project->assets, selection->placement.source.asset, &AssetInfo::id);
-    if (source != project->assets.end()) clip_name = source->source.file.Name();
+    const auto source = project->resources->FindMedia(selection->placement.source.asset);
+    if (source) clip_name = source->file.Name();
   }
   View inspector = WorkbenchPanel(Column{
     Text("片段属性", TextRole::Label),
@@ -1843,20 +1891,20 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
           const auto end = std::min(timestamp(cue.end), next->revision->Range().end, Before);
           if (!Before(start, end)) continue;
           edit.AddOverlay({{}, CanvasOverlayKind::Subtitle, {start, end},
-                           {0.06F, 0.78F, 0.88F, 0.17F}, cue.text});
+                           {0.06F, 0.78F, 0.88F, 0.17F}, PreviewPointText(cue.text)});
         }
       });
       next->dirty = true;
       context.document = std::move(next);
     });
   };
-  const auto open_overlay = [=](const CanvasOverlay& overlay, Rect artwork) {
+  const auto open_overlay = [=](const OverlayInstance& overlay, Rect artwork) {
     overlay_draft = overlay;
-    text_draft = TextEditingValue::FromText(overlay.text);
-    overlay_page = overlay.kind == CanvasOverlayKind::Sticker || overlay.kind == CanvasOverlayKind::PagText
-        ? OverlayPage::Position : OverlayPage::Style;
+    const auto slot = OverlayTextSlot(overlay, resource_pack.get());
+    text_draft = TextEditingValue::FromText(OverlayText(overlay, slot).text.value_or(""));
+    overlay_page = IsPointText(overlay, resource_pack.get()) ? OverlayPage::Style : OverlayPage::Position;
     overlay_artwork_draft = artwork;
-    geometry = GeometryValues(ArtworkBounds(overlay.destination, artwork), project->canvas);
+    geometry = GeometryValues(ArtworkBounds(overlay.destination, artwork), project->canvas_size);
     panel = EditorPanel::Overlay;
   };
   const auto add_overlay = [=](const WorkbenchSticker* sticker) {
@@ -1865,13 +1913,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     const auto last = std::max<std::int64_t>(0, std::floor(Seconds(end) * 12.0) - 1);
     const auto start = media::MediaTimestamp{std::clamp(now.ticks, std::int64_t{}, last), 12};
     const auto stop = std::min(media::MediaTimestamp{start.ticks + 24, 12}, end, Before);
-    const auto sticker_width = sticker ? std::clamp(0.24F * project->canvas.height * sticker->aspect /
-                                                   project->canvas.width, 0.06F, 0.65F) : 0.0F;
+    const auto sticker_width = sticker ? std::clamp(0.24F * project->canvas_size.height * sticker->aspect /
+                                                   project->canvas_size.width, 0.06F, 0.65F) : 0.0F;
     const Rect bounds = sticker ? Rect{0.92F - sticker_width, 0.08F, sticker_width, 0.24F}
                                 : Rect{0.08F, 0.73F, 0.84F, 0.19F};
     const auto kind = sticker ? CanvasOverlayKind::Sticker : CanvasOverlayKind::Text;
-    const ResourceRef resource{"avkit.preview", "1", sticker ? sticker->key : "pag-point-text"};
-    CanvasOverlay overlay{{}, kind, {start, stop}, bounds, sticker ? "" : "标题", resource};
+    const auto pag = sticker ? PagOverlay{{sticker->key}} : PreviewPointText("标题");
+    OverlayInstance overlay{{}, kind, {start, stop}, bounds, pag};
     edit([&](Project& value) {
       value.Edit([&](ProjectEdit& draft) {
         overlay.id = draft.AddOverlay(overlay);
@@ -1879,16 +1927,9 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       return true;
     });
     if (!overlay.id.value) return;
-    choose_canvas(overlay.id);
+    select_target(EditTarget::ForOverlay(overlay.id));
     move_to(Seconds(start));
-    if (!sticker && !wide) {
-      Rect artwork{0, 0, 1, 1};
-      if (resource_pack) {
-        try { artwork = MeasureWorkbenchOverlay(overlay, project->canvas, *resource_pack); }
-        catch (const std::exception&) {}
-      }
-      open_overlay(overlay, artwork);
-    }
+    if (!sticker && !wide) open_overlay(overlay, {0, 0, 1, 1});
   };
   const auto add_text = [add_overlay] { add_overlay(nullptr); };
   const auto sticker_catalog = [panel] { panel = EditorPanel::Stickers; };
@@ -1899,16 +1940,21 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     if (!overlay_selection) return {};
     const auto original = *overlay_selection;
     const bool text = original.kind != CanvasOverlayKind::Sticker;
-    const bool styled_text = text && original.kind != CanvasOverlayKind::PagText;
+    const bool styled_text = text && IsPointText(original, resource_pack.get());
     const auto overlay = overlay_draft.Get();
+    const std::string text_slot(OverlayTextSlot(overlay, resource_pack.get()));
+    const auto& replacement = OverlayText(overlay, text_slot);
+    const auto foreground = replacement.foreground.value_or(Color::White());
+    const auto background_color = replacement.background.value_or(Color{0, 0, 0, 0});
     const auto artwork = overlay_artwork_draft.Get();
     const auto basis = ArtworkBounds(overlay.destination, artwork);
-    const auto bounds = ReadGeometry(geometry.Get(), basis, project->canvas);
+    const auto bounds = ReadGeometry(geometry.Get(), basis, project->canvas_size);
     const auto apply = [=] {
       if (!bounds) return;
       auto changed = overlay_draft.Get();
       if (*bounds != basis) changed.destination = FrameFromArtwork(*bounds, artwork);
-      if (text) changed.text = text_draft->text;
+      if (text && text_draft->text != OverlayText(original, text_slot).text.value_or(""))
+        EditOverlayText(changed, text_slot).text = text_draft->text;
       edit([&](Project& value) {
         if (changed == original) return false;
         value.Edit([&](ProjectEdit& draft) { draft.SetOverlay(changed); });
@@ -1927,12 +1973,12 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       return EditorSlider(theme, label, WorkbenchSeconds(value, 2), value, low, high, std::move(changed));
     };
     if (!text) {
-      return EditorDock(theme, EditorRow(theme, GeometryFields(geometry, basis, project->canvas, theme), apply, bounds.has_value()),
+      return EditorDock(theme, EditorRow(theme, GeometryFields(geometry, basis, project->canvas_size, theme), apply, bounds.has_value()),
           slider("透明度", overlay.opacity, 0, 1, [overlay_draft](float alpha) {
-            overlay_draft.Update([&](CanvasOverlay& draft) { draft.opacity = alpha; });
+            overlay_draft.Update([&](OverlayInstance& draft) { draft.opacity = alpha; });
           }));
     }
-    const bool valid = bounds.has_value() && !text_draft->text.empty();
+    const bool valid = bounds.has_value();
     const auto page = overlay_page.Get();
     auto tabs = Row{
       styled_text ? tab("字体", OverlayPage::Font) : View{},
@@ -1945,7 +1991,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
         .With(text_input).On<ViewEvents::FocusChanged>([text_focused](bool focused) { text_focused = focused; });
 
     const auto palette = [&](bool background) {
-      const auto current = background ? overlay.style.background : overlay.style.foreground;
+      const auto current = background ? background_color : foreground;
       std::vector<View> colors;
       for (const auto& [name, color] : std::array{
                std::pair{"白色", Color::White()}, std::pair{"黑色", Color::Rgb(0, 0, 0)},
@@ -1954,11 +2000,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
         const bool selected = current.red == color.red && current.green == color.green && current.blue == color.blue;
         colors.push_back(View(Column{}.With(Frame{.width = 34.0F, .height = 34.0F}, Background(color),
             CornerRadius(17.0F), Border{selected ? theme.colors.primary : theme.colors.outline, selected ? 3.0F : 1.0F},
-            Semantics{.role = SemanticRole::Button, .label = name})).OnClick([overlay_draft, color, background] {
-              overlay_draft.Update([&](CanvasOverlay& draft) {
-                auto& paint = background ? draft.style.background : draft.style.foreground;
-                const auto alpha = background && paint.alpha == 0 ? 0.65F : paint.alpha;
-                paint = {color.red, color.green, color.blue, alpha};
+            Semantics{.role = SemanticRole::Button, .label = name})).OnClick([overlay_draft, color, background, text_slot] {
+              overlay_draft.Update([&](OverlayInstance& draft) {
+                auto& slot = EditOverlayText(draft, text_slot);
+                auto& paint = background ? slot.background : slot.foreground;
+                const auto current = paint.value_or(background ? Color{0, 0, 0, 0} : Color::White());
+                const auto alpha = background && current.alpha == 0 ? 0.65F : current.alpha;
+                paint = Color{color.red, color.green, color.blue, alpha};
               });
             }));
       }
@@ -1968,35 +2016,41 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     switch (page) {
       case OverlayPage::Font:
         content = Row{
-          WorkbenchTab("系统字体", theme, [overlay_draft] {
-            overlay_draft.Update([](CanvasOverlay& draft) { draft.style.font = {}; });
-          }, overlay.style.font.key.empty()),
-          WorkbenchTab("Preview Sans", theme, [overlay_draft] {
-            overlay_draft.Update([](CanvasOverlay& draft) { draft.style.font = {"avkit.preview", "1", "preview-sans"}; });
-          }, !overlay.style.font.key.empty()),
+          WorkbenchTab("系统字体", theme, [overlay_draft, text_slot] {
+            overlay_draft.Update([&](OverlayInstance& draft) { EditOverlayText(draft, text_slot).font.reset(); });
+          }, !replacement.font),
+          WorkbenchTab("Preview Sans", theme, [overlay_draft, text_slot] {
+            overlay_draft.Update([&](OverlayInstance& draft) {
+              EditOverlayText(draft, text_slot).font = ResourceRef{"preview-sans"};
+            });
+          }, replacement.font.has_value()),
         }.With(Spacing(12.0F));
         break;
       case OverlayPage::Style:
         content = Column{
           palette(false),
-          slider("字号", overlay.style.size, 0.4F, 2.4F, [overlay_draft](float size) {
-            overlay_draft.Update([&](CanvasOverlay& draft) { draft.style.size = size; });
+          slider("字号", replacement.size_scale.value_or(1.0F), 0.4F, 2.4F, [overlay_draft, text_slot](float size) {
+            overlay_draft.Update([&](OverlayInstance& draft) { EditOverlayText(draft, text_slot).size_scale = size; });
           }),
-          slider("透明度", overlay.style.foreground.alpha, 0, 1, [overlay_draft](float alpha) {
-            overlay_draft.Update([&](CanvasOverlay& draft) { draft.style.foreground.alpha = alpha; });
+          slider("透明度", foreground.alpha, 0, 1, [overlay_draft, foreground, text_slot](float alpha) {
+            overlay_draft.Update([&](OverlayInstance& draft) {
+              EditOverlayText(draft, text_slot).foreground = Color{foreground.red, foreground.green, foreground.blue, alpha};
+            });
           }),
         }.With(Spacing(8.0F));
         break;
       case OverlayPage::Background:
         content = Column{
           palette(true),
-          slider("透明度", overlay.style.background.alpha, 0, 1, [overlay_draft](float alpha) {
-            overlay_draft.Update([&](CanvasOverlay& draft) { draft.style.background.alpha = alpha; });
+          slider("透明度", background_color.alpha, 0, 1, [overlay_draft, background_color, text_slot](float alpha) {
+            overlay_draft.Update([&](OverlayInstance& draft) {
+              EditOverlayText(draft, text_slot).background = Color{background_color.red, background_color.green, background_color.blue, alpha};
+            });
           }),
         }.With(Spacing(8.0F));
         break;
       case OverlayPage::Position:
-        content = GeometryFields(geometry, basis, project->canvas, theme);
+        content = GeometryFields(geometry, basis, project->canvas_size, theme);
         break;
     }
     const bool typing = editing_text && text_focused.Get() && window_handle.KeyboardBounds();
@@ -2013,7 +2067,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       value.Edit([&](ProjectEdit& draft) { draft.RemoveOverlay(overlay_selection->id); });
       return true;
     });
-    choose_canvas({});
+    select_target({});
   };
   const auto save = [context] {
     RunWorkbenchAction(context, [context]() -> Task<void> {
@@ -2067,10 +2121,10 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
   const auto canvas_menu = [enter] { enter(EditorTools::Canvas); };
   const auto canvas_options = [&]() -> View {
     if (!project) return {};
-    auto original = project->canvas;
-    for (const auto& asset : project->assets) {
-      const auto track = std::ranges::find_if(asset.source.tracks, [](const AssetTrack& item) { return item.display_size.has_value(); });
-      if (track != asset.source.tracks.end()) { original = *track->display_size; break; }
+    auto original = project->canvas_size;
+    for (const auto& [key, asset] : project->resources->Media()) {
+      const auto track = std::ranges::find_if(asset->tracks, [](const AssetTrack& item) { return item.display_size.has_value(); });
+      if (track != asset->tracks.end()) { original = *track->display_size; break; }
     }
     const auto short_edge = std::clamp(std::min(original.width, original.height), 2U, 1080U) & ~1U;
     bool has_active_ratio = false;
@@ -2078,11 +2132,11 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       const auto unit = double(short_edge) / std::min(w, h);
       const auto even = [unit](unsigned n) { return static_cast<unsigned>(std::clamp(std::round(n * unit / 2), 1.0, 4096.0)) * 2; };
       const PixelSize size{even(w), even(h)};
-      const bool active = project->canvas == size && !std::exchange(has_active_ratio, true);
+      const bool active = project->canvas_size == size && !std::exchange(has_active_ratio, true);
       return WorkbenchTool(icon, label, theme, [=] {
         edit([&](Project& value) {
-          if (value.Snapshot()->canvas == size) return false;
-          value.Edit([&](ProjectEdit& draft) { draft.SetCanvas(size); });
+          if (value.Snapshot()->canvas_size == size) return false;
+          value.Edit([&](ProjectEdit& draft) { draft.SetCanvasSize(size); });
           return true;
         });
       }, allowed, true, active).With(Grow());
@@ -2102,6 +2156,8 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     return [enter, page] { enter(page); };
   };
   const auto canvas_action = [=](CanvasCorner corner) {
+    const auto frame = presented.Get();
+    const auto canvas_item = frame ? find_selected_canvas_item(frame->preview) : std::nullopt;
     if (!canvas_item) return;
     if (corner == CanvasCorner::Edit) {
       if (overlay_selection) adjust_overlay();
@@ -2115,7 +2171,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
           value.Edit([&](ProjectEdit& draft) { draft.RemoveClip(selection->id); });
           return true;
         });
-        choose_canvas({});
+        select_target({});
       }
       return;
     }
@@ -2123,13 +2179,13 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     const auto item = *canvas_item;
     const auto visible = item.Visible();
     const auto bounds = FrameFromArtwork(PlaceCanvasItem(visible, visible.x + 0.035F, visible.y + 0.035F), item.artwork);
-    std::optional<CanvasTarget> duplicate;
+    std::optional<EditTarget> duplicate;
     edit([&](Project& value) {
       value.Edit([&](ProjectEdit& draft) {
         if (overlay_selection) {
           auto copied = *overlay_selection;
           copied.destination = bounds;
-          duplicate = draft.AddOverlay(std::move(copied));
+          duplicate = EditTarget::ForOverlay(draft.AddOverlay(std::move(copied)));
         } else if (selection) {
           const auto lane = draft.AddTrack(media::TrackKind::Video);
           const auto id = draft.InsertClip(lane, selection->placement);
@@ -2137,18 +2193,14 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
           draft.SetClipFill(id, true);
           draft.SetClipRotation(id, selection->rotation_degrees);
           if (selection->background) draft.SetBackground(id, selection->background);
-          for (const auto& sticker : selection->stickers) draft.AddSticker(id, sticker.spec);
-          duplicate = id;
+          if (selection->source_crop) draft.SetSourceCrop(id, selection->source_crop);
+          for (const auto& sticker : selection->stickers) draft.AddSticker(id, sticker);
+          duplicate = EditTarget::ForClip(id);
         }
       });
       return true;
     });
-    if (duplicate) {
-      if (const auto* id = std::get_if<InstanceId>(&*duplicate)) {
-        text_bounds.Update([&](MeasuredBounds& bounds) { bounds.emplace_back(*id, item.artwork); });
-      }
-      choose_canvas(duplicate);
-    }
+    if (duplicate) select_target(duplicate);
   };
   View dock;
   switch (panel.Get()) {
@@ -2163,11 +2215,11 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       break;
   }
   const bool dock_open = bool(dock);
-  const auto up = [current, dock_open, back, allowed, close_panel, choose_canvas, enter] {
+  const auto up = [current, dock_open, back, allowed, close_panel, select_target, enter] {
     if (!allowed) return;
     if (dock_open) close_panel();
     else if (current == EditorTools::Main) back();
-    else if (current == EditorTools::Clip || current == EditorTools::Overlay) choose_canvas({});
+    else if (current == EditorTools::Clip || current == EditorTools::Overlay) select_target({});
     else enter(EditorTools::Main);
   };
   std::function<View(const WorkbenchFrame&, bool)> canvas_controls;
@@ -2178,25 +2230,19 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
         UseVectorImage(app::images::icons_corner_delete), UseVectorImage(app::images::icons_corner_edit),
         UseVectorImage(app::images::icons_corner_transform), UseVectorImage(app::images::icons_corner_duplicate)};
     canvas_controls = [=](const WorkbenchFrame& frame, bool current) {
-      const auto canvas = frame.project->canvas;
+      const auto project_canvas_size = frame.preview.project->canvas_size;
       const auto pressed = pressed_corner.Get();
-      auto items = canvas_items_at(*frame.project, frame.playing ? position : frame.seconds, true);
-      if (frame.drag) {
-        const auto item = std::ranges::find(items, frame.drag->layout.target, &CanvasItem::target);
-        if (item != items.end()) {
-          item->bounds = frame.drag->bounds;
-          item->degrees = frame.drag->degrees;
-        }
-      }
-      const auto item = find_canvas_item(items);
-      const auto guides = item && frame.drag && frame.drag->layout.target == item->target && dragging.Get()
+      const auto item = find_selected_canvas_item(frame.preview);
+      const auto guides = item && frame.drag && frame.drag->target == item->target && dragging.Get()
           ? frame.drag->guides : CanvasGuides{};
-      return Canvas([=](PaintContext& paint, Size size) {
+      return Canvas([=](PaintContext& paint, Size preview_view_size) {
         if (!item) return;
-        const auto area = CanvasArea(size, canvas);
-        PaintCanvasGuides(paint, size, area, *item, canvas, guides);
-        PaintCanvasSelection(paint, area, *item, canvas, !dock_open, pressed, plate_icon, pressed_plate_icon, action_icons);
-      }).With(CanvasPointer{canvas, std::move(items), item, pressed_corner, choose_canvas, change_canvas, canvas_action, current},
+        const auto preview_content_rect = PreviewContentRect(preview_view_size, project_canvas_size);
+        PaintCanvasGuides(paint, preview_view_size, preview_content_rect, *item, project_canvas_size, guides);
+        PaintCanvasSelection(paint, preview_content_rect, *item, project_canvas_size, !dock_open, pressed, plate_icon,
+                             pressed_plate_icon, action_icons);
+      }).With(CanvasPointer{project_canvas_size, frame.preview, item, pressed_corner, select_target, change_canvas,
+                            canvas_action, current},
               Enabled(allowed && !dock_open), Semantics{.label = "画布对象编辑区"});
     };
   }
@@ -2213,7 +2259,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     monitor_views.inspector = (dock_open ? std::move(dock) : View(ScrollView(std::move(inspector))))
         .With(Frame{.width = 288.0F}, Background(theme.colors.surface_container_low));
   }
-  auto monitor = EditorMonitor(context, project, transport, wide, back, project_menu, std::move(monitor_views), preview_drag);
+  auto monitor = EditorMonitor(context, project, transport, wide, back, project_menu, std::move(monitor_views), presented, preview_drag);
   if (wide) {
     auto controls = current == EditorTools::Canvas ? View(Row{
       WorkbenchBack("返回上一级", theme, up, allowed), canvas_options().With(Grow()),
@@ -2254,7 +2300,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
       break;
     case EditorTools::Media:
       actions.push_back(utility(app::images::icons_add, "导入主轨", add_movie, can_pick));
-      if (project && !project->assets.empty())
+      if (project && !project->resources->Empty())
         actions.push_back(utility(app::images::icons_video, "素材库", show_library, true));
       break;
     case EditorTools::Audio:
@@ -2274,7 +2320,7 @@ View WorkbenchEditor(WorkbenchContext context, std::function<void()> back) {
     case EditorTools::Overlay:
       actions.push_back(utility(app::images::icons_duplicate, "复制", [canvas_action] {
         canvas_action(CanvasCorner::Duplicate);
-      }, canvas_item.has_value()));
+      }, overlay_selection.has_value()));
       actions.push_back(utility(app::images::icons_captions, "编辑", adjust_overlay, true));
       actions.push_back(utility(app::images::icons_delete, "删除", remove_overlay, true));
       break;

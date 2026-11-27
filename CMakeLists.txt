@@ -8,7 +8,7 @@ if (CMAKE_HOST_APPLE AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "D
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target")
 endif ()
 
-project(av_kit VERSION 0.1.0 LANGUAGES NONE)
+project(av_kit VERSION 1.0.0 LANGUAGES NONE)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,15 +52,21 @@ target_include_directories(huxerui_avkit PUBLIC
         "$<INSTALL_INTERFACE:include>"
 )
 
-include(cmake/AVKitFlecs.cmake)
+include(cmake/AVKitEntityX.cmake)
 
 add_library(avkit_core STATIC
         src/analysis/tracking.cpp
         src/ecs/scene.cpp
+        src/ecs/system/layer_timing_system.cpp
+        src/ecs/system/pag_system.cpp
+        src/ecs/system/resource_system.cpp
+        src/ecs/system/spatial_system.cpp
         src/project/edit_template.cpp
         src/project/project.cpp
         src/project/project_io.cpp
-        src/render/image_surface.cpp
+        src/project/resource_catalog.cpp
+        src/media/image_decode.cpp
+        src/render/image_pixels.cpp
 )
 add_library(AVKit::Core ALIAS avkit_core)
 target_compile_features(avkit_core PUBLIC cxx_std_20)
@@ -68,7 +74,7 @@ target_include_directories(avkit_core
         PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>" "$<INSTALL_INTERFACE:include>"
         PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(avkit_core PUBLIC flecs::flecs_static HuxerUI::Media)
+target_link_libraries(avkit_core PUBLIC AVKit::EntityX HuxerUI::Media)
 set_target_properties(avkit_core PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
 if (TARGET HuxerUI::huxerui)
     set(avkit_sdk_target HuxerUI::huxerui)
@@ -80,12 +86,18 @@ target_include_directories(avkit_core SYSTEM PUBLIC
 )
 
 include(cmake/AVKitBgfx.cmake)
+target_link_libraries(avkit_core PRIVATE bimg_decode bimg)
 include(cmake/AVKitMedia.cmake)
 include(cmake/AVKitNCNN.cmake)
 include(cmake/AVKitPAG.cmake)
 
-add_library(avkit_render STATIC src/render/thumbnail_source.cpp src/render/timeline_renderer.cpp)
+add_library(avkit_render STATIC src/render/thumbnail_source.cpp
+        src/render/timeline_renderer.cpp src/render/timeline_preview.cpp)
 add_library(AVKit::Render ALIAS avkit_render)
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_sources(avkit_render PRIVATE platform/macos/src/render_iteration.mm)
+    set_target_properties(avkit_render PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED ON)
+endif ()
 target_include_directories(avkit_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if (ANDROID)
     target_include_directories(avkit_render PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/src")

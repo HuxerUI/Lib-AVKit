@@ -1,0 +1,109 @@
+--- a/entityx/Entity.h
++++ b/entityx/Entity.h
+@@ -9,6 +9,8 @@
+  */
+ 
+ #pragma once
++
++#include <atomic>
+ 
+ 
+ #include <cstdint>
+@@ -252,7 +254,7 @@
+ #endif
+   }
+ 
+-  static Family family_counter_;
++  static std::atomic<Family> family_counter_;
+ };
+ 
+ 
+@@ -367,8 +369,14 @@
+   /// An iterator over a view of the entities in an EntityManager.
+   /// If All is true it will iterate over all valid entities and will ignore the entity mask.
+   template <class Delegate, bool All = false>
+-  class ViewIterator : public std::iterator<std::input_iterator_tag, Entity::Id> {
++  class ViewIterator {
+    public:
++    using iterator_category = std::input_iterator_tag;
++    using value_type = Entity;
++    using difference_type = std::ptrdiff_t;
++    using pointer = Entity*;
++    using reference = Entity;
++
+     Delegate &operator ++() {
+       ++i_;
+       next();
+--- a/entityx/Entity.cc
++++ b/entityx/Entity.cc
+@@ -14,7 +14,7 @@
+ namespace entityx {
+ 
+ const Entity::Id Entity::INVALID;
+-BaseComponent::Family BaseComponent::family_counter_ = 0;
++std::atomic<BaseComponent::Family> BaseComponent::family_counter_ = 0;
+ 
+ void Entity::invalidate() {
+   id_ = INVALID;
+--- a/entityx/Event.h
++++ b/entityx/Event.h
+@@ -9,6 +9,8 @@
+  */
+ 
+ #pragma once
++
++#include <atomic>
+ 
+ #include <cstdint>
+ #include <cstddef>
+@@ -33,7 +35,7 @@
+   virtual ~BaseEvent();
+ 
+  protected:
+-  static Family family_counter_;
++  static std::atomic<Family> family_counter_;
+ };
+ 
+ 
+--- a/entityx/Event.cc
++++ b/entityx/Event.cc
+@@ -12,7 +12,7 @@
+ 
+ namespace entityx {
+ 
+-BaseEvent::Family BaseEvent::family_counter_ = 0;
++std::atomic<BaseEvent::Family> BaseEvent::family_counter_ = 0;
+ 
+ BaseEvent::~BaseEvent() {
+ }
+--- a/entityx/System.h
++++ b/entityx/System.h
+@@ -9,6 +9,8 @@
+  */
+ 
+ #pragma once
++
++#include <atomic>
+ 
+ 
+ #include <cstdint>
+@@ -57,7 +59,7 @@
+    */
+   virtual void update(EntityManager &entities, EventManager &events, TimeDelta dt) = 0;
+ 
+-  static Family family_counter_;
++  static std::atomic<Family> family_counter_;
+ 
+  protected:
+ };
+--- a/entityx/System.cc
++++ b/entityx/System.cc
+@@ -12,7 +12,7 @@
+ 
+ namespace entityx {
+ 
+-BaseSystem::Family BaseSystem::family_counter_;
++std::atomic<BaseSystem::Family> BaseSystem::family_counter_;
+ 
+ BaseSystem::~BaseSystem() {
+ }

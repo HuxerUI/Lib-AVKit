@@ -1,156 +1,200 @@
-#include <huxerui/avkit_ecs.h>
+#include <huxerui/avkit/scene.h>
+#include <huxerui/avkit/resource_catalog.h>
 
 #include <algorithm>
-#include <cmath>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
-#include "support/geometry.h"
+#include "support/cancellation.h"
+#include "ecs/system/layer_timing_system.h"
+#include "ecs/system/pag_system.h"
+#include "ecs/system/resource_system.h"
+#include "ecs/system/spatial_system.h"
 
 namespace huxerui::avkit {
-namespace {
 
-static_assert(FLECS_VERSION_MAJOR == 4 && FLECS_VERSION_MINOR == 2 && FLECS_VERSION_PATCH == 0,
-              "AVKit Core expects Flecs v4.2.0");
+struct RenderScene::Impl {
+  bool Owns(entityx::Entity entity) {
+    return entity != entityx::Entity{} && runtime.entities.valid(entity.id()) && runtime.entities.get(entity.id()) == entity;
+  }
 
-bool ValidRectangle(const Rect& rect) {
-  return std::isfinite(rect.x) && std::isfinite(rect.y) &&
-         std::isfinite(rect.width) && std::isfinite(rect.height) && !rect.IsEmpty();
+  entityx::Entity Parent(entityx::Entity entity) {
+    const auto link = entity.component<SpatialParent>();
+    return link && Owns(link->entity) ? link->entity : entityx::Entity{};
+  }
+
+  entityx::EntityX runtime;
+  entityx::Entity root = runtime.entities.create();
+  std::shared_ptr<const ResourceCatalog> render_resources;
+  struct RegisteredSystem { const std::type_info* type; SceneSystemPhase phase; UpdateSystem update; };
+  std::vector<RegisteredSystem> systems;
+  bool configured{};
+  bool evaluating{};
+  std::vector<entityx::Entity> ancestry;
+};
+
+RenderScene::RenderScene(std::shared_ptr<const ResourceCatalog> resources) : impl_(std::make_unique<Impl>()) {
+  impl_->root.assign<VideoFrameContext>();
+  impl_->root.assign<ResourceCatalog>(resources ? *resources : ResourceCatalog{});
+  impl_->root.assign<detail::ImageResources>();
+  impl_->render_resources = std::move(resources);
+  RegisterSystemAt<detail::LayerTimingSystem>(SceneSystemPhase::BeforeCompile);
+  RegisterSystemAt<detail::PagSystem>(SceneSystemPhase::BeforeCompile);
+  RegisterSystemAt<detail::ResourceSystem>(SceneSystemPhase::ResolveResources);
+  RegisterSystemAt<detail::SpatialSystem>(SceneSystemPhase::Spatial);
 }
 
-struct OrderedDraw {
-  std::int32_t order;
-  std::optional<std::uint32_t> subcomposition;
-  render::Draw draw;
-};
+RenderScene::~RenderScene() = default;
 
-struct ResolvedLayer {
-  Rect destination{0, 0, 1, 1};
-  std::optional<std::uint32_t> subcomposition;
-  std::optional<Transform2D> transform;
-};
+entityx::EntityManager& RenderScene::Entities() { return impl_->runtime.entities; }
 
-using detail::Compose;
+entityx::EventManager& RenderScene::Events() { return impl_->runtime.events; }
 
-} // namespace
+entityx::SystemManager& RenderScene::Systems() { return impl_->runtime.systems; }
 
-struct SceneEvaluator::Impl {
-  Impl() {
-    world.entity<EffectEvaluation>().add(flecs::Phase).depends_on(flecs::OnUpdate);
-    world.component<SpatialParent>().add(flecs::Exclusive).add(flecs::OnDeleteTarget, flecs::Remove);
-    world.component<LocalTransform2D>();
-    world.component<Transform2D>();
-    world.component<SubcompositionRoot>();
-    world.component<render::MaskedBlend>();
-    world.component<render::SourceSampling>();
-    world.component<render::DepthOcclusion>();
-    world.component<FrameContext>().add(flecs::Singleton);
-    world.set<FrameContext>({});
-    layers = world.query<const CompositeLayer>();
+entityx::Entity RenderScene::Root() const noexcept { return impl_->root; }
+
+const ResourceCatalog& SceneCatalog(entityx::Entity root) {
+  if (root) {
+    const auto catalog = root.component<const ResourceCatalog>();
+    if (catalog) return *catalog;
   }
+  throw std::invalid_argument("The scene root needs a resource catalog component");
+}
 
-  std::optional<ResolvedLayer> Resolve(flecs::entity entity) {
-    ResolvedLayer result;
-    Transform2D transform;
-    ancestry.clear();
-    for (; entity; entity = entity.target<SpatialParent>()) {
-      if (std::ranges::find(ancestry, entity.id()) != ancestry.end()) return std::nullopt;
-      ancestry.push_back(entity.id());
-      if (const auto* root = entity.try_get<SubcompositionRoot>()) {
-        result.subcomposition = root->index;
-        break;
-      }
-      if (const auto* local = entity.try_get<LocalTransform2D>()) {
-        if (!(local->scale.width > 0 && local->scale.height > 0)) return std::nullopt;
-        transform = Compose({local->scale.width, 0, 0, local->scale.height, local->translation.x, local->translation.y},
-                            transform);
-      }
-      if (const auto* local = entity.try_get<Transform2D>()) transform = Compose(*local, transform);
-    }
-    if (!transform.m12 && !transform.m21 && transform.m11 > 0 && transform.m22 > 0) {
-      result.destination = {transform.translate_x, transform.translate_y, transform.m11, transform.m22};
-      if (!ValidRectangle(result.destination)) return std::nullopt;
-    } else {
-      const auto determinant = double(transform.m11) * transform.m22 - double(transform.m21) * transform.m12;
-      if (!std::isfinite(determinant) || determinant == 0 || !std::isfinite(transform.translate_x) ||
-          !std::isfinite(transform.translate_y)) return std::nullopt;
-      result.transform = transform;
-    }
-    return result;
+const std::shared_ptr<const ResourceCatalog>& RenderScene::CatalogSnapshot() const noexcept {
+  return impl_->render_resources;
+}
+
+void RenderScene::ReuseImageResources(const RenderScene& previous) {
+  if (CatalogSnapshot() == previous.CatalogSnapshot())
+    *Root().component<detail::ImageResources>() = *previous.Root().component<const detail::ImageResources>();
+}
+
+const VideoFrameContext& RenderScene::Frame() const noexcept { return *impl_->root.component<const VideoFrameContext>(); }
+
+void RenderScene::CheckSystemRegistration(const std::type_info& type) {
+  if (impl_->evaluating) throw std::logic_error("Cannot add a system during scene evaluation");
+  if (std::ranges::any_of(impl_->systems, [&](const auto& entry) { return *entry.type == type; }))
+    throw std::invalid_argument("This scene system type is already registered");
+  impl_->systems.reserve(impl_->systems.size() + 1);
+}
+
+void RenderScene::ConfigureAddedSystem(entityx::BaseSystem& system) {
+  if (impl_->configured) system.configure(Entities(), Events());
+}
+
+void RenderScene::TrackSystem(const std::type_info& type, SceneSystemPhase phase, UpdateSystem update) {
+  auto& systems = impl_->systems;
+  const auto next = std::ranges::upper_bound(systems, phase, {}, &Impl::RegisteredSystem::phase);
+  systems.insert(next, {&type, phase, update});
+}
+
+void RenderScene::SetSpatialParent(entityx::Entity child, entityx::Entity parent) {
+  auto& state = *impl_;
+  if (!state.Owns(child) || (parent != entityx::Entity{} && !state.Owns(parent))) {
+    throw std::invalid_argument("Spatial parent and child must belong to the scene");
   }
-
-  flecs::world world;
-  flecs::query<const CompositeLayer> layers;
-  std::vector<flecs::entity_t> ancestry;
-  std::vector<OrderedDraw> ordered;
-};
-
-SceneEvaluator::SceneEvaluator() : impl_(std::make_unique<Impl>()) {}
-SceneEvaluator::~SceneEvaluator() = default;
-
-flecs::world& SceneEvaluator::World() { return impl_->world; }
-
-void SceneEvaluator::SetSpatialParent(flecs::entity child, flecs::entity parent) {
-  const auto* world = impl_->world.c_ptr();
-  if (!child || !parent || child.world().c_ptr() != world || parent.world().c_ptr() != world ||
-      !child.is_alive() || !parent.is_alive()) {
-    throw std::invalid_argument("Spatial parent and child must be live entities in this world");
+  if (!parent) {
+    if (child.has_component<SpatialParent>()) child.remove<SpatialParent>();
+    return;
   }
-  auto& ancestry = impl_->ancestry;
+  auto& ancestry = state.ancestry;
   ancestry.clear();
-  for (auto ancestor = parent; ancestor; ancestor = ancestor.target<SpatialParent>()) {
-    if (ancestor == child || std::ranges::find(ancestry, ancestor.id()) != ancestry.end()) {
+  for (auto ancestor = parent; ancestor; ancestor = state.Parent(ancestor)) {
+    if (ancestor == child || std::ranges::find(ancestry, ancestor) != ancestry.end()) {
       throw std::invalid_argument("The spatial parent would create a cycle");
     }
-    ancestry.push_back(ancestor.id());
+    ancestry.push_back(ancestor);
   }
-  child.add<SpatialParent>(parent);
+  child.replace<SpatialParent>(parent);
 }
 
-std::shared_ptr<const render::RenderPlan> SceneEvaluator::Evaluate(media::MediaTimestamp time, render::ImageDesc target,
-                                                                   std::uint32_t subcomposition_count) {
-  if (!time.timescale || !target.size.width || !target.size.height) {
+void RenderScene::Destroy(entityx::Entity entity) {
+  if (!impl_->Owns(entity)) throw std::invalid_argument("The scene entity is not live");
+  if (entity == impl_->root) throw std::invalid_argument("The scene root belongs to the scene");
+  for (auto child : Entities().entities_with_components<SpatialParent>()) {
+    if (child.component<SpatialParent>()->entity == entity) child.remove<SpatialParent>();
+  }
+  entity.destroy();
+}
+
+std::shared_ptr<const render::RenderPlan> RenderScene::Evaluate(VideoFrameContext frame, std::stop_token stop) {
+  return Evaluate(frame, stop, nullptr);
+}
+
+std::shared_ptr<const render::RenderPlan> RenderScene::Evaluate(VideoFrameContext frame, std::stop_token stop,
+    std::vector<detail::TargetLayoutEntry>* layouts) {
+  UpdateSystems(frame, stop);
+  return Compile({}, {}, layouts, stop);
+}
+
+void RenderScene::UpdateSystems(VideoFrameContext frame, std::stop_token stop) {
+  if (!frame.time.timescale || !frame.target.size.width || !frame.target.size.height) {
     throw std::invalid_argument("Scene evaluation needs a valid media time and target size");
   }
-  auto& state = *impl_;
-  state.world.set<FrameContext>({time});
-  state.world.run_pipeline(state.world.get_pipeline(), 0.0);
-
-  state.ordered.clear();
-  bool invalid_transform = false;
-  state.layers.each([&](flecs::entity entity, const CompositeLayer& layer) {
-    if (const auto resolved = state.Resolve(entity)) {
-      const auto* mask = entity.try_get<render::MaskedBlend>();
-      const auto* sampling = entity.try_get<render::SourceSampling>();
-      const auto* occlusion = entity.try_get<render::DepthOcclusion>();
-      state.ordered.push_back({layer.order, resolved->subcomposition,
-                               {layer.input_slot, layer.blend, resolved->destination,
-                                mask ? std::optional{*mask} : std::nullopt, resolved->transform,
-                                sampling ? std::optional{*sampling} : std::nullopt,
-                                occlusion ? std::optional{*occlusion} : std::nullopt, layer.opacity}});
-    } else {
-      invalid_transform = true;
-    }
-  });
-  if (invalid_transform) throw std::invalid_argument("Visible layer has a cyclic or invalid spatial transform");
-  const auto order = [](const OrderedDraw& draw) { return std::pair{draw.subcomposition, draw.order}; };
-  std::ranges::sort(state.ordered, {}, order);
-  auto plan = std::make_shared<render::RenderPlan>();
-  plan->target = target;
-  plan->subcompositions.resize(subcomposition_count);
-  plan->draws.reserve(state.ordered.size());
-  for (std::size_t index = 0; index < state.ordered.size(); ++index) {
-    const auto& layer = state.ordered[index];
-    if (index && order(state.ordered[index - 1]) == order(layer)) {
-      throw std::invalid_argument("Visible composite layers must have distinct orders");
-    }
-    if (layer.subcomposition && *layer.subcomposition >= subcomposition_count)
-      throw std::invalid_argument("Visible layer references an unavailable subcomposition");
-    auto& draws = layer.subcomposition ? plan->subcompositions[*layer.subcomposition].draws : plan->draws;
-    draws.push_back(layer.draw);
+  if (impl_->evaluating) throw std::logic_error("Scene evaluation cannot be reentered");
+  entityx::TimeDelta step{};
+  if (frame.continuous_step) {
+    const auto duration = *frame.continuous_step;
+    if (!duration.timescale || duration.ticks <= 0)
+      throw std::invalid_argument("A continuous scene update needs a positive media duration");
+    step = static_cast<entityx::TimeDelta>(duration.ticks) / duration.timescale;
   }
-  return plan;
+  detail::CheckCancelled(stop);
+  for (auto entity : Entities().entities_with_components<SampledStillImage>())
+    entity.remove<SampledStillImage>();
+  *impl_->root.component<VideoFrameContext>() = frame;
+  RunSystems(SceneSystemPhase::BeforeSampling, SceneSystemPhase::ResolveResources, stop, step);
+}
+
+void RenderScene::RunPhase(SceneSystemPhase phase, std::stop_token stop) {
+  RunSystems(phase, phase, stop);
+}
+
+void RenderScene::RunSystems(SceneSystemPhase first, SceneSystemPhase last, std::stop_token stop,
+                             entityx::TimeDelta step) {
+  auto& state = *impl_;
+  if (state.evaluating) throw std::logic_error("Scene evaluation cannot be reentered");
+  struct Evaluation {
+    bool& active;
+
+    ~Evaluation() { active = false; }
+  } evaluation{state.evaluating};
+  state.evaluating = true;
+  detail::CheckCancelled(stop);
+  if (!state.configured) {
+    Systems().configure();
+    state.configured = true;
+  }
+  for (const auto& system : state.systems) {
+    if (system.phase < first || system.phase > last) continue;
+    detail::CheckCancelled(stop);
+    system.update(Systems(), step);
+  }
+  detail::CheckCancelled(stop);
+}
+
+std::shared_ptr<const render::RenderPlan> RenderScene::Compile(std::stop_token stop) {
+  return Compile({}, {}, nullptr, stop);
+}
+
+std::shared_ptr<const render::RenderPlan> RenderScene::Compile(entityx::Entity target, Affine2D delta,
+    std::vector<detail::TargetLayoutEntry>* layouts, std::stop_token stop) {
+  if (!Frame().target.size.width || !Frame().target.size.height)
+    throw std::invalid_argument("Scene compilation requires a target size");
+  if (impl_->evaluating) throw std::logic_error("Scene evaluation cannot be reentered");
+  auto root = Root();
+  auto request = root.assign<detail::RenderPlanCompilation>(target, delta, layouts);
+  struct Release {
+    entityx::Entity root;
+
+    ~Release() { root.remove<detail::RenderPlanCompilation>(); }
+  } release{root};
+  RunPhase(SceneSystemPhase::Spatial, stop);
+  request->plan->resources = CatalogSnapshot();
+  return std::move(request->plan);
 }
 
 } // namespace huxerui::avkit

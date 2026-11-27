@@ -1,6 +1,7 @@
 #include "project_internal.h"
 
-#include <algorithm>
+#include <huxerui/avkit/resource_catalog.h>
+
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -11,6 +12,8 @@
 
 namespace huxerui::avkit {
 namespace {
+
+constexpr unsigned kProjectFormatVersion = 1;
 
 using media::TrackKind;
 
@@ -42,6 +45,7 @@ TrackKind ReadKind(std::istream& input) {
 char Kind(TrackKind kind) { return kind == TrackKind::Video ? 'v' : 'a'; }
 
 media::MediaTimestamp ReadTime(std::istream& input) { return {Read<std::int64_t>(input), Read<std::uint32_t>(input)}; }
+
 TimeRange ReadRange(std::istream& input) { return {ReadTime(input), ReadTime(input)}; }
 
 void Put(std::ostream& output, media::MediaTimestamp value) { output << value.ticks << ' ' << value.timescale; }
@@ -68,6 +72,114 @@ void Put(std::ostream& output, Color color) {
   output << color.red << ' ' << color.green << ' ' << color.blue << ' ' << color.alpha;
 }
 
+ResourceRef ReadResource(std::istream& input) { return {Text(input)}; }
+
+void Put(std::ostream& output, const ResourceRef& resource) {
+  output << std::quoted(resource.key);
+}
+
+void PutBackground(std::ostream& output, const BackgroundReplacementSpec& effect) {
+  Put(output, effect.color);
+  if (const auto* model = std::get_if<PortraitMask>(&effect.mask)) {
+    output << " p " << std::quoted(model->model_id);
+  } else if (const auto* mask = std::get_if<StaticMask>(&effect.mask)) {
+    output << " s ";
+    Put(output, mask->image.resource);
+    output << ' ' << (mask->image.channel == MaskChannel::Alpha ? 'a' : 'g') << ' ' << mask->inverted;
+  } else {
+    const auto& animation = std::get<AnimatedMask>(effect.mask);
+    output << " a ";
+    Put(output, animation.resource);
+    output << ' ' << (animation.playback == AnimationPlayback::Loop ? 'l' : 'h') << ' ' << animation.inverted;
+  }
+}
+
+BackgroundReplacementSpec ReadBackground(std::istream& input) {
+  BackgroundReplacementSpec effect{ReadColor(input)};
+  switch (Read<char>(input)) {
+    case 'p': effect.mask = PortraitMask{Text(input)}; break;
+    case 's': {
+      auto resource = ReadResource(input);
+      const auto channel = Read<char>(input);
+      if (channel != 'g' && channel != 'a') throw std::runtime_error("Invalid static mask channel");
+      effect.mask = StaticMask{{std::move(resource), channel == 'a' ? MaskChannel::Alpha : MaskChannel::Grayscale},
+                               Read<bool>(input)};
+      break;
+    }
+    case 'a': {
+      auto resource = ReadResource(input);
+      const auto playback = Read<char>(input);
+      if (playback != 'h' && playback != 'l') throw std::runtime_error("Invalid animated mask playback mode");
+      effect.mask = AnimatedMask{std::move(resource), playback == 'l' ? AnimationPlayback::Loop : AnimationPlayback::HoldLast,
+                                 Read<bool>(input)};
+      break;
+    }
+    default: throw std::runtime_error("Invalid background mask source");
+  }
+  return effect;
+}
+
+void PutReplacements(std::ostream& output, const PagReplacements& replacements) {
+  output << ' ' << replacements.texts.size();
+  for (const auto& text : replacements.texts) {
+    output << ' ' << std::quoted(text.slot) << ' ' << text.text.has_value();
+    if (text.text) output << ' ' << std::quoted(*text.text);
+    output << ' ' << text.font.has_value();
+    if (text.font) { output << ' '; Put(output, *text.font); }
+    output << ' ' << text.size_scale.has_value();
+    if (text.size_scale) output << ' ' << *text.size_scale;
+    for (const auto& color : {text.foreground, text.background}) {
+      output << ' ' << color.has_value();
+      if (color) { output << ' '; Put(output, *color); }
+    }
+  }
+  output << ' ' << replacements.images.size();
+  for (const auto& image : replacements.images) {
+    output << ' ' << std::quoted(image.slot) << ' ';
+    Put(output, image.image);
+  }
+}
+
+PagReplacements ReadReplacements(std::istream& input) {
+  PagReplacements replacements;
+  for (auto count = Read<std::size_t>(input); count; --count) {
+    PagTextReplacement text{Text(input)};
+    if (Read<bool>(input)) text.text = Text(input);
+    if (Read<bool>(input)) text.font = ReadResource(input);
+    if (Read<bool>(input)) text.size_scale = Read<float>(input);
+    if (Read<bool>(input)) text.foreground = ReadColor(input);
+    if (Read<bool>(input)) text.background = ReadColor(input);
+    replacements.texts.push_back(std::move(text));
+  }
+  for (auto count = Read<std::size_t>(input); count; --count)
+    replacements.images.push_back({Text(input), ReadResource(input)});
+  return replacements;
+}
+
+void Put(std::ostream& output, const OverlayContent& content) {
+  if (const auto* still = std::get_if<StillImageSource>(&content)) {
+    output << "s ";
+    Put(output, still->resource);
+  } else {
+    const auto& pag = std::get<PagOverlay>(content);
+    output << "p ";
+    Put(output, pag.resource);
+    output << ' ' << (pag.playback == AnimationPlayback::Loop ? 'l' : 'h');
+    PutReplacements(output, pag.replacements);
+  }
+}
+
+OverlayContent ReadOverlayContent(std::istream& input) {
+  const auto kind = Read<char>(input);
+  if (kind != 's' && kind != 'p') throw std::runtime_error("Invalid overlay content");
+  auto resource = ReadResource(input);
+  if (kind == 's') return StillImageSource{std::move(resource)};
+  const auto playback = Read<char>(input);
+  if (playback != 'l' && playback != 'h') throw std::runtime_error("Invalid overlay animation playback mode");
+  return PagOverlay{std::move(resource), ReadReplacements(input),
+                    playback == 'l' ? AnimationPlayback::Loop : AnimationPlayback::HoldLast};
+}
+
 void RequireIo(IoResult<void> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
 }
@@ -79,62 +191,20 @@ void Project::Save(const File& destination) const {
   output.imbue(std::locale::classic());
   output << std::setprecision(std::numeric_limits<float>::max_digits10);
   const auto& project = *current_;
-  const bool versioned_assets = std::ranges::any_of(project.assets, [](const auto& asset) { return asset.content_revision != 0; });
-  const auto any_clip = [&](auto predicate) {
-    return std::ranges::any_of(project.tracks, [&](const auto& track) {
-      return std::ranges::any_of(track.clips, predicate);
-    });
-  };
-  const bool reversed = any_clip([](const auto& clip) { return clip.placement.source.reverse; });
-  const bool tracked = any_clip([](const auto& clip) {
-    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.anchor.has_value(); });
-  });
-  const bool backgrounds = any_clip([](const auto& clip) { return clip.background.has_value(); });
-  const bool selected_models = any_clip([](const auto& clip) { return clip.background && !clip.background->model_id.empty(); });
-  const bool static_masks = any_clip([](const auto& clip) { return clip.background && clip.background->static_mask; });
-  const bool animated_masks = any_clip([](const auto& clip) { return clip.background && clip.background->animated_mask; });
-  const bool depth_stickers = any_clip([](const auto& clip) {
-    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.depth_meters.has_value(); });
-  });
-  const bool animated_stickers = any_clip([](const auto& clip) {
-    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return sticker.spec.playback.has_value(); });
-  });
-  const bool replaced_stickers = any_clip([](const auto& clip) {
-    return std::ranges::any_of(clip.stickers, [](const auto& sticker) { return !sticker.spec.replacements.Empty(); });
-  });
-  const bool animated_transitions = std::ranges::any_of(project.transitions, [](const auto& transition) {
-    return transition.spec.animation.has_value();
-  });
-  const bool display_geometry = std::ranges::any_of(project.assets, [](const auto& asset) {
-    return std::ranges::any_of(asset.source.tracks, [](const auto& track) { return track.display_size.has_value(); });
-  });
-  const bool clip_settings = any_clip([](const auto& clip) { return clip.audio_of || clip.audio_mix != AudioMix{} || clip.fill; });
-  const bool styled = std::ranges::any_of(project.overlays, [](const auto& overlay) {
-    return overlay.style != CanvasTextStyle{} || overlay.opacity != 1.0F;
-  });
-  const bool rotated = any_clip([](const auto& clip) { return clip.rotation_degrees != 0; }) ||
-      std::ranges::any_of(project.overlays, [](const auto& overlay) { return overlay.rotation_degrees != 0; });
-  const int version = rotated ? 15 : styled ? 14 : display_geometry || clip_settings || !project.overlays.empty() ? 13 :
-                      animated_transitions ? 12 : replaced_stickers ? 11 : animated_stickers ? 10 : depth_stickers ? 9 :
-                      animated_masks ? 8 : static_masks ? 7 :
-                      selected_models ? 6 : backgrounds ? 5 :
-                      tracked ? 4 : versioned_assets || reversed ? 3 :
-                      project.transitions.empty() ? 1 : 2;
-  output << "AVKIT_PROJECT " << version << '\n';
-  output << "canvas " << project.canvas.width << ' ' << project.canvas.height << '\n';
+  output << "AVKIT_PROJECT " << kProjectFormatVersion << '\n';
+  output << "canvas " << project.canvas_size.width << ' ' << project.canvas_size.height << '\n';
   output << "revision " << project.revision << ' ' << project.next_id << '\n';
-  output << "assets " << project.assets.size() << '\n';
-  for (const auto& asset : project.assets) {
-    output << "asset " << asset.id.value << ' ' << std::quoted(asset.source.file.Path()) << ' ' << asset.source.tracks.size();
-    if (version >= 3) output << ' ' << asset.content_revision;
-    output << '\n';
-    for (const auto& track : asset.source.tracks) {
+  const auto media = project.resources->Media();
+  output << "assets " << media.size() << '\n';
+  for (const auto& [key, asset] : media) {
+    output << "asset ";
+    Put(output, key);
+    output << ' ' << std::quoted(asset->file.Path()) << ' ' << asset->tracks.size() << ' ' << asset->still_image << '\n';
+    for (const auto& track : asset->tracks) {
       output << "source " << track.id << ' ' << Kind(track.kind) << ' ';
       Put(output, track.presentation);
-      if (version >= 13) {
-        const auto size = track.display_size.value_or(PixelSize{});
-        output << ' ' << size.width << ' ' << size.height;
-      }
+      const auto size = track.display_size.value_or(PixelSize{});
+      output << ' ' << size.width << ' ' << size.height;
       output << '\n';
     }
   }
@@ -143,135 +213,89 @@ void Project::Save(const File& destination) const {
     output << "track " << track.id.value << ' ' << Kind(track.kind) << ' ' << track.clips.size() << '\n';
     for (const auto& clip : track.clips) {
       const auto& placement = clip.placement;
-      output << "clip " << clip.id.value << ' ' << placement.source.asset.value << ' ' << placement.source.track << ' ';
+      output << "clip " << clip.id.value << ' ';
+      Put(output, placement.source.asset);
+      output << ' ' << placement.source.track << ' ';
       Put(output, placement.source.range);
       output << ' ';
       Put(output, placement.timeline);
       output << ' ';
       Put(output, clip.destination);
-      output << ' ' << clip.stickers.size();
-      if (version >= 3) output << ' ' << placement.source.reverse;
-      if (version >= 5) {
-        output << ' ' << clip.background.has_value();
-        if (clip.background) {
-          const auto& effect = *clip.background;
-          output << ' ' << effect.color.red << ' ' << effect.color.green << ' ' << effect.color.blue << ' '
-                 << effect.color.alpha << ' ';
-          Put(output, effect.source_crop);
-          output << ' ' << effect.mirrored;
-          if (version >= 6) output << ' ' << std::quoted(effect.model_id);
-          if (version >= 7) {
-            output << ' ' << effect.static_mask.has_value();
-            if (effect.static_mask) {
-              const auto& mask = *effect.static_mask;
-              output << ' ' << std::quoted(mask.resource.pack) << ' ' << std::quoted(mask.resource.revision) << ' '
-                     << std::quoted(mask.resource.key) << ' ' << mask.inverted;
-            }
-          }
-          if (version >= 8) {
-            output << ' ' << effect.animated_mask.has_value();
-            if (effect.animated_mask) {
-              const auto& mask = *effect.animated_mask;
-              output << ' ' << std::quoted(mask.resource.pack) << ' ' << std::quoted(mask.resource.revision) << ' '
-                     << std::quoted(mask.resource.key) << ' ' << (mask.playback == MaskPlayback::Loop ? 'l' : 'h')
-                     << ' ' << mask.inverted;
-            }
-          }
-        }
-      }
-      if (version >= 13) {
-        output << ' ' << clip.audio_of.value_or(ClipId{}).value << ' ' << clip.audio_mix.gain << ' '
-               << clip.audio_mix.muted << ' ';
-        Put(output, clip.audio_mix.fade_in);
+      output << ' ' << clip.stickers.size() << ' ' << placement.source.reverse << ' ' << clip.background.has_value();
+      if (clip.background) {
         output << ' ';
-        Put(output, clip.audio_mix.fade_out);
-        output << ' ' << clip.fill;
+        PutBackground(output, *clip.background);
       }
-      if (version >= 15) output << ' ' << clip.rotation_degrees;
-      output << '\n';
+      output << ' ' << clip.source_crop.has_value();
+      if (const auto& crop = clip.source_crop) {
+        output << ' ';
+        Put(output, crop->area);
+        output << ' ' << crop->mirrored;
+      }
+      output << ' ' << clip.audio_of.value_or(ClipId{}).value << ' ' << clip.audio_mix.gain << ' '
+             << clip.audio_mix.muted << ' ';
+      Put(output, clip.audio_mix.fade_in);
+      output << ' ';
+      Put(output, clip.audio_mix.fade_out);
+      output << ' ' << clip.fill << ' ' << clip.rotation_degrees << ' '
+             << (clip.voice_effect ? static_cast<int>(*clip.voice_effect) : 0) << '\n';
       for (const auto& sticker : clip.stickers) {
-        const auto& resource = sticker.spec.resource;
-        output << "sticker " << sticker.id.value << ' ' << std::quoted(resource.pack) << ' '
-               << std::quoted(resource.revision) << ' ' << std::quoted(resource.key) << ' ';
-        Put(output, sticker.spec.destination);
-        if (version >= 4) {
-          const auto& anchor = sticker.spec.anchor;
-          output << ' ' << anchor.has_value();
-          if (anchor) {
-            output << ' ' << static_cast<int>(anchor->part) << ' ' << std::quoted(anchor->point)
-                   << ' ' << std::quoted(anchor->axis_point.value_or(""));
-          }
+        output << "sticker " << sticker.id.value << ' ';
+        Put(output, sticker.content);
+        output << ' ';
+        Put(output, sticker.destination);
+        const auto& anchor = sticker.anchor;
+        output << ' ' << anchor.has_value();
+        if (anchor) {
+          output << ' ' << static_cast<int>(anchor->part) << ' ' << std::quoted(anchor->point)
+                 << ' ' << std::quoted(anchor->axis_point.value_or(""));
         }
-        if (version >= 9) {
-          output << ' ' << sticker.spec.depth_meters.has_value();
-          if (sticker.spec.depth_meters) output << ' ' << *sticker.spec.depth_meters;
+        output << ' ' << sticker.depth.has_value();
+        if (sticker.depth) output << ' ' << sticker.depth->meters;
+        output << ' ' << (sticker.range != TimeRange{});
+        if (sticker.range != TimeRange{}) {
+          output << ' ';
+          Put(output, sticker.range);
         }
-        if (version >= 10) {
-          const auto playback = sticker.spec.playback;
-          output << ' ' << (!playback ? '-' : *playback == AnimationPlayback::Loop ? 'l' : 'h');
-        }
-        if (version >= 11) {
-          const auto& replacements = sticker.spec.replacements;
-          output << ' ' << replacements.texts.size();
-          for (const auto& text : replacements.texts)
-            output << ' ' << std::quoted(text.slot) << ' ' << std::quoted(text.text);
-          output << ' ' << replacements.images.size();
-          for (const auto& image : replacements.images)
-            output << ' ' << std::quoted(image.slot) << ' ' << std::quoted(image.image.pack) << ' '
-                   << std::quoted(image.image.revision) << ' ' << std::quoted(image.image.key);
-        }
-        output << '\n';
+        output << ' ' << static_cast<unsigned>(sticker.kind) << ' ' << sticker.opacity << ' ' << sticker.rotation_degrees << '\n';
       }
     }
   }
-  if (version >= 2) {
-    output << "transitions " << project.transitions.size() << '\n';
-    for (const auto& transition : project.transitions) {
-      const auto& spec = transition.spec;
-      output << "transition " << transition.id.value << ' ' << transition.from.value << ' ' << transition.to.value << ' ';
-      Put(output, spec.range);
-      output << ' ' << std::quoted(spec.mask.pack) << ' ' << std::quoted(spec.mask.revision) << ' '
-             << std::quoted(spec.mask.key) << ' ' << spec.feather << ' ' << spec.inverted << ' ' << spec.feather_keys.size();
-      if (version >= 12) {
-        output << ' ' << spec.animation.has_value();
-        if (const auto& animation = spec.animation)
-          output << ' ' << std::quoted(animation->pack) << ' ' << std::quoted(animation->revision) << ' '
-                 << std::quoted(animation->key);
-      }
-      output << '\n';
-      for (const auto& key : spec.feather_keys) {
+  output << "transitions " << project.transitions.size() << '\n';
+  for (const auto& transition : project.transitions) {
+    const auto& spec = transition.spec;
+    output << "transition " << transition.id.value << ' ' << transition.from.value << ' ' << transition.to.value << ' ';
+    Put(output, spec.range);
+    if (const auto* mask = std::get_if<MaskTransition>(&spec.effect)) {
+      output << " m ";
+      Put(output, mask->resource);
+      output << ' ' << mask->feather << ' ' << mask->inverted << ' ' << mask->feather_keys.size() << '\n';
+      for (const auto& key : mask->feather_keys) {
         output << "feather ";
         Put(output, key.time);
         output << ' ' << key.value << ' ' << (key.interpolation == Interpolation::Hold ? 'h' : 'l') << '\n';
       }
-    }
-  }
-  if (version >= 13) {
-    output << "overlays " << project.overlays.size() << '\n';
-    for (const auto& overlay : project.overlays) {
-      output << "overlay " << overlay.id.value << ' ' << static_cast<unsigned>(overlay.kind) << ' ';
-      Put(output, overlay.range);
-      output << ' ';
-      Put(output, overlay.destination);
-      output << ' ' << std::quoted(overlay.text) << ' ' << std::quoted(overlay.resource.pack) << ' '
-             << std::quoted(overlay.resource.revision) << ' ' << std::quoted(overlay.resource.key);
-      if (version >= 14) {
-        output << ' ';
-        Put(output, overlay.style.foreground);
-        output << ' ';
-        Put(output, overlay.style.background);
-        output << ' ' << overlay.style.size << ' ' << std::quoted(overlay.style.font.pack) << ' '
-               << std::quoted(overlay.style.font.revision) << ' ' << std::quoted(overlay.style.font.key) << ' '
-               << overlay.opacity;
-      }
-      if (version >= 15) output << ' ' << overlay.rotation_degrees;
+    } else {
+      output << " p ";
+      Put(output, std::get<PagTransitionSource>(spec.effect).resource);
       output << '\n';
     }
   }
+  output << "overlays " << project.overlays.size() << '\n';
+  for (const auto& overlay : project.overlays) {
+    output << "overlay " << overlay.id.value << ' ' << static_cast<unsigned>(overlay.kind) << ' ';
+    Put(output, overlay.range);
+    output << ' ';
+    Put(output, overlay.destination);
+    output << ' ';
+    Put(output, overlay.content);
+    output << ' ' << overlay.opacity << ' ' << overlay.rotation_degrees;
+    output << '\n';
+  }
   output << "end\n";
   if (!output) throw std::runtime_error("Cannot serialize the project");
-  for (const auto& asset : project.assets) {
-    if (asset.source.file == destination) throw std::invalid_argument("A project document cannot replace an asset");
+  for (const auto& [key, asset] : media) {
+    if (asset->file == destination) throw std::invalid_argument("A project document cannot replace an asset");
   }
   const auto serialized = output.str();
   detail::StagedOutput stage(destination);
@@ -287,125 +311,107 @@ Project Project::Open(const File& source) {
   std::istringstream input(std::move(text).Value());
   input.imbue(std::locale::classic());
   Tag(input, "AVKIT_PROJECT");
-  const auto version = Read<unsigned>(input);
-  if (version < 1 || version > 15) throw std::runtime_error("Unsupported project document version");
+  if (Read<unsigned>(input) != kProjectFormatVersion) throw std::runtime_error("Unsupported project document version");
   ProjectSnapshot project;
   Tag(input, "canvas");
-  project.canvas = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
+  project.canvas_size = {Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
   Tag(input, "revision");
   project.revision = Read<std::uint64_t>(input);
   project.next_id = Read<std::uint64_t>(input);
   Tag(input, "assets");
+  auto resources = std::make_shared<ResourceCatalog>();
   for (auto count = Read<std::size_t>(input); count; --count) {
     Tag(input, "asset");
-    AssetInfo asset{{Read<std::uint64_t>(input)}, {File(Text(input)), {}}};
+    auto resource = ReadResource(input);
+    AssetSource asset{File(Text(input)), {}};
     const auto track_count = Read<std::size_t>(input);
-    if (version >= 3) asset.content_revision = Read<std::uint64_t>(input);
+    asset.still_image = Read<bool>(input);
     for (auto tracks = track_count; tracks; --tracks) {
       Tag(input, "source");
       AssetTrack track{Read<std::uint32_t>(input), ReadKind(input), ReadRange(input)};
-      if (version >= 13) {
-        const PixelSize size{Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
-        if (size.width || size.height) track.display_size = size;
-      }
-      asset.source.tracks.push_back(track);
+      const PixelSize size{Read<std::uint32_t>(input), Read<std::uint32_t>(input)};
+      if (size.width || size.height) track.display_size = size;
+      asset.tracks.push_back(track);
     }
-    project.assets.push_back(std::move(asset));
+    resources->Register(std::move(resource), std::move(asset));
   }
+  project.resources = std::move(resources);
   Tag(input, "tracks");
   for (auto count = Read<std::size_t>(input); count; --count) {
     Tag(input, "track");
-    TrackInfo track{{Read<std::uint64_t>(input)}, ReadKind(input), {}};
+    TimelineTrack track{{Read<std::uint64_t>(input)}, ReadKind(input), {}};
     for (auto clips = Read<std::size_t>(input); clips; --clips) {
       Tag(input, "clip");
-      ClipInfo clip{{Read<std::uint64_t>(input)},
-          {{{Read<std::uint64_t>(input)}, Read<std::uint32_t>(input), ReadRange(input)}, ReadRange(input)},
+      TimelineClip clip{{Read<std::uint64_t>(input)},
+          {{ReadResource(input), Read<std::uint32_t>(input), ReadRange(input)}, ReadRange(input)},
           ReadRect(input), {}};
       const auto sticker_count = Read<std::size_t>(input);
-      if (version >= 3) clip.placement.source.reverse = Read<bool>(input);
-      if (version >= 5 && Read<bool>(input)) {
-        const Color color{Read<float>(input), Read<float>(input), Read<float>(input), Read<float>(input)};
-        clip.background = BackgroundReplacement{color, ReadRect(input), Read<bool>(input),
-                                                 version >= 6 ? Text(input) : std::string{}};
-        if (version >= 7 && Read<bool>(input))
-          clip.background->static_mask = StaticMask{{Text(input), Text(input), Text(input)}, Read<bool>(input)};
-        if (version >= 8 && Read<bool>(input)) {
-          ResourceRef mask{Text(input), Text(input), Text(input)};
-          const auto playback = Read<char>(input);
-          if (playback != 'h' && playback != 'l') throw std::runtime_error("Invalid animated mask playback mode");
-          clip.background->animated_mask = AnimatedMask{std::move(mask), playback == 'l' ? MaskPlayback::Loop : MaskPlayback::HoldLast,
-                                                         Read<bool>(input)};
-        }
-      }
-      if (version >= 13) {
-        const auto owner = Read<std::uint64_t>(input);
-        if (owner) clip.audio_of = ClipId{owner};
-        clip.audio_mix = {Read<float>(input), Read<bool>(input), ReadTime(input), ReadTime(input)};
-        clip.fill = Read<bool>(input);
-      }
-      if (version >= 15) clip.rotation_degrees = Read<float>(input);
+      clip.placement.source.reverse = Read<bool>(input);
+      if (Read<bool>(input)) clip.background = ReadBackground(input);
+      if (Read<bool>(input)) clip.source_crop = SourceCrop{ReadRect(input), Read<bool>(input)};
+      const auto owner = Read<std::uint64_t>(input);
+      if (owner) clip.audio_of = ClipId{owner};
+      clip.audio_mix = {Read<float>(input), Read<bool>(input), ReadTime(input), ReadTime(input)};
+      clip.fill = Read<bool>(input);
+      clip.rotation_degrees = Read<float>(input);
+      const auto voice = Read<int>(input);
+      if (voice == static_cast<int>(VoiceEffect::Robot)) clip.voice_effect = VoiceEffect::Robot;
+      else if (voice != 0) throw std::runtime_error("Invalid voice effect");
       for (auto stickers = sticker_count; stickers; --stickers) {
         Tag(input, "sticker");
-        StickerInstance sticker{{Read<std::uint64_t>(input)}, {{Text(input), Text(input), Text(input)}, ReadRect(input)}};
-        if (version >= 4 && Read<bool>(input)) {
+        OverlayInstance sticker{.id = {Read<std::uint64_t>(input)}};
+        sticker.content = ReadOverlayContent(input);
+        sticker.destination = ReadRect(input);
+        if (Read<bool>(input)) {
           const auto part = static_cast<analysis::TrackedPart>(Read<int>(input));
           auto point = Text(input);
           auto axis = Text(input);
-          sticker.spec.anchor = {part, std::move(point), axis.empty() ? std::nullopt : std::optional{std::move(axis)}};
+          sticker.anchor = {part, std::move(point), axis.empty() ? std::nullopt : std::optional{std::move(axis)}};
         }
-        if (version >= 9 && Read<bool>(input)) sticker.spec.depth_meters = Read<float>(input);
-        if (version >= 10) {
-          const auto playback = Read<char>(input);
-          if (playback != '-' && playback != 'h' && playback != 'l')
-            throw std::runtime_error("Invalid sticker animation playback mode");
-          if (playback != '-') sticker.spec.playback = playback == 'l' ? AnimationPlayback::Loop : AnimationPlayback::HoldLast;
-        }
-        if (version >= 11) {
-          auto& replacements = sticker.spec.replacements;
-          for (auto count = Read<std::size_t>(input); count; --count)
-            replacements.texts.push_back({Text(input), Text(input)});
-          for (auto count = Read<std::size_t>(input); count; --count)
-            replacements.images.push_back({Text(input), {Text(input), Text(input), Text(input)}});
-        }
+        if (Read<bool>(input)) sticker.depth = StickerDepth{Read<float>(input)};
+        if (Read<bool>(input)) sticker.range = ReadRange(input);
+        sticker.kind = static_cast<CanvasOverlayKind>(Read<unsigned>(input));
+        sticker.opacity = Read<float>(input);
+        sticker.rotation_degrees = Read<float>(input);
         clip.stickers.push_back(std::move(sticker));
       }
       track.clips.push_back(std::move(clip));
     }
     project.tracks.push_back(std::move(track));
   }
-  if (version >= 2) {
-    Tag(input, "transitions");
-    for (auto count = Read<std::size_t>(input); count; --count) {
-      Tag(input, "transition");
-      TransitionInfo transition{{Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)},
-          {ReadRange(input), {Text(input), Text(input), Text(input)}, Read<float>(input), Read<bool>(input), {}}};
-      const auto key_count = Read<std::size_t>(input);
-      if (version >= 12 && Read<bool>(input))
-        transition.spec.animation = ResourceRef{Text(input), Text(input), Text(input)};
-      for (auto keys = key_count; keys; --keys) {
+  Tag(input, "transitions");
+  for (auto count = Read<std::size_t>(input); count; --count) {
+    Tag(input, "transition");
+    TransitionInstance transition{{Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)}, {Read<std::uint64_t>(input)},
+                                  {ReadRange(input)}};
+    const auto kind = Read<char>(input);
+    if (kind != 'm' && kind != 'p') throw std::runtime_error("Invalid transition effect");
+    auto resource = ReadResource(input);
+    if (kind == 'p') {
+      transition.spec.effect = PagTransitionSource{std::move(resource)};
+    } else {
+      MaskTransition mask{std::move(resource), Read<float>(input), Read<bool>(input)};
+      for (auto keys = Read<std::size_t>(input); keys; --keys) {
         Tag(input, "feather");
         const auto at = ReadTime(input);
         const auto value = Read<float>(input);
         const auto interpolation = Read<char>(input);
         if (interpolation != 'h' && interpolation != 'l') throw std::runtime_error("Invalid transition interpolation");
-        transition.spec.feather_keys.push_back({at, value, interpolation == 'h' ? Interpolation::Hold : Interpolation::Linear});
+        mask.feather_keys.push_back({at, value, interpolation == 'h' ? Interpolation::Hold : Interpolation::Linear});
       }
-      project.transitions.push_back(std::move(transition));
+      transition.spec.effect = std::move(mask);
     }
+    project.transitions.push_back(std::move(transition));
   }
-  if (version >= 13) {
-    Tag(input, "overlays");
-    for (auto count = Read<std::size_t>(input); count; --count) {
-      Tag(input, "overlay");
-      CanvasOverlay overlay{{Read<std::uint64_t>(input)}, static_cast<CanvasOverlayKind>(Read<unsigned>(input)),
-                            ReadRange(input), ReadRect(input), Text(input), {Text(input), Text(input), Text(input)}};
-      if (version >= 14) {
-        overlay.style = {ReadColor(input), ReadColor(input), Read<float>(input), {Text(input), Text(input), Text(input)}};
-        overlay.opacity = Read<float>(input);
-      }
-      if (version >= 15) overlay.rotation_degrees = Read<float>(input);
-      project.overlays.push_back(std::move(overlay));
-    }
+  Tag(input, "overlays");
+  for (auto count = Read<std::size_t>(input); count; --count) {
+    Tag(input, "overlay");
+    OverlayInstance overlay{{Read<std::uint64_t>(input)}, static_cast<CanvasOverlayKind>(Read<unsigned>(input)),
+                          ReadRange(input), ReadRect(input)};
+    overlay.content = ReadOverlayContent(input);
+    overlay.opacity = Read<float>(input);
+    overlay.rotation_degrees = Read<float>(input);
+    project.overlays.push_back(std::move(overlay));
   }
   Tag(input, "end");
   if ((input >> std::ws).peek() != std::char_traits<char>::eof()) throw std::runtime_error("Unexpected project data");

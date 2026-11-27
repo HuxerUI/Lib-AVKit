@@ -12,13 +12,9 @@ using namespace huxerui::avkit;
 
 bool HasWorkbenchMedia() { return false; }
 
-OverlayAssets LoadOverlayAssets(const Resources&) { return {}; }
+std::shared_ptr<const ResourceCatalog> LoadWorkbenchResources(const Resources&) { return {}; }
 
-Rect MeasureWorkbenchOverlay(const CanvasOverlay&, PixelSize, const OverlayAssets&) {
-  return {0, 0, 1, 1};
-}
-
-AssetReference ReadWorkbenchMusic(const File&, const File&, const ProjectSnapshot&) {
+AssetSource ReadWorkbenchMusic(const File&) {
   throw std::runtime_error("This build does not support timeline audio import");
 }
 
@@ -26,13 +22,10 @@ std::function<void()> ObserveWorkbenchMagnification(WindowHandle, std::function<
   return {};
 }
 
-AssetReference ReadWorkbenchMovie(const File&) {
+AssetSource ReadWorkbenchVisual(const File&) {
   throw std::logic_error("Video import is unavailable in this build");
 }
 
-AssetReference PrepareWorkbenchPhoto(Bitmap, const File&) {
-  throw std::logic_error("Photo import is unavailable in this build");
-}
 
 std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectSnapshot>, StripViewport) {
   return {};
@@ -40,7 +33,7 @@ std::shared_ptr<const StripResult> UseEditorStrip(std::shared_ptr<const ProjectS
 
 [[huxerui::composable]]
 View EditorMonitor(WorkbenchContext, std::shared_ptr<const ProjectSnapshot>, EditorTransport, bool wide, std::function<void()> back, std::function<void()>,
-                   EditorMonitorViews, std::function<std::optional<WorkbenchDrag>()>) {
+                   EditorMonitorViews, State<std::optional<WorkbenchFrame>>, std::function<std::optional<WorkbenchDrag>()>) {
   const auto& theme = UseTheme();
   return WorkbenchPanel(Column{
       wide ? View{} : WorkbenchCompactAction(Row{

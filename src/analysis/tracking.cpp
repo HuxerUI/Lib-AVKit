@@ -54,17 +54,17 @@ void ValidateWindow(const Model& model) {
   }
 }
 
-std::vector<TrackingDetection> Run(Model& model, AnalysisJob job, std::stop_token stop) {
-  auto completion = WaitForAnalysis<AnalysisCompletion>(std::move(job), stop, [&](auto request, auto token, auto done) {
+std::vector<LandmarkDetection> Run(Model& model, AnalysisJob job, std::stop_token stop) {
+  auto completion = WaitForAnalysis<LandmarkCompletion>(std::move(job), stop, [&](auto request, auto token, auto done) {
     model.session->Submit(std::move(request), token, std::move(done));
   });
   auto result = std::move(completion->result);
   if (!result.Succeeded())
     throw std::runtime_error(std::string("Analysis failed for ") + Name(model.config.capability) + ": " + result.Error());
-  return std::move(result).Value().value_or(std::vector<TrackingDetection>{});
+  return std::move(result).Value().value_or(std::vector<LandmarkDetection>{});
 }
 
-std::optional<Point> FindLandmark(const TrackedPoints& points, std::string_view name) {
+std::optional<Point> FindLandmark(const SubjectLandmarks& points, std::string_view name) {
   const auto it = std::ranges::find(points.points, name, &Landmark::name);
   if (it == points.points.end()) return std::nullopt;
   const auto confidence = it->confidence.value_or(1.0F);
@@ -82,7 +82,7 @@ std::string_view BodyPoint(TrackedPart part) {
   throw std::invalid_argument("Unknown tracked part");
 }
 
-std::optional<PartSample>& Part(PersonSample& person, TrackedPart part) {
+std::optional<TrackedPartSample>& Part(TrackedPersonSample& person, TrackedPart part) {
   switch (part) {
     case TrackedPart::Face: return person.face;
     case TrackedPart::LeftHand: return person.left_hand;
@@ -91,8 +91,8 @@ std::optional<PartSample>& Part(PersonSample& person, TrackedPart part) {
   throw std::invalid_argument("Unknown tracked part");
 }
 
-PartSample Freeze(FrameKey target, TrackedPoints points) {
-  return {target, std::make_shared<const TrackedPoints>(std::move(points))};
+TrackedPartSample Freeze(FrameKey target, SubjectLandmarks points) {
+  return {target, std::make_shared<const SubjectLandmarks>(std::move(points))};
 }
 
 bool MatchesRegion(Point point, std::span<const AnalysisRegion> regions, std::size_t index,
@@ -114,7 +114,7 @@ bool MatchesRegion(Point point, std::span<const AnalysisRegion> regions, std::si
   return std::ranges::none_of(regions, competes) && std::ranges::none_of(blockers, competes);
 }
 
-void SuppressHandSwitch(PersonSample& person, const PersonSample& previous) {
+void SuppressHandSwitch(TrackedPersonSample& person, const TrackedPersonSample& previous) {
   if (person.person != previous.person || Before({1, 16}, Difference(person.target.pts, previous.target.pts)) ||
       bool(person.left_hand) == bool(person.right_hand) || bool(previous.left_hand) == bool(previous.right_hand) ||
       bool(person.left_hand) == bool(previous.left_hand)) return;
@@ -128,13 +128,13 @@ void SuppressHandSwitch(PersonSample& person, const PersonSample& previous) {
 
 constexpr std::array kHands{TrackedPart::LeftHand, TrackedPart::RightHand};
 
-AnalysisRegion SearchRegion(const PersonSample& person, TrackedPart part, Point center, bool predicted,
+AnalysisRegion SearchRegion(const TrackedPersonSample& person, TrackedPart part, Point center, bool predicted,
                             std::optional<Point> forearm = {}) {
   const auto radius = predicted && !forearm ? Point{0.06F, 0.08F} : Point{0.08F, 0.10F};
   return {person.person, part, {center.x - radius.x, center.y - radius.y, 2 * radius.x, 2 * radius.y}, predicted, forearm};
 }
 
-std::optional<AnalysisRegion> ForearmRegion(const PersonSample& person, TrackedPart part, Point wrist) {
+std::optional<AnalysisRegion> ForearmRegion(const TrackedPersonSample& person, TrackedPart part, Point wrist) {
   const auto elbow = FindLandmark(*person.body->points, part == TrackedPart::LeftHand ? "left_elbow" : "right_elbow");
   if (!elbow) return std::nullopt;
   const auto direction = wrist - *elbow;
@@ -225,7 +225,7 @@ struct SourceTracking::Impl {
     return {source, generation, 0, pts};
   }
 
-  std::vector<TrackingDetection> Detect(Model& model, const VideoFrame& frame, FrameKey target, const ReadWindow& read,
+  std::vector<LandmarkDetection> Detect(Model& model, const VideoFrame& frame, FrameKey target, const ReadWindow& read,
                                         std::vector<AnalysisRegion> regions, std::stop_token stop) {
     if (model.config.uses_roi && regions.empty()) return {};
     AnalysisJob job{next_job++, target, {}, std::move(regions)};
@@ -247,13 +247,13 @@ struct SourceTracking::Impl {
   }
 
   void EstablishPeople(TrackingFrame& result, FrameKey target, AnalysisCapability capability,
-                       std::vector<TrackingDetection> detections) {
+                       std::vector<LandmarkDetection> detections) {
     for (auto& detection : detections) {
       const auto id = detection.landmarks.subject_id;
       if (detection.region || std::ranges::count_if(detections, [&](const auto& other) {
             return !other.region && other.landmarks.subject_id == id;
           }) != 1) continue;
-      auto& person = result.people.emplace_back(PersonSample{target, {id}});
+      auto& person = result.people.emplace_back(TrackedPersonSample{target, {id}});
       auto& part = capability == AnalysisCapability::BodyLandmarks ? person.body : person.face;
       part = Freeze(target, std::move(detection.landmarks));
     }
@@ -262,7 +262,7 @@ struct SourceTracking::Impl {
   void DeriveParts(TrackingFrame& result, const VideoFrame& frame, FrameKey target, Model& model,
                    const ReadWindow& read, std::stop_token stop) {
     std::vector<AnalysisRegion> regions;
-    std::vector<PersonSample*> owners;
+    std::vector<TrackedPersonSample*> owners;
     for (auto& person : result.people) {
       for (const auto part : parts) {
         if (Capability(part) != model.config.capability) continue;
@@ -279,7 +279,7 @@ struct SourceTracking::Impl {
     if (model.config.capability != AnalysisCapability::HandLandmarks || !Ordered()) return;
 
     std::vector<AnalysisRegion> retries;
-    std::vector<PersonSample*> retry_owners;
+    std::vector<TrackedPersonSample*> retry_owners;
     for (std::size_t i = 0; i < regions.size(); ++i) {
       auto& person = *owners[i];
       auto& region = regions[i];
@@ -303,7 +303,7 @@ struct SourceTracking::Impl {
   }
 
   std::vector<bool> DetectParts(const VideoFrame& frame, FrameKey target, Model& model, const ReadWindow& read,
-                                const std::vector<AnalysisRegion>& regions, const std::vector<PersonSample*>& owners,
+                                const std::vector<AnalysisRegion>& regions, const std::vector<TrackedPersonSample*>& owners,
                                 std::stop_token stop, std::span<const AnalysisRegion> blockers = {}) {
     auto matches = Detect(model, frame, target, read, regions, stop);
     std::vector<bool> ambiguous(regions.size());
@@ -324,7 +324,7 @@ struct SourceTracking::Impl {
     return ambiguous;
   }
 
-  std::optional<Point> PredictWrist(const PersonSample& person, TrackedPart part, std::optional<Point> body_wrist = {}) const {
+  std::optional<Point> PredictWrist(const TrackedPersonSample& person, TrackedPart part, std::optional<Point> body_wrist = {}) const {
     if (!hand_reference || hand_reference->person != person.person || hand_reference->end != person.target.pts ||
         Before({1, 12}, Difference(person.target.pts, hand_reference->target.pts))) return std::nullopt;
     const auto& wrist = hand_reference->wrists[part == TrackedPart::LeftHand ? 0 : 1];
@@ -341,7 +341,7 @@ struct SourceTracking::Impl {
     return center;
   }
 
-  void RememberHands(PersonSample& person, const VideoFrame& frame) {
+  void RememberHands(TrackedPersonSample& person, const VideoFrame& frame) {
     if (!person.body || (!person.left_hand && !person.right_hand) || !frame.duration) return;
     const auto head = FindLandmark(*person.body, "head");
     if (!head) return;
@@ -357,13 +357,13 @@ struct SourceTracking::Impl {
   }
 
   std::optional<PersonTrackId> SelectPrimary(const TrackingFrame& result) const {
-    const auto count = [&](const PersonSample& person) {
+    const auto count = [&](const TrackedPersonSample& person) {
       if (!person.body) return person.face && FindLandmark(*person.face, "face_center") ? std::ptrdiff_t{1} : 0;
       return std::ranges::count_if(parts, [&](auto part) {
         return FindLandmark(*person.body, BodyPoint(part)).has_value();
       });
     };
-    const auto best = std::ranges::min_element(result.people, {}, [&](const PersonSample& person) {
+    const auto best = std::ranges::min_element(result.people, {}, [&](const TrackedPersonSample& person) {
       return std::pair{-count(person), person.person.value};
     });
     return best != result.people.end() && count(*best) ? std::optional{best->person} : std::nullopt;
@@ -476,7 +476,7 @@ void SourceTracking::Reset() {
   if (!impl_->Ordered()) impl_->Reset();
 }
 
-std::optional<Point> FindLandmark(const PartSample& part, std::string_view name) {
+std::optional<Point> FindLandmark(const TrackedPartSample& part, std::string_view name) {
   return FindLandmark(*part.points, name);
 }
 

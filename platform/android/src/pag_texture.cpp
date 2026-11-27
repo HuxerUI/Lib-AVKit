@@ -1,5 +1,6 @@
-#include "animation/pag_frame_renderer.h"
+#include "render/pag/pag_frame_renderer.h"
 #include "render/bgfx/video_texture_internal.h"
+#include "render/texture_backing.h"
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -29,6 +30,7 @@ public:
       throw std::runtime_error("Cannot create the PAG offscreen EGL surface");
     }
   }
+
   ~PagEglContext() {
     eglDestroySurface(display, surface);
     eglDestroyContext(display, context);
@@ -47,6 +49,7 @@ public:
     if (!eglMakeCurrent(display_, target.surface, target.surface, target.context))
       throw std::runtime_error("Cannot bind the shared PAG EGL context");
   }
+
   ~CurrentEgl() {
     eglMakeCurrent(restore_ == EGL_NO_DISPLAY ? display_ : restore_, draw_, read_, context_);
   }
@@ -78,17 +81,13 @@ public:
     } catch (const std::runtime_error&) {}
   }
 
-  render::ColorSurface Draw(pag::PAGPlayer& player, PagOverlayStats* stats) override {
+  render::Texture Draw(pag::PAGPlayer& player) override {
     auto& slot = AcquireOutput();
     GLsync completed = nullptr;
-    using Clock = std::chrono::steady_clock;
-    Clock::time_point waiting;
     {
       CurrentEgl current(*egl_);
       player.setSurface(slot.drawable);
-      if (stats) ++stats->flushes;
       player.flush();
-      if (stats) waiting = Clock::now();
       completed = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
       if (completed) glFlush();
       else glFinish();
@@ -97,21 +96,22 @@ public:
       glWaitSync(completed, 0, GL_TIMEOUT_IGNORED);
       glDeleteSync(completed);
     }
-    if (stats) stats->gpu_sync += Clock::now() - waiting;
     return slot.texture;
   }
 
 private:
   struct OutputSlot {
-    render::ColorSurface texture;
+    render::Texture texture;
     std::shared_ptr<pag::PAGSurface> drawable;
   };
 
   OutputSlot& AcquireOutput() {
-    const auto existing = std::ranges::find_if(slots_, [](const auto& slot) { return slot.texture.pixels.storage.use_count() == 1; });
+    const auto existing = std::ranges::find_if(slots_, [](const auto& slot) {
+      return TextureAccess::Backing(slot.texture).use_count() == 1;
+    });
     if (existing != slots_.end()) return *existing;
     auto surface = render::detail::CreateBgfxInteropTexture(backend_, {size_, render::PixelFormat::Rgba8Unorm});
-    const auto name = static_cast<GLuint>(render::detail::GetBgfxInteropTexture(backend_, surface.pixels));
+    const auto name = static_cast<GLuint>(render::detail::GetBgfxInteropTexture(backend_, surface));
     if (!name) throw std::runtime_error("Cannot allocate the Android PAG render texture");
     CurrentEgl current(*egl_);
     const pag::BackendTexture texture({name, GL_TEXTURE_2D, GL_RGBA8}, int(size_.width), int(size_.height));

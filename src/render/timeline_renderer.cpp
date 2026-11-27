@@ -1,12 +1,20 @@
-#include <huxerui/avkit/timeline_renderer.h>
+#include "render/pag/pag_overlay_renderer.h"
+#include "render/pag/pag_transition.h"
+#include "render/render_passes.h"
+#include "media/timeline_internal.h"
 
-#include "render/bgfx/timing.h"
+#include <huxerui/avkit/resource_catalog.h>
+#include <huxerui/avkit/timeline.h>
+#include "render/bgfx/backend.h"
+
+#include "render/bgfx/render_lease.h"
+#include "render/bgfx/video_texture_internal.h"
+#include "support/cancellation.h"
 
 #include <algorithm>
-#include <map>
+#include <list>
 #include <span>
 #include <stdexcept>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -14,6 +22,9 @@ namespace huxerui::avkit::render {
 namespace {
 
 using namespace media;
+using detail::PassImageSlot;
+using detail::PassRequest;
+using detail::RenderPasses;
 
 void Check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
@@ -24,224 +35,173 @@ template<class T, class E> T Require(Result<T, E> result) {
   return std::move(result).Value();
 }
 
-void CheckMask(const ImageSurface& surface) {
-  Check(surface.storage && surface.image.format == PixelFormat::R8Unorm &&
-        surface.image.size.width && surface.image.size.height, "Expected a nonempty R8Unorm mask");
-}
-
-struct ResourceLess {
-  bool operator()(const ResourceRef& a, const ResourceRef& b) const {
-    return std::tie(a.pack, a.revision, a.key) < std::tie(b.pack, b.revision, b.key);
-  }
-};
-
-template<class T> using ResourceCache = std::map<ResourceRef, T, ResourceLess>;
-
-template<class T, class Resolver>
-T& Resolve(ResourceCache<T>& cache, const Resolver& resolve, const ResourceRef& resource) {
-  const auto item = cache.lower_bound(resource);
-  if (item != cache.end() && item->first == resource) return item->second;
-  return cache.emplace_hint(item, resource, resolve(resource))->second;
-}
-
 } // namespace
 
 struct TimelineRenderer::Impl {
-  Impl(ImageDesc target, std::unique_ptr<RenderBackend> backend, TimelineRenderResources resources)
-      : target_(target), backend_(std::move(backend)), resources_(std::move(resources)),
-        overlays_(*backend_, std::move(resources_.overlays)) {}
+  Impl(ImageInfo target, std::unique_ptr<RenderBackend> backend)
+      : target_(target), backend_(std::move(backend)) {}
 
-  ImportedVideoFrame ImportFrame(const VideoFrame& frame) {
-    const bool platform = frame.Storage() == VideoStorage::Platform;
-    auto result = ImportDecodedBgfxFrame(*backend_, frame, {target_.size.width, target_.size.height},
-        platform ? TextureTransferPolicy::GpuOnly : TextureTransferPolicy::AllowCpuTransfer);
-    if (!result.Succeeded() && platform && result.Error().code == RenderErrorCode::Unsupported) {
-      throw PlatformVideoImportError(result.Error().message);
+  Texture Draw(const TimelineFrame& frame, std::span<avkit::detail::TargetLayoutEntry> layouts) {
+    if (!frame.plan) throw std::invalid_argument("A timeline render plan is required");
+    if (frame.plan->target != target_) throw std::invalid_argument("The render plan target does not match the compositor");
+    auto compiled = detail::CompileRenderPasses(*frame.plan);
+    const bool pag_transition = std::ranges::any_of(compiled.passes.offscreen_passes, [](const auto& pass) {
+      return pass.pag.has_value();
+    });
+    UseResources(frame.plan->resources);
+    if (!overlays_) overlays_ = std::make_unique<avkit::detail::PagOverlayRenderer>(*backend_, resources_.get());
+    std::vector<Texture> images(compiled.images.size());
+    for (std::size_t index = 0; index < compiled.images.size(); ++index) {
+      if (const auto* image = dynamic_cast<const ImageNode*>(compiled.images[index]))
+        images[index] = PrepareTexture(image->pixels);
+      else if (const auto* texture = dynamic_cast<const TextureNode*>(compiled.images[index]))
+        images[index] = texture->texture;
     }
-    return Require(std::move(result));
-  }
-
-  ColorSurface Draw(const TimelineFrame& frame, const TimelineRenderOptions& options) {
-    if (options.transition) *options.transition = {};
-    auto data = frame.analysis_masks;
-    data.reserve(data.size() + frame.depth_maps.size() + frame.static_masks.size() + frame.animated_masks.size() + frame.masks.size());
-    data.insert(data.end(), frame.depth_maps.begin(), frame.depth_maps.end());
-    for (const auto& resource : frame.static_masks) data.push_back(StaticMaskTexture(resource));
-    for (const auto& sample : frame.animated_masks) data.push_back(AnimatedMaskTexture(sample));
-    for (const auto& sample : frame.masks) data.push_back(TransitionMaskTexture(sample));
-    auto request = overlays_.Prepare(frame, [&](std::size_t slot) {
-      const auto& input = frame.inputs.at(slot);
-      if (const auto* picture = std::get_if<VideoFrame>(&input)) return ImportFrame(*picture).surface;
-      if (const auto* surface = std::get_if<ColorSurface>(&input)) return *surface;
-      if (const auto* resource = std::get_if<ResourceRef>(&input)) {
-        if (!resources_.sticker) throw std::runtime_error("No resolver for the sticker " + resource->key);
-        return Resolve(stickers_, resources_.sticker, *resource);
-      }
-      throw std::runtime_error("The timeline color input is unavailable");
-    }, std::move(data), options.overlays, options.batch_overlays);
-    if (!frame.transition_animations.empty()) {
-      return DrawPagTransitions(frame, std::move(request), options.transition);
+    std::vector<Texture> data;
+    data.reserve(compiled.data.size());
+    for (const auto& input : compiled.data) {
+      if (const auto* pixels = std::get_if<ImagePixels>(&input)) data.push_back(PrepareTexture(*pixels));
+      else data.push_back(std::get<Texture>(input));
     }
-    return Render(request);
+    auto request = overlays_->Prepare(std::move(compiled.passes), compiled.images,
+                                      std::move(images), std::move(data), layouts);
+    if (pag_transition) return DrawPagTransitions(std::move(request));
+    return RenderPassRequest(CompactImageInputs(std::move(request)));
   }
 
 private:
-  using Clock = std::chrono::steady_clock;
-
-  static std::vector<ColorSurface> CompactColorInputs(RenderPlan& plan, std::span<const ColorSurface> inputs) {
-    const auto visit_slots = [&](const auto& visit) {
-      const auto visit_draw = [&](render::Draw& draw) {
-        visit(draw.input_slot);
-        if (draw.masked_blend) visit(draw.masked_blend->incoming_slot);
-      };
-      for (auto& pass : plan.subcompositions)
-        for (auto& draw : pass.draws) visit_draw(draw);
-      for (auto& draw : plan.draws) visit_draw(draw);
-    };
-    std::vector<bool> used(inputs.size());
-    visit_slots([&](std::uint32_t slot) {
-      if (slot < inputs.size()) used[slot] = true;
-    });
-    std::vector<std::uint32_t> slots(inputs.size());
-    std::vector<ColorSurface> retained;
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-      if (!used[i]) continue;
-      slots[i] = static_cast<std::uint32_t>(retained.size());
-      retained.push_back(inputs[i]);
+  Texture PrepareTexture(const ImagePixels& pixels) {
+    const auto found = std::ranges::find(uploaded_, pixels, &std::pair<ImagePixels, Texture>::first);
+    if (found != uploaded_.end()) {
+      uploaded_.splice(uploaded_.begin(), uploaded_, found);
+      return uploaded_.front().second;
     }
-    visit_slots([&](std::uint32_t& slot) {
-      slot = slot < inputs.size() ? slots[slot] : static_cast<std::uint32_t>(retained.size() + slot - inputs.size());
-    });
-    return retained;
+    // Keep recent upload leases by retained pixel identity, including a single oversized input.
+    constexpr std::size_t kUploadCacheBytes = 64 * 1024 * 1024;
+    const auto bytes = pixels.bytes.AsBytes().size();
+    const auto remaining = kUploadCacheBytes - std::min(bytes, kUploadCacheBytes);
+    while (!uploaded_.empty() && (uploaded_.size() >= 32 || uploaded_bytes_ > remaining)) {
+      uploaded_bytes_ -= uploaded_.back().first.bytes.AsBytes().size();
+      uploaded_.pop_back();
+    }
+    auto texture = Require(backend_->UploadTexture(pixels));
+    uploaded_.emplace_front(pixels, texture);
+    uploaded_bytes_ += bytes;
+    return texture;
   }
 
-  ColorSurface RenderTransitionSide(const RenderPlan& plan, std::uint32_t pass, const std::vector<ColorSurface>& inputs,
-                                    const std::vector<ImageSurface>& data) {
-    auto side = std::make_shared<RenderPlan>(RenderPlan{plan.target, plan.subcompositions.at(pass).draws});
-    auto used = CompactColorInputs(*side, inputs);
-    return Render({std::move(side), std::move(used), data});
-  }
-
-  ColorSurface DrawPagTransitions(const TimelineFrame& frame, RenderRequest request, PagTransitionRenderTiming* timing) {
-    const auto& source = *request.plan;
-    auto& inputs = request.inputs;
-    const auto& data = request.data_inputs;
-    auto final = std::make_shared<RenderPlan>(RenderPlan{source.target, source.draws});
-    const auto external_slots = inputs.size();
-    std::vector<std::optional<std::uint32_t>> slots(source.subcompositions.size());
-    for (const auto& sample : frame.transition_animations) {
-      const auto [from, to] = std::pair{sample.outgoing_pass, sample.incoming_pass};
-      Check(from != to && !slots.at(from) && !slots.at(to), "Expected two independent transition passes");
-      auto& transition = pag_transitions_[sample.instance.value];
-      if (!transition.animation || transition.resource != sample.resource) {
-        if (!resources_.pag_transition) throw std::runtime_error("No resolver for the PAG transition " + sample.resource.key);
-        auto asset = resources_.pag_transition(sample.resource);
-        transition = {sample.resource, std::make_unique<PagTransition>(std::move(asset.encoded), target_.size,
-                                                                      asset.outgoing_index, asset.incoming_index)};
-      }
-      const auto started = timing ? Clock::now() : Clock::time_point{};
-      const auto outgoing = RenderTransitionSide(source, from, inputs, data);
-      const auto incoming = RenderTransitionSide(source, to, inputs, data);
-      if (timing) timing->prepare_sides += Clock::now() - started;
-      slots[from] = slots[to] = static_cast<std::uint32_t>(inputs.size());
-      PagTransitionTiming stage;
-      inputs.push_back(transition.animation->Sample(sample.offset, sample.duration, outgoing, incoming, timing ? &stage : nullptr));
-      if (timing) {
-        timing->pag.stage_inputs += stage.stage_inputs;
-        timing->pag.bind_images += stage.bind_images;
-        timing->pag.flush += stage.flush;
-        timing->pag.wait_for_output += stage.wait_for_output;
-      }
-    }
-    for (std::size_t pass = 0; pass < slots.size(); ++pass) {
-      if (slots[pass]) continue;
-      slots[pass] = static_cast<std::uint32_t>(inputs.size() + final->subcompositions.size());
-      final->subcompositions.push_back(source.subcompositions[pass]);
-    }
-    const auto remap = [&](std::uint32_t& slot) {
-      if (slot >= external_slots) slot = *slots.at(slot - external_slots);
-    };
-    for (auto& draw : final->draws) {
-      remap(draw.input_slot);
-      if (draw.masked_blend) remap(draw.masked_blend->incoming_slot);
-    }
-    std::erase_if(pag_transitions_, [&](const auto& entry) {
-      return std::ranges::none_of(frame.transition_animations, [&](const auto& sample) {
-        return sample.instance.value == entry.first;
+  static PassRequest CompactImageInputs(PassRequest request) {
+    std::vector<bool> used(request.image_inputs.size());
+    detail::VisitDrawLists(*request.plan, [&](auto draws) {
+      detail::VisitImageSlots(draws, [&](PassImageSlot slot) {
+        if (slot.IsInput()) used.at(slot.index) = true;
       });
     });
-    auto used = CompactColorInputs(*final, inputs);
-    return Render({std::move(final), std::move(used), data}, timing);
-  }
-
-  const ImageSurface& StaticMaskTexture(const ResourceRef& resource) {
-    return Resolve(static_masks_, [&](const auto& ref) {
-      if (!resources_.static_mask) throw std::runtime_error("No resolver for the static mask " + ref.key);
-      auto surface = resources_.static_mask(ref);
-      CheckMask(surface);
-      return surface;
-    }, resource);
-  }
-
-  struct ResolvedMaskSequence {
-    MaskSequence source;
-    std::optional<ImageDesc> image;
-    std::unordered_map<std::uint32_t, ImageSurface> frames;
-
-    const ImageSurface& Frame(std::uint32_t index) {
-      if (const auto item = frames.find(index); item != frames.end()) return item->second;
-      auto frame = source.frame(index);
-      CheckMask(frame);
-      Check(!image || frame.image == *image, "Mask sequence frame dimensions differ");
-      image = frame.image;
-      return frames.emplace(index, std::move(frame)).first->second;
+    if (std::ranges::all_of(used, [](bool present) { return present; })) return request;
+    std::vector<std::uint32_t> slots(used.size());
+    std::vector<Texture> retained;
+    for (std::size_t index = 0; index < used.size(); ++index) {
+      if (!used[index]) continue;
+      slots[index] = static_cast<std::uint32_t>(retained.size());
+      retained.push_back(std::move(request.image_inputs[index]));
     }
-  };
-
-  ResolvedMaskSequence& Sequence(const ResourceRef& resource) {
-    return Resolve(mask_sequences_, [&](const auto& ref) {
-      if (!resources_.mask_sequence) throw std::runtime_error("No resolver for the mask sequence " + ref.key);
-      auto sequence = resources_.mask_sequence(ref);
-      Check(sequence.frame_count && sequence.frame, "A mask sequence needs at least one resolvable frame");
-      return ResolvedMaskSequence{std::move(sequence)};
-    }, resource);
+    auto plan = std::make_shared<RenderPasses>(*request.plan);
+    detail::VisitDrawLists(*plan, [&](auto draws) {
+      detail::VisitImageSlots(draws, [&](PassImageSlot& slot) {
+        if (slot.IsInput()) slot.index = slots[slot.index];
+      });
+    });
+    return {std::move(plan), std::move(retained), std::move(request.data_inputs)};
   }
 
-  const ImageSurface& TransitionMaskTexture(const TransitionMaskSample& sample) {
-    auto& sequence = Sequence(sample.resource);
-    return sequence.Frame(sample.FrameIndex(sequence.source.frame_count));
+  static PassRequest SelectPasses(const PassRequest& request, std::span<const detail::Draw> draws,
+                                  std::span<const std::optional<PassImageSlot>> replacements) {
+    const auto& source = *request.plan;
+    auto plan = std::make_shared<RenderPasses>();
+    plan->target = source.target;
+    std::vector<std::optional<PassImageSlot>> selected(source.offscreen_passes.size());
+    const auto remap = [&](const auto& self, PassImageSlot& slot) -> void {
+      if (slot.IsInput()) return;
+      if (const auto& replacement = replacements[slot.index]) {
+        slot = *replacement;
+        return;
+      }
+      auto& moved = selected[slot.index];
+      if (!moved) {
+        auto pass = source.offscreen_passes.at(slot.index);
+        Check(!pass.pag, "A referenced PAG transition has not been evaluated");
+        detail::VisitImageSlots(std::span(pass.draws), [&](PassImageSlot& child) { self(self, child); });
+        moved = PassImageSlot::PassOutput(static_cast<std::uint32_t>(plan->offscreen_passes.size()));
+        plan->offscreen_passes.push_back(std::move(pass));
+      }
+      slot = *moved;
+    };
+    plan->final_draws.assign(draws.begin(), draws.end());
+    detail::VisitImageSlots(std::span(plan->final_draws), [&](PassImageSlot& slot) { remap(remap, slot); });
+    return CompactImageInputs({std::move(plan), request.image_inputs, request.data_inputs});
   }
 
-  const ImageSurface& AnimatedMaskTexture(const AnimatedMaskSample& sample) {
-    auto& sequence = Sequence(sample.resource);
-    return sequence.Frame(sample.FrameIndex(sequence.source.frame_interval, sequence.source.frame_count));
+  Texture DrawPagTransitions(PassRequest request) {
+    const auto& source = *request.plan;
+    std::vector<std::optional<PassImageSlot>> slots(source.offscreen_passes.size());
+    for (std::size_t index = 0; index < source.offscreen_passes.size(); ++index) {
+      const auto& pass = source.offscreen_passes[index];
+      if (!pass.pag) continue;
+      const auto& sample = *pass.pag;
+      auto& transition = pag_transitions_[sample.instance.value];
+      if (!transition.animation || transition.resource != sample.resource) {
+        transition = {sample.resource, std::make_unique<PagTransition>(sample.resource, Catalog(), target_.size)};
+      }
+      const auto render_side = [&](std::uint32_t side) {
+        return RenderPassRequest(SelectPasses(request, source.offscreen_passes.at(side).draws, slots));
+      };
+      const auto outgoing = render_side(sample.outgoing_pass);
+      const auto incoming = render_side(sample.incoming_pass);
+      slots[index] = PassImageSlot::Input(static_cast<std::uint32_t>(request.image_inputs.size()));
+      request.image_inputs.push_back(transition.animation->Sample(sample.offset, sample.duration, outgoing, incoming));
+    }
+    std::erase_if(pag_transitions_, [&](const auto& entry) {
+      return std::ranges::none_of(source.offscreen_passes, [&](const auto& pass) {
+        return pass.pag && pass.pag->instance.value == entry.first;
+      });
+    });
+    return RenderPassRequest(SelectPasses(request, source.final_draws, slots));
   }
 
-public:
-  ColorSurface Render(const RenderRequest& request, PagTransitionRenderTiming* timing = nullptr) {
-    const auto start = timing ? Clock::now() : Clock::time_point{};
-    auto ticket = Require(backend_->TrySubmit(request));
+  const ResourceCatalog& Catalog() const {
+    if (!resources_) throw std::invalid_argument("A packaged input needs the frame resource catalog");
+    return *resources_;
+  }
+
+  void UseResources(const std::shared_ptr<const ResourceCatalog>& resources) {
+    if (resources_ == resources) return;
+    overlays_.reset();
+    pag_transitions_.clear();
+    resources_ = resources;
+  }
+
+  Texture RenderPassRequest(const PassRequest& request) {
+    auto ticket = Require(detail::SubmitBgfxPasses(*backend_, request));
     Check(ticket.has_value(), "The composition target is busy");
-    if (timing) timing->enqueue_upload = render::detail::PumpBgfxWithUploadTiming(*backend_);
-    else backend_->Pump();
+    backend_->Pump();
     auto output = Require(backend_->TryTake(*ticket));
     Check(output.has_value(), "The composition target did not finish");
-    if (timing) timing->complete_output = Clock::now() - start;
     return std::move(*output);
   }
 
-  VideoFrame EncoderFrame(const ColorSurface& output, const VideoEncoderConfig& config, MediaTimestamp pts,
+public:
+  VideoFrame EncoderFrame(const Texture& output, const VideoEncoderConfig& config, MediaTimestamp pts,
                           std::optional<MediaTimestamp> duration) {
     auto picture = MakeBgfxEncoderFrame(*backend_, output, config, pts, duration);
     if (!picture.Succeeded() && config.input_storage == VideoStorage::Platform &&
         picture.Error().code == RenderErrorCode::Unsupported) {
-      throw PlatformVideoTransferError(picture.Error().message);
+      throw PlatformEncoderInputError(picture.Error().message);
     }
     return Require(std::move(picture));
   }
 
-  ImageDesc target_;
-  std::unique_ptr<RenderBackend> backend_;
+  ImageInfo target_;
+  std::shared_ptr<RenderBackend> backend_;
 
 private:
   struct Transition {
@@ -249,35 +209,83 @@ private:
     std::unique_ptr<PagTransition> animation;
   };
 
-  TimelineRenderResources resources_;
-  PagOverlayRenderer overlays_;
-  ResourceCache<ColorSurface> stickers_;
-  ResourceCache<ImageSurface> static_masks_;
-  ResourceCache<ResolvedMaskSequence> mask_sequences_;
+  std::shared_ptr<const ResourceCatalog> resources_;
+  std::unique_ptr<avkit::detail::PagOverlayRenderer> overlays_;
+  std::list<std::pair<ImagePixels, Texture>> uploaded_;
+  std::size_t uploaded_bytes_{};
   std::unordered_map<std::uint64_t, Transition> pag_transitions_;
 };
 
-TimelineRenderer::TimelineRenderer(ImageDesc target, std::unique_ptr<RenderBackend> backend,
-                                   TimelineRenderResources resources) {
-  if (!backend) throw std::invalid_argument("A timeline renderer needs a bgfx backend");
-  impl_ = std::make_unique<Impl>(target, std::move(backend), std::move(resources));
+std::unique_ptr<TimelineRenderer> TimelineRenderer::Open(ImageInfo target, std::stop_token stop, RenderPlatformHandles platform) {
+  auto backend = detail::OpenBgfxBackend(target, platform, stop);
+  if (!backend) return {};
+  auto impl = std::make_unique<Impl>(target, std::move(backend));
+  if (stop.stop_requested()) return {};
+  return std::unique_ptr<TimelineRenderer>(new TimelineRenderer(std::move(impl)));
 }
+
+TimelineRenderer::TimelineRenderer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
 TimelineRenderer::~TimelineRenderer() = default;
 
-RenderBackend& TimelineRenderer::Backend() { return *impl_->backend_; }
-PixelFormat TimelineRenderer::Format() const { return impl_->target_.format; }
-
-ImportedVideoFrame TimelineRenderer::ImportFrame(const VideoFrame& input) { return impl_->ImportFrame(input); }
-
-ColorSurface TimelineRenderer::Draw(const TimelineFrame& frame, const TimelineRenderOptions& options) {
-  return impl_->Draw(frame, options);
+std::unique_ptr<TimelineSession> TimelineRenderer::OpenTimeline(std::shared_ptr<const ProjectSnapshot> project,
+    CodecProviders providers, CodecPolicy policy, SceneConfiguration scene, OnCodecFallback fallback) const {
+  return avkit::detail::TimelineSessionAccess::Open(std::move(project), std::move(providers), policy,
+      scene, std::move(fallback), impl_->backend_, impl_->target_);
 }
 
-ColorSurface TimelineRenderer::Render(const RenderRequest& request) { return impl_->Render(request); }
+PixelFormat TimelineRenderer::Format() const { return impl_->target_.format; }
 
-VideoFrame TimelineRenderer::EncoderFrame(const ColorSurface& output, const VideoEncoderConfig& config,
+Texture TimelineRenderer::ImportTexture(const ExternalTexture& texture) {
+  return Require(impl_->backend_->ImportTexture(texture));
+}
+
+Texture TimelineRenderer::UploadTexture(const ImagePixels& pixels) {
+  return Require(impl_->backend_->UploadTexture(pixels));
+}
+
+Texture TimelineRenderer::Draw(const TimelineFrame& frame) {
+  return impl_->Draw(frame, {});
+}
+
+Texture TimelineRenderer::Draw(const TimelineFrame& frame, std::vector<avkit::detail::TargetLayoutEntry>& layouts) {
+  return impl_->Draw(frame, layouts);
+}
+
+Result<PreviewFrameCommit, RenderError> TimelineRenderer::PreparePreview(PreviewTexture& preview,
+                                                                        const Texture& output) {
+  return preview.Prepare(*impl_->backend_, output);
+}
+
+Result<void, RenderError> TimelineRenderer::PublishPreview(PreviewTexture& preview, const Texture& output) {
+  return preview.Publish(*impl_->backend_, output);
+}
+
+VideoFrame TimelineRenderer::EncoderFrame(const Texture& output, const VideoEncoderConfig& config,
                                           MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
   return impl_->EncoderFrame(output, config, pts, duration);
+}
+
+void ExportRenderedTimeline(TimelineRenderer& renderer, std::shared_ptr<const ProjectSnapshot> project,
+    const File& destination, const CodecProviders& providers, const FileExportSettings& settings,
+    const TimelineExportOptions& options) {
+  avkit::detail::ExportTimeline(std::move(project), destination, providers, settings,
+      renderer.impl_->backend_, renderer.impl_->target_,
+      [&](const TimelineFrame& frame, const VideoEncoderConfig& config, MediaTimestamp duration) {
+        avkit::detail::CheckCancelled(options.stop);
+        std::optional<VideoFrame> output;
+        const auto iteration = [&] {
+          output = renderer.EncoderFrame(renderer.Draw(frame), config, frame.pts, duration);
+          if (options.on_video_transfer) options.on_video_transfer(CodecOperation::VideoEncode, *output);
+          if (options.on_frame) options.on_frame(frame.pts);
+          return false;
+        };
+        if (options.scope) options.scope(iteration);
+        else iteration();
+        avkit::detail::CheckCancelled(options.stop);
+        if (!output) throw std::runtime_error("The export iteration did not render a frame");
+        return std::move(*output);
+      }, options);
 }
 
 } // namespace huxerui::avkit::render

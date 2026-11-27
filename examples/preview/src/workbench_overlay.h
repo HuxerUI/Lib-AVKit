@@ -1,23 +1,15 @@
 #pragma once
 
-#include <huxerui/avkit/pag.h>
+#include <huxerui/avkit/resource_catalog.h>
 #include <huxerui/avkit/timeline.h>
 #include <huxerui/resource.h>
 
 #include "app_resources.h"
 
 #include <array>
+#include <utility>
 
 namespace avkit_preview {
-
-inline constexpr std::size_t kPreviewWipeFrameCount = 8;
-
-struct OverlayAssets {
-  std::array<huxerui::BufferReference, 4> stickers;
-  huxerui::BufferReference editable, point_text, font, replacement_image, transition;
-  std::array<huxerui::BufferReference, kPreviewWipeFrameCount> wipe_masks;
-  std::array<huxerui::BufferReference, 3> clip_masks;
-};
 
 struct WorkbenchSticker {
   const char* key;
@@ -33,11 +25,21 @@ inline const std::array kWorkbenchStickers{
     WorkbenchSticker{"pag-arrow", "箭头", app::raw::stickers_arrow_pag, app::images::stickers_arrow, 1.0F},
     WorkbenchSticker{"pag-circle", "手绘圈", app::raw::stickers_circle_pag, app::images::stickers_circle, 1.0F},
 };
-OverlayAssets LoadOverlayAssets(const huxerui::Resources& resources);
-huxerui::avkit::CanvasOverlay CaptureSticker(huxerui::avkit::PixelSize canvas);
-huxerui::Rect MeasureWorkbenchOverlay(const huxerui::avkit::CanvasOverlay& overlay,
-                                     huxerui::avkit::PixelSize canvas, const OverlayAssets& assets);
 
-huxerui::avkit::PagOverlayResources WorkbenchPagResources(OverlayAssets assets);
+/// @brief Registers the example's packaged assets and shares the catalog with media workers.
+/// @param resources SDK service used to obtain the packaged raw asset handles.
+std::shared_ptr<const huxerui::avkit::ResourceCatalog> LoadWorkbenchResources(const huxerui::Resources& resources);
+
+inline const huxerui::avkit::ResourceRef kPreviewPointTextResource{"point-text"};
+inline constexpr auto kPreviewPointTextSlot = "text";
+
+/// @brief Authors a title using the workbench's packaged PAG master.
+/// @param text Replacement for the master's named text slot.
+inline huxerui::avkit::PagOverlay PreviewPointText(std::string text) {
+  return {kPreviewPointTextResource, {{{kPreviewPointTextSlot, std::move(text)}}},
+          huxerui::avkit::AnimationPlayback::HoldLast};
+}
+
+huxerui::avkit::OverlayInstance CaptureSticker(huxerui::avkit::PixelSize canvas);
 
 } // namespace avkit_preview

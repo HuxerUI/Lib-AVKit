@@ -22,6 +22,7 @@ CodecNegotiation Negotiation(const VideoEncoderConfig& config) {
 }
 
 CodecNegotiation Negotiation(const AudioDecoderConfig&) { return {CodecImplementation::Unknown, std::nullopt}; }
+
 CodecNegotiation Negotiation(const AudioEncoderConfig&) { return {CodecImplementation::Unknown, std::nullopt}; }
 
 template<class Codec, class Config>
@@ -51,9 +52,13 @@ public:
       : codec_(std::move(codec)), negotiation_(negotiation) {}
 
   CodecNegotiation Negotiated() const noexcept override { return negotiation_; }
+
   CodecResult<SubmitStatus> TrySubmit(const typename Session::Input& input) override { return codec_.TrySubmit(input); }
+
   CodecResult<std::optional<typename Session::Output>> TryRead() override { return codec_.TryRead(); }
+
   CodecResult<void> FinishInput() override { return codec_.Finish(); }
+
   void Close() noexcept override { codec_.Close(); }
 
 private:
@@ -76,24 +81,31 @@ public:
   CodecResult<CodecNegotiation> Probe(const VideoDecoderConfig& config) const override {
     return ProbeCodec<VideoDecoder>(config);
   }
+
   CodecResult<CodecNegotiation> Probe(const VideoEncoderConfig& config) const override {
     return ProbeCodec<VideoEncoder>(config);
   }
+
   CodecResult<CodecNegotiation> Probe(const AudioDecoderConfig& config) const override {
     return ProbeCodec<AudioDecoder>(config);
   }
+
   CodecResult<CodecNegotiation> Probe(const AudioEncoderConfig& config) const override {
     return ProbeCodec<AudioEncoder>(config);
   }
+
   CodecResult<std::unique_ptr<VideoDecoderSession>> Open(const VideoDecoderConfig& config) const override {
     return OpenCodec<VideoDecoder, VideoDecoderSession>(config);
   }
+
   CodecResult<std::unique_ptr<VideoEncoderSession>> Open(const VideoEncoderConfig& config) const override {
     return OpenCodec<VideoEncoder, VideoEncoderSession>(config);
   }
+
   CodecResult<std::unique_ptr<AudioDecoderSession>> Open(const AudioDecoderConfig& config) const override {
     return OpenCodec<AudioDecoder, AudioDecoderSession>(config);
   }
+
   CodecResult<std::unique_ptr<AudioEncoderSession>> Open(const AudioEncoderConfig& config) const override {
     return OpenCodec<AudioEncoder, AudioEncoderSession>(config);
   }

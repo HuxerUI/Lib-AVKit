@@ -10,6 +10,7 @@ namespace {
 
 struct PublicationTexture {
   explicit PublicationTexture(PixelSize size) : name(AllocateRgba(size)) {}
+
   ~PublicationTexture() { glDeleteTextures(1, &name); }
   const GLuint name;
 };
@@ -30,12 +31,12 @@ void CopyIntoPublicationTexture(GLuint source, GLuint destination, PixelSize siz
   if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot copy the composite for EGL publication");
 }
 
-void PublishGlFrame(android::GlTexture& mailbox, GLuint name, const ColorSurface& surface) {
-  const auto size = surface.pixels.image.size;
+void PublishGlFrame(android::GlTexture& mailbox, GLuint name, const Texture& surface) {
+  const auto size = surface.Info().size;
   using Origin = android::GlTexture::Origin;
   android::GlTexture::Frame frame{.texture_name = name, .pixel_width = static_cast<int>(size.width),
       .pixel_height = static_cast<int>(size.height),
-      .origin = surface.pixels.origin == RowOrigin::TopLeft ? Origin::TopLeft : Origin::BottomLeft,
+      .origin = surface.Origin() == RowOrigin::TopLeft ? Origin::TopLeft : Origin::BottomLeft,
       .alpha = android::GlTexture::Alpha::Premultiplied};
   try {
     mailbox.PublishCurrent(frame);
@@ -48,16 +49,17 @@ void PublishGlFrame(android::GlTexture& mailbox, GLuint name, const ColorSurface
   }
 }
 
-class GlPreviewTexture final : public BgfxPreviewTexture {
+class GlPreviewTexture final : public PreviewTexture {
 public:
   explicit GlPreviewTexture(PixelSize size)
       : texture_(std::make_shared<android::GlTexture>(Size{float(size.width), float(size.height)})) {}
 
   std::shared_ptr<ExternalTexture> Texture() const override { return texture_; }
+
   void Finish() noexcept override { texture_->Finish(); }
 
-  void PublishFrame(const ColorSurface& surface) override {
-    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+  void PublishFrame(const render::Texture& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(TextureAccess::Backing(surface).get());
     if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
     PublishGlFrame(*texture_, storage->name->texture, surface);
   }
@@ -66,26 +68,27 @@ private:
   std::shared_ptr<android::GlTexture> texture_;
 };
 
-class CanvasPreviewTexture final : public BgfxPreviewTexture {
+class CanvasPreviewTexture final : public PreviewTexture {
 public:
   CanvasPreviewTexture(PixelSize size, JavaVM* vm)
       : texture_(std::make_shared<android::BitmapTexture>(Size{float(size.width), float(size.height)})), vm_(vm) {}
 
   std::shared_ptr<ExternalTexture> Texture() const override { return texture_; }
+
   void Finish() noexcept override { texture_->Finish(); }
 
 private:
-  PreviewFrameCommit PrepareFrame(const ColorSurface& surface) override {
-    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+  PreviewFrameCommit PrepareFrame(const render::Texture& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(TextureAccess::Backing(surface).get());
     if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
-    return PrepareAndroidCanvasTexture(texture_, vm_, storage->name->texture, surface.pixels.image.size,
-                                       surface.pixels.origin);
+    return PrepareAndroidCanvasTexture(texture_, vm_, storage->name->texture, surface.Info().size,
+                                       surface.Origin());
   }
 
-  void PublishFrame(const ColorSurface& surface) override {
-    const auto* storage = dynamic_cast<const GlStorage*>(surface.pixels.storage.get());
+  void PublishFrame(const render::Texture& surface) override {
+    const auto* storage = dynamic_cast<const GlStorage*>(TextureAccess::Backing(surface).get());
     if (!storage) throw std::invalid_argument("Expected a completed GLES render target");
-    PublishAndroidCanvasTexture(*texture_, vm_, storage->name->texture, surface.pixels.image.size, surface.pixels.origin);
+    PublishAndroidCanvasTexture(*texture_, vm_, storage->name->texture, surface.Info().size, surface.Origin());
   }
 
   std::shared_ptr<android::BitmapTexture> texture_;
@@ -114,23 +117,23 @@ public:
       if (const auto* mailbox = dynamic_cast<const android::GlTexture*>(&texture)) frame = mailbox->AcquireFrame();
       if (const auto* stream = dynamic_cast<const android::SurfaceStreamTexture*>(&texture)) frame = stream->AcquireFrame();
       if (!frame) return R::Failure({RenderErrorCode::Unsupported, "Expected a published Android GPU frame"});
-      const ImageDesc image{{static_cast<std::uint32_t>(frame->PixelWidth()),
+      const ImageInfo image{{static_cast<std::uint32_t>(frame->PixelWidth()),
                              static_cast<std::uint32_t>(frame->PixelHeight())}, PixelFormat::Rgba8Unorm};
       auto record = std::make_shared<GlTextureName>();
       record->texture = frame->ImportCurrent();
       record->producer = std::move(frame);
-      return R::Success({Retain(image, RowOrigin::BottomLeft, std::move(record))});
+      return R::Success(Retain(image, RowOrigin::BottomLeft, std::move(record)));
     } catch (const std::exception& error) {
       return R::Failure({RenderErrorCode::Unsupported, error.what()});
     }
   }
 
-  PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp) override {
+  PublishedTexture Publish(const Texture& surface, media::MediaTimestamp) override {
     using R = PublishedTexture;
-    const auto name = static_cast<GLuint>(GetTexture(surface.pixels));
+    const auto name = static_cast<GLuint>(GetTexture(surface));
     if (!name) return R::Failure({RenderErrorCode::Unsupported, "Expected a completed GL render target"});
     try {
-      GlPreviewTexture preview(surface.pixels.image.size);
+      GlPreviewTexture preview(surface.Info().size);
       preview.PublishFrame(surface);
       preview.Finish();
       return R::Success(preview.Texture());
@@ -142,7 +145,7 @@ public:
 
 } // namespace
 
-std::unique_ptr<BgfxPreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize size) {
+std::unique_ptr<PreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize size) {
   JavaVM* vm = nullptr;
   try { vm = OpenAndroidCanvasTextureVm(); }
   catch (const std::logic_error&) {
@@ -152,12 +155,12 @@ std::unique_ptr<BgfxPreviewTexture> OpenPlatformBgfxPreviewTexture(PixelSize siz
   return std::make_unique<GlPreviewTexture>(size);
 }
 
-std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageInfo target, bgfx::Init init, std::stop_token stop) {
   init.type = bgfx::RendererType::OpenGLES;
   if (target.format == PixelFormat::Rgba8Unorm) {
-    return CreateBgfxBackend(target, init, std::make_unique<GlesTextureBridge>());
+    return CreateBgfxBackend(target, init, stop, std::make_unique<GlesTextureBridge>());
   }
-  return CreateBgfxBackend(target, init);
+  return CreateBgfxBackend(target, init, stop);
 }
 
 } // namespace huxerui::avkit::render::detail

@@ -19,6 +19,7 @@ public:
     if (!opened.Succeeded()) throw std::runtime_error(opened.Error().message);
     stream_.emplace(std::move(opened).Value());
   }
+
   ~StagedOutput() {
     if (!published_) {
       stream_.reset();
@@ -31,6 +32,7 @@ public:
     stream_.reset();
     return stream;
   }
+
   void Publish(const File& target, bool overwrite = false) {
     if (!file_.MoveTo(target, overwrite)) throw std::runtime_error("Cannot publish output to " + target.Path());
     published_ = true;

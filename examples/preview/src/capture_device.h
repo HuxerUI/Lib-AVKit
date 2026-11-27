@@ -19,7 +19,7 @@ struct CaptureDevice {
 };
 
 huxerui::Task<void> RequestCapturePermission(huxerui::ApplicationHandle application, huxerui::Permission permission);
-void WriteCaptureFile(const huxerui::File& file, std::span<const std::byte> bytes);
+
 CaptureDevice UseCaptureDevice(huxerui::State<bool> robot, huxerui::State<bool> sticker);
 
 } // namespace avkit_preview

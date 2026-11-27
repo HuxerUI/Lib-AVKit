@@ -68,17 +68,17 @@ public:
       }
       auto record = std::make_shared<GlTextureName>();
       record->texture = name;
-      return R::Success({Retain({{width, height}, PixelFormat::Rgba8Unorm}, RowOrigin::TopLeft, std::move(record))});
+      return R::Success(Retain({{width, height}, PixelFormat::Rgba8Unorm}, RowOrigin::TopLeft, std::move(record)));
     } catch (const std::exception& error) {
       return R::Failure({RenderErrorCode::Unsupported, error.what()});
     }
   }
 
-  PublishedTexture Publish(const ColorSurface& surface, media::MediaTimestamp pts) override {
+  PublishedTexture Publish(const Texture& surface, media::MediaTimestamp pts) override {
     using R = PublishedTexture;
-    const auto name = static_cast<GLuint>(GetTexture(surface.pixels));
+    const auto name = static_cast<GLuint>(GetTexture(surface));
     if (!name) return R::Failure({RenderErrorCode::Unsupported, "Expected a completed GL render target"});
-    const auto [width, height] = surface.pixels.image.size;
+    const auto [width, height] = surface.Info().size;
     try {
       const auto timestamp = pts.Rescale(1'000'000);
       if (!timestamp) {
@@ -124,14 +124,14 @@ private:
 
 } // namespace
 
-std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageDesc target, bgfx::Init init) {
+std::unique_ptr<RenderBackend> CreatePlatformBgfxBackend(ImageInfo target, bgfx::Init init, std::stop_token stop) {
   init.type = bgfx::RendererType::OpenGLES;
   const auto* canvas_selector = static_cast<const char*>(init.swapChain.nwh);
   if (!canvas_selector) throw std::invalid_argument("WebGL requires a canvas selector");
   if (target.format == PixelFormat::Rgba8Unorm) {
-    return CreateBgfxBackend(target, init, std::make_unique<WebGlTextureBridge>(canvas_selector));
+    return CreateBgfxBackend(target, init, stop, std::make_unique<WebGlTextureBridge>(canvas_selector));
   }
-  return CreateBgfxBackend(target, init);
+  return CreateBgfxBackend(target, init, stop);
 }
 
 } // namespace huxerui::avkit::render::detail

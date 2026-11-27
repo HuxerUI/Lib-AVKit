@@ -8,7 +8,7 @@ if (CMAKE_HOST_APPLE AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "D
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target")
 endif ()
 
-project(example_av_kit VERSION 0.1.0 LANGUAGES NONE)
+project(example_av_kit VERSION 1.0.0 LANGUAGES NONE)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,32 +75,27 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
     avkit_add_capture_target()
     target_link_libraries(example_av_kit PRIVATE AVKit::Capture)
     target_sources(example_av_kit PRIVATE src/capture_camera.cpp src/capture_avkit_device.cpp)
-elseif (IOS OR WIN32)
-    target_sources(example_av_kit PRIVATE src/capture_camera.cpp src/capture_camera_device.cpp)
 else ()
     target_sources(example_av_kit PRIVATE src/capture_unavailable.cpp)
 endif ()
 
 if (IOS)
-    # Include the existing resource-free static targets in the HuxerUI iOS app archive.
-    get_target_property(avkit_core_target AVKit::Core ALIASED_TARGET)
-    get_target_property(avkit_flecs_target flecs::flecs_static ALIASED_TARGET)
-    set_property(TARGET ${avkit_core_target} ${avkit_flecs_target} PROPERTY HUXERUI_LIBRARY TRUE)
-    huxerui_use_library(example_av_kit TARGET AVKit::Core)
-    huxerui_use_library(example_av_kit TARGET flecs::flecs_static)
+    # Include the resource-free scene dependencies in the HuxerUI iOS app archive.
+    foreach (avkit_scene_target IN ITEMS AVKit::Core AVKit::EntityX)
+        get_target_property(avkit_scene_library ${avkit_scene_target} ALIASED_TARGET)
+        set_property(TARGET ${avkit_scene_library} PROPERTY HUXERUI_LIBRARY TRUE)
+        huxerui_use_library(example_av_kit TARGET ${avkit_scene_target})
+    endforeach ()
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR ANDROID)
     target_sources(example_av_kit PRIVATE
-            src/timeline_playback.cpp
             src/timeline_resources.cpp
             src/timeline_strip.cpp
             src/workbench_monitor.cpp
             src/workbench_overlay.cpp
-            src/workbench_photo.cpp
             src/workbench_player.cpp
     )
-    target_link_libraries(example_av_kit PRIVATE bimg_decode bimg)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -113,7 +108,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     )
     target_compile_options(example_av_kit PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
     avkit_embed_macos_pag(example_av_kit)
-    add_subdirectory(verification EXCLUDE_FROM_ALL)
 elseif (ANDROID)
     target_sources(example_av_kit PRIVATE platform/android/src/workbench_platform.cpp)
     target_link_libraries(example_av_kit PRIVATE log)
